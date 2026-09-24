@@ -2017,12 +2017,9 @@ pub const DISPATCH_BACKLOG_KEY: &str = "AMUX_DISPATCH_BACKLOG_WHEN_IDLE";
 
 /// May this lane pull from `backlog` when it has no `todo` left?
 ///
-/// DEFAULT ON. A worker with actionable backlog and an empty To Do column is a
-/// stalled queue, not an idle worker; every new and existing worker therefore
-/// drains by default. The eligibility query still excludes human-owned cards,
-/// `needs:you`, live triggers, epics, watches, tripwires, and already-claimed
-/// work, so default-on does not turn parked coordination state into executable
-/// work. A worker/group/global layer may explicitly opt out.
+/// DEFAULT OFF. Ethan, 2026-09-24: "all new workers should have every board
+/// toggle disabled by default except decompose onto board." A worker opts in
+/// with AMUX_DISPATCH_BACKLOG_WHEN_IDLE=1 at any scope.
 ///
 /// Same resolver shape as the gates above, so the override ladder is one thing:
 /// process env wins (the operator switch in `~/.amux/server.env`), then the
@@ -2047,7 +2044,7 @@ pub(crate) fn dispatch_backlog_when_idle_in(
     crate::api::session_verbs::scoped_setting_in(home, session, DISPATCH_BACKLOG_KEY)
         .as_deref()
         .map(is_on)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 pub fn dispatch_backlog_when_idle(session: &str) -> bool {
@@ -9288,7 +9285,7 @@ fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
 /// GET /api/board/nudges — current CC_STANDING_ORDERS state at every scope.
 ///
 /// Returns `{"global": bool, "groups": {"name": bool, ...}, "workers": {"name": bool, ...}}`
-/// where `true` = nudges ON (the default), `false` = disabled at that level.
+/// where `true` = nudges ON, `false` = disabled at that level (default OFF).
 ///
 /// Reads the env files directly — same source `standing_orders_on_in` reads.
 pub async fn get_nudges() -> axum::response::Response {

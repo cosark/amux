@@ -1,16 +1,7 @@
 //! Standing orders must be switchable at GLOBAL, GROUP and WORKER scope
-//! (AMUX-2930).
-//!
-//! Ethan, 2026-08-11: "I should be able to shut off standing orders like 'Hey
-//! you have stuff in your to-do. Keep going.' … on the group, global, or
-//! individual worker level … configurable but also obviously have defaults."
-//!
-//! Before this, only the WORKER level worked. `/api/scope` has advertised `env`
-//! at `["global","group","worker"]` since the cutover and the scope UI writes
-//! all three files, but every consumer called `parse_env(lane)`, which loads
-//! the worker file and nothing else. Setting the switch globally or on a group
-//! wrote a file that no code read: it saved, reported success, and changed
-//! nothing.
+//! (AMUX-2930), and default to OFF (Ethan, 2026-09-24: "all new workers
+//! should have every board toggle disabled by default except decompose
+//! onto board").
 //!
 //! Each test drives the real files through its OWN temp home, passed in
 //! explicitly. Nothing here touches process env, so nothing races.
@@ -59,27 +50,26 @@ impl Home {
 }
 
 #[test]
-fn default_is_on_at_every_level() {
+fn default_is_off_at_every_level() {
     let h = Home::new();
     h.worker("so-default", "CC_DIR=/tmp\n");
     assert!(
-        h.on("so-default", "CC_AUTO_PICKUP"),
-        "default must be ON — the opt-IN version of this reached 2 lanes of ~50"
+        !h.on("so-default", "CC_AUTO_PICKUP"),
+        "default must be OFF (Ethan 2026-09-24: all toggles off except decompose)"
     );
-    assert!(h.on("so-default", "CC_AUTO_CONTINUE"));
-    // A lane with no env file at all is still ON.
-    assert!(h.on("so-nonexistent-lane", "CC_AUTO_PICKUP"));
+    assert!(!h.on("so-default", "CC_AUTO_CONTINUE"));
+    assert!(!h.on("so-nonexistent-lane", "CC_AUTO_PICKUP"));
 }
 
 #[test]
 fn worker_level_off_silences_that_lane_only() {
     let h = Home::new();
     h.worker("so-off", "CC_AUTO_PICKUP=0\n")
-        .worker("so-on", "CC_DIR=/tmp\n");
+        .worker("so-on", "CC_AUTO_PICKUP=1\n");
     assert!(!h.on("so-off", "CC_AUTO_PICKUP"));
     assert!(
         h.on("so-on", "CC_AUTO_PICKUP"),
-        "the neighbour is unaffected"
+        "an explicit opt-in neighbour is unaffected"
     );
 }
 
@@ -101,8 +91,8 @@ fn group_level_off_silences_every_member() {
         "multi-group member too"
     );
     assert!(
-        h.on("so-outsider", "CC_AUTO_PICKUP"),
-        "a lane outside the group keeps its default"
+        !h.on("so-outsider", "CC_AUTO_PICKUP"),
+        "a lane outside the group keeps its default (off)"
     );
 }
 
@@ -118,29 +108,29 @@ fn global_level_off_silences_the_whole_fleet() {
 }
 
 /// Precedence must run this direction or a per-worker exception is impossible:
-/// turn the fleet off, then turn ONE lane back on.
+/// turn the fleet on globally, then override at each level.
 #[test]
 fn worker_overrides_group_overrides_global() {
     let h = Home::new();
-    h.global("CC_STANDING_ORDERS=0\n")
-        .group("loud-crew", "CC_STANDING_ORDERS=1\n")
+    h.global("CC_STANDING_ORDERS=1\n")
+        .group("loud-crew", "CC_STANDING_ORDERS=0\n")
         .worker("so-prec-global", "CC_DIR=/tmp\n")
         .worker("so-prec-group", "CC_TAGS=loud-crew\n")
         .worker(
             "so-prec-worker",
-            "CC_TAGS=loud-crew\nCC_STANDING_ORDERS=0\n",
+            "CC_TAGS=loud-crew\nCC_STANDING_ORDERS=1\n",
         );
     assert!(
-        !h.on("so-prec-global", "CC_AUTO_PICKUP"),
-        "global off applies"
+        h.on("so-prec-global", "CC_AUTO_PICKUP"),
+        "global on applies"
     );
     assert!(
-        h.on("so-prec-group", "CC_AUTO_PICKUP"),
-        "the group's ON beats the global OFF"
+        !h.on("so-prec-group", "CC_AUTO_PICKUP"),
+        "the group's OFF beats the global ON"
     );
     assert!(
-        !h.on("so-prec-worker", "CC_AUTO_PICKUP"),
-        "the worker's OFF beats both"
+        h.on("so-prec-worker", "CC_AUTO_PICKUP"),
+        "the worker's ON beats both"
     );
 }
 
@@ -154,11 +144,16 @@ fn the_master_switch_covers_every_class_and_the_per_class_keys_still_work() {
         !h.on("so-master", "CC_AUTO_PICKUP"),
         "master OFF wins even against an explicit per-class ON — one knob to reach for"
     );
-    h.worker("so-fine", "CC_AUTO_PICKUP=0\n");
+    h.worker("so-fine", "CC_STANDING_ORDERS=1\nCC_AUTO_PICKUP=0\n");
     assert!(!h.on("so-fine", "CC_AUTO_PICKUP"), "per-class off");
     assert!(
-        h.on("so-fine", "CC_AUTO_CONTINUE"),
-        "…and it does NOT silence the other class"
+        !h.on("so-fine", "CC_AUTO_CONTINUE"),
+        "master ON + no per-class override = off (default-off)"
+    );
+    h.worker("so-both", "CC_STANDING_ORDERS=1\nCC_AUTO_CONTINUE=1\n");
+    assert!(
+        h.on("so-both", "CC_AUTO_CONTINUE"),
+        "master ON + per-class ON = on"
     );
 }
 
@@ -166,17 +161,18 @@ fn the_master_switch_covers_every_class_and_the_per_class_keys_still_work() {
 /// that must NOT read as off — without it, a predicate returning false for
 /// everything would pass all of the above.
 #[test]
-fn the_falsey_spellings_are_the_usual_ones_and_nothing_else() {
+fn the_truthy_spellings_are_the_usual_ones_and_nothing_else() {
     let h = Home::new();
-    for v in ["0", "false", "no", "off", "OFF", " 0 "] {
-        h.worker("so-spell", &format!("CC_AUTO_PICKUP={v}\n"));
-        assert!(!h.on("so-spell", "CC_AUTO_PICKUP"), "{v:?} means off");
+    // Master must be on for per-class keys to take effect.
+    for v in ["1", "true", "yes", "on", "ON", " 1 "] {
+        h.worker("so-spell", &format!("CC_STANDING_ORDERS=1\nCC_AUTO_PICKUP={v}\n"));
+        assert!(h.on("so-spell", "CC_AUTO_PICKUP"), "{v:?} means on");
     }
-    for v in ["1", "true", "yes", "on", "", "maybe"] {
-        h.worker("so-spell", &format!("CC_AUTO_PICKUP={v}\n"));
+    for v in ["0", "false", "no", "off", "OFF", " 0 ", "", "maybe"] {
+        h.worker("so-spell", &format!("CC_STANDING_ORDERS=1\nCC_AUTO_PICKUP={v}\n"));
         assert!(
-            h.on("so-spell", "CC_AUTO_PICKUP"),
-            "{v:?} must NOT be read as off — default-on is the point"
+            !h.on("so-spell", "CC_AUTO_PICKUP"),
+            "{v:?} must NOT be read as on (default-off)"
         );
     }
 }

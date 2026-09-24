@@ -4702,17 +4702,18 @@ fn strip_provider_yolo_flags(flags: &str) -> String {
 
 /// Standing order (Ethan 2026-08-11: "whenever idle, take care of any
 /// non-terminal board task"): the board-drive continue-nudge is ON by
-/// default; CC_AUTO_CONTINUE=0 opts a lane out. Ethos rule 1 — prefer
-/// opt-out for anything that expands what a session can do; the opt-in
-/// version reached 2 lanes of ~50.
+/// DEFAULT OFF. CC_AUTO_CONTINUE=1 opts a lane in. Ethan, 2026-09-24:
+/// "all new workers should have every board toggle disabled by default
+/// except decompose onto board." Standing orders, auto-pickup and
+/// auto-continue are all off unless explicitly enabled.
 ///
 /// ONE predicate for the mechanism (board_drive) and the view
 /// (/api/sessions `auto_continue`): a view that disagrees with the
 /// mechanism it describes is worse than no view.
 pub(crate) fn auto_continue_on(val: Option<&str>) -> bool {
-    !matches!(
+    matches!(
         val.map(|v| v.trim().to_lowercase()).as_deref(),
-        Some("0") | Some("false") | Some("no") | Some("off")
+        Some("1") | Some("true") | Some("yes") | Some("on")
     )
 }
 
@@ -4730,11 +4731,9 @@ pub(crate) fn auto_continue_on(val: Option<&str>) -> bool {
 /// A third spelling would be a second way to express the same thing, which is
 /// how the board keeps growing predicates that disagree.
 ///
-/// DEFAULT IS ON, at every level, and that is deliberate rather than inherited:
-/// ethos rule 1 — the opt-IN version of auto-continue reached 2 lanes out of
-/// ~50, so a capability nobody is enrolled in is decoration. Off must be a
-/// choice someone made, and now it is a choice they can make once, for
-/// everyone, instead of 50 times.
+/// DEFAULT IS OFF, at every level. Ethan, 2026-09-24: "all new workers should
+/// have every board toggle disabled by default except decompose onto board."
+/// A worker opts in with CC_STANDING_ORDERS=1 at any scope.
 pub fn standing_orders_on(lane: &str, key: &str) -> bool {
     standing_orders_on_in(&home(), lane, key)
 }
@@ -4754,10 +4753,10 @@ pub fn standing_orders_on_in(home: &std::path::Path, lane: &str, key: &str) -> b
 ///
 /// The bug that made this public: the SPA computed its badge as
 /// `flags.includes(skipPermissions) || !!s.auto_continue`, and `auto_continue`
-/// in the payload is `standing_orders_on(...)`, which is DEFAULT-ON at every
-/// level. So a lane with no skip-permissions flag at all rendered a YOLO badge,
-/// and a worker sat blocked on "This command requires approval" for 11 hours
-/// while its card claimed it would never stop to ask.
+/// in the payload is `standing_orders_on(...)`, which was DEFAULT-ON at every
+/// level (now default-off as of 2026-09-24). So a lane with no skip-permissions
+/// flag at all rendered a YOLO badge, and a worker sat blocked on "This command
+/// requires approval" for 11 hours while its card claimed it would never stop.
 ///
 /// Note the comment below already forbade exactly that, server-side, and was
 /// right: the default-on nudge must never imply skip-permissions. The client
@@ -37310,7 +37309,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
     }
 
     #[test]
-    fn fresh_workers_default_to_full_board_drive_and_nonterminal_continuation() {
+    fn fresh_workers_default_board_off_except_decompose() {
         let dir = tempfile::tempdir().expect("isolated standing-order home");
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
@@ -37321,10 +37320,37 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             None,
             "the process-level board-drive master must default enabled"
         );
+        // Ethan, 2026-09-24: all board toggles OFF by default except decompose.
+        for key in ["CC_STANDING_ORDERS", "CC_AUTO_PICKUP", "CC_AUTO_CONTINUE"] {
+            assert!(
+                !standing_orders_on_in(dir.path(), "fresh", key),
+                "a fresh worker with no override must NOT enroll in {key}"
+            );
+        }
+        assert!(
+            !crate::runtime_jobs::board_drive::dispatch_backlog_when_idle_in(
+                dir.path(),
+                "fresh",
+                None,
+            ),
+            "a fresh worker must NOT promote backlog by default"
+        );
+        // Decompose (board_lifecycle::enabled) stays on by default.
+        assert!(
+            crate::api::board_lifecycle::policy_enabled(None),
+            "decompose onto board must default ON"
+        );
+
+        // Explicit opt-in works.
+        std::fs::write(
+            sessions.join("fresh.env"),
+            "CC_ISOLATED=0\nCC_STANDING_ORDERS=1\nCC_AUTO_PICKUP=1\nCC_AUTO_CONTINUE=1\nAMUX_DISPATCH_BACKLOG_WHEN_IDLE=1\n",
+        )
+        .unwrap();
         for key in ["CC_STANDING_ORDERS", "CC_AUTO_PICKUP", "CC_AUTO_CONTINUE"] {
             assert!(
                 standing_orders_on_in(dir.path(), "fresh", key),
-                "a non-isolated worker with no override must enroll in {key}"
+                "an explicit opt-in must enable {key}"
             );
         }
         assert!(
@@ -37333,12 +37359,13 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
                 "fresh",
                 None,
             ),
-            "a fresh non-isolated worker must promote eligible backlog by default"
+            "an explicit opt-in must enable backlog promotion"
         );
 
+        // Explicit opt-out still works.
         std::fs::write(
             sessions.join("fresh.env"),
-            "CC_ISOLATED=0\nCC_STANDING_ORDERS=0\nCC_AUTO_PICKUP=1\nCC_AUTO_CONTINUE=1\nAMUX_DISPATCH_BACKLOG_WHEN_IDLE=0\n",
+            "CC_ISOLATED=0\nCC_STANDING_ORDERS=0\nCC_AUTO_PICKUP=0\nCC_AUTO_CONTINUE=0\nAMUX_DISPATCH_BACKLOG_WHEN_IDLE=0\n",
         )
         .unwrap();
         assert!(!standing_orders_on_in(
@@ -37362,7 +37389,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
                 "fresh",
                 None,
             ),
-            "an explicit backlog-promotion opt-out must stay off"
+            "an explicit opt-out must stay off"
         );
         assert_eq!(
             crate::runtime_jobs::isolation_reason_with("board-drive", |key| {
@@ -38552,6 +38579,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         )
         .await;
         assert_eq!(v["effective"], json!(false));
+        // Removing the standing_orders override restores the default (OFF).
         let (_, v) = call(
             &app,
             "PATCH",
@@ -38560,9 +38588,10 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         )
         .await;
         assert_eq!(v["inherited"], json!(true));
-        assert_eq!(v["effective"], json!(true));
+        assert_eq!(v["effective"], json!(false), "default is off");
         assert_eq!(parse_env("probe").get("CC_STANDING_ORDERS"), None);
 
+        // Removing backlog drain override restores the default (OFF).
         let (_, v) = call(
             &app,
             "PATCH",
@@ -38570,11 +38599,12 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             Some(json!({"auto_drain_backlog": null})),
         )
         .await;
-        assert_eq!(v["effective"], json!(true));
+        assert_eq!(v["effective"], json!(false), "backlog drain default is off");
         assert_eq!(
             parse_env("probe").get("AMUX_DISPATCH_BACKLOG_WHEN_IDLE"),
             None
         );
+        // Removing per-class overrides restores defaults (OFF).
         for field in ["board_auto_pickup", "board_auto_continue"] {
             let (st, v) = call(
                 &app,
@@ -38584,7 +38614,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             )
             .await;
             assert_eq!(st, StatusCode::OK, "{v}");
-            assert_eq!(v["effective"], json!(true));
+            assert_eq!(v["effective"], json!(false), "{field} default is off");
         }
         assert_eq!(parse_env("probe").get("CC_AUTO_PICKUP"), None);
         assert_eq!(parse_env("probe").get("CC_AUTO_CONTINUE"), None);

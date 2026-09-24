@@ -35,7 +35,7 @@ pub(crate) fn enabled(session: &str) -> bool {
         && policy_enabled(setting(session, POLICY_KEY).as_deref())
 }
 
-fn policy_enabled(value: Option<&str>) -> bool {
+pub(crate) fn policy_enabled(value: Option<&str>) -> bool {
     !value.is_some_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
