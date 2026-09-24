@@ -11818,7 +11818,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1098';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1099';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -13749,14 +13749,31 @@ function _hideScrollLockBadge(scrollEl) {
 function _trimPeekLiveOverlap(history, live) {
   if (!history || !live) return live;
   const normalize = line => String(line || '').replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '')
+    .replace(/[*#`_|\u2502\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2500=>\u2022\u00b7\u00bb\u276f\u23bf\u23fa\u273b\u2726\u25cf]+/g, ' ')
     .replace(/[\s\u00a0]+/g, ' ').trim().toLowerCase();
   const histLines = history.split('\n'), liveLines = live.split('\n');
   const histNorm = histLines.map(normalize), liveNorm = liveLines.map(normalize);
   const eligible = new Set(histNorm.filter(line => line.length >= 12));
-  const generalMatches = [];
-  liveNorm.forEach((line, index) => { if (eligible.has(line)) generalMatches.push(index); });
-  if (generalMatches.length >= 3) {
-    return liveLines.slice(generalMatches[generalMatches.length - 1] + 1).join('\n').replace(/^\n+/, '');
+  const longHist = histNorm.filter(line => line.length >= 46);
+  const inHistory = n => {
+    if (n.length < 12) return false;
+    if (eligible.has(n)) return true;
+    if (n.length >= 24) {
+      for (let k = 0; k < longHist.length; k++) {
+        if (longHist[k].includes(n) || n.includes(longHist[k])) return true;
+      }
+    }
+    return false;
+  };
+  const found = [];
+  for (let i = liveNorm.length - 1; i >= 0; i--) {
+    if (inHistory(liveNorm[i])) {
+      found.push(i);
+      if (found.length >= 3) break;
+    }
+  }
+  if (found.length >= 3) {
+    return liveLines.slice(found[0] + 1).join('\n').replace(/^\n+/, '');
   }
   // A timestamped prompt is an amux-stamped submission identity. One exact
   // anchor is sufficient and safer than requiring three arbitrary output
