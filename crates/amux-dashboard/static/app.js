@@ -2839,9 +2839,13 @@ function updateConnectionStatus() {
   // Update all connection status indicators (main + peek)
   document.querySelectorAll('#conn-status, #conn-modal-status').forEach(el => {
     if (el.id === 'conn-modal-status') el.style.color = '';
+    const blockedCount = offlineQueue.filter(q => q.state === 'blocked' && !_outboxUncertainMessage(q)).length;
     if (readState || _localWriteError) {
       el.className = 'conn-status offline';
       el.textContent = readState === 'auth' ? 'Access required' : 'Sync error';
+    } else if (blockedCount) {
+      el.className = 'conn-status offline';
+      el.textContent = blockedCount + ' failed';
     } else if (!online) {
       el.className = 'conn-status offline';
       const total = offlineQueue.length + drafts.length;
@@ -2876,55 +2880,12 @@ function updateConnectionStatus() {
   }
   const writeNotice = document.getElementById('conn-modal-write-notice');
   if (writeNotice) writeNotice.innerHTML = _localWriteNotice();
-  // Update offline banner
+  // Failed ops live in the status modal (Ethan 2026-09-24: "the failed ops
+  // thing should just be in the status modal thing, it takes up too much real
+  // estate on the homepage"). The connection modal already renders every
+  // blocked op with dismiss buttons, so the homepage banner is fully redundant.
   const banner = document.getElementById('offline-banner');
-  const ops = document.getElementById('offline-ops');
-  const title = document.getElementById('offline-banner-title');
-  if (!banner) return;
-  // ONLY A DECISION EARNS SCREEN SPACE (Ethan 2026-09-24: "i don't need that
-  // big old message ... we already have a status thing in the top left").
-  // Offline, queued, sending, stalled and drafts are all states the top-left
-  // badge already names ("Offline", "N pending") and its modal lists. The
-  // banner is for the one thing the badge cannot resolve: an op that FAILED
-  // and needs review or dismissal. One line, failed rows only.
-  const blockedOps = offlineQueue.filter(q => q.state === 'blocked' && !_outboxUncertainMessage(q));
-  if (!blockedOps.length) {
-    banner.classList.remove('active');
-    ops.innerHTML = '';
-    return;
-  }
-  banner.classList.add('active');
-  title.innerHTML = '&#x26A0; ' + blockedOps.length + ' failed op' + (blockedOps.length === 1 ? '' : 's') +
-    ' <a href="#" onclick="event.preventDefault();showQueueModal();" style="color:inherit;text-decoration:underline;">review</a>' +
-    ' or <a href="#" onclick="event.preventDefault();_clearBlockedOps();" style="color:inherit;text-decoration:underline;">dismiss</a>';
-  const rows = [];
-  blockedOps.forEach(item => {
-    const age = Math.floor((Date.now() - item.timestamp) / 60000);
-    const timeStr = age < 1 ? 'just now' : age + 'm ago';
-    const isBlocked = item.state === 'blocked' && !_outboxUncertainMessage(item);
-    const dismissBtn = isBlocked
-      ? ' <button type="button" class="offline-op-dismiss" onclick="_dismissQueuedOp(\'' + escJs(item.id) + '\')" aria-label="Dismiss failed change" title="Dismiss">&#x2715;</button>'
-      : '';
-    rows.push('<div class="offline-op' + (isBlocked ? ' blocked' : '') + '">' +
-      '<span class="op-action">' + esc(describeOp(item)) + (item.error ? ' <span style="color:' + (_outboxUncertainMessage(item) ? 'var(--yellow,#d29922)' : 'var(--red,#e55)') + '">[' + esc(item.error).substring(0, 80) + ']</span>' : '') + '</span>' +
-      '<span class="op-time">' + timeStr + dismissBtn + '</span>' +
-    '</div>');
-  });
-  // Accordion (Ethan 08:39): once the queued list exceeds 5, collapse it by
-  // default behind a click-to-expand header showing the count, so a long
-  // offline backlog doesn't push the whole board off-screen. <=5 shows inline.
-  if (rows.length > 5) {
-    const expanded = _offlineQueueExpanded;
-    const caret = expanded ? '&#x25BE;' : '&#x25B8;'; // ▾ open / ▸ closed
-    const label = expanded ? 'Hide queued operations'
-                           : 'Show all ' + rows.length + ' queued operations';
-    ops.innerHTML =
-      '<button type="button" class="offline-queue-toggle" aria-expanded="' + expanded +
-        '" onclick="_toggleOfflineQueue()">' + caret + ' ' + label + '</button>' +
-      '<div class="offline-queue-list' + (expanded ? '' : ' collapsed') + '">' + rows.join('') + '</div>';
-  } else {
-    ops.innerHTML = rows.join('');
-  }
+  if (banner) { banner.classList.remove('active'); const ops = document.getElementById('offline-ops'); if (ops) ops.innerHTML = ''; }
 }
 
 // Accordion toggle for the offline queued-ops list (AMUX-2976). State lives
