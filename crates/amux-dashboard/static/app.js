@@ -7089,9 +7089,11 @@ document.addEventListener('click', e => {
 const RETIRED_TABS = new Set(['orchestrations']);
 document.querySelectorAll('.tab-bar button[id^="tab-"]').forEach(b => { if (RETIRED_TABS.has(b.id.slice(4))) b.remove(); });
 const ALL_TABS = (function _discoverNavTabs() {
-  // Board is required (Ethan, 2026-09-24: "make sure it's present global and
-  // worker details"): a stale saved hidden list must not remove it.
-  const REQUIRED = new Set(['sessions', 'board']);
+  // Board is HIDEABLE again (Ethan, 2026-09-26: "board should be hidable"),
+  // but only by an explicit uncheck. It was made required on 2026-09-24
+  // because a stale saved hidden list removed it without anyone asking; that
+  // protection now lives in _honourBoardHide instead of in REQUIRED.
+  const REQUIRED = new Set(['sessions']);
   const out = [];
   document.querySelectorAll('.tab-bar button[id^="tab-"]').forEach(b => {
     const id = b.id.slice(4);   // strip 'tab-'
@@ -7102,10 +7104,18 @@ const ALL_TABS = (function _discoverNavTabs() {
   return out.length ? out : [{ id: 'sessions', label: 'Workers', required: true }];
 })();
 
+// A hidden list written before Board became hideable may carry 'board' from
+// an older layout. Only an owner uncheck (or a preset saved after it) also
+// writes the 'board!' marker, so 'board' without it is ignored.
+function _honourBoardHide(set) {
+  if (set.has('board') && !set.has('board!')) set.delete('board');
+  if (!set.has('board')) set.delete('board!');
+  return set;
+}
 let hiddenTabs = (function() {
   try {
     const s = localStorage.getItem('amux_hidden_tabs');
-    if (s !== null) return new Set(JSON.parse(s));
+    if (s !== null) return _honourBoardHide(new Set(JSON.parse(s)));
   } catch(e) {}
   // Default visible tabs: sessions, files, scheduler, board, workspace, notes, skills, browser, logs
   // Logs was hidden by default and kept disappearing on localStorage eviction
@@ -7597,11 +7607,13 @@ function toggleTabVisibility(id, show) {
   if (!tab || tab.required) return;
   if (show) {
     hiddenTabs.delete(id);
+    if (id === 'board') hiddenTabs.delete('board!');
   } else {
     // If hiding the currently active tab, switch to sessions first
     const gridActive = id === 'grid' && document.getElementById('grid-view')?.classList.contains('active');
     if (activeView === id || gridActive) switchView('sessions');
     hiddenTabs.add(id);
+    if (id === 'board') hiddenTabs.add('board!');   // explicit owner hide (_honourBoardHide)
   }
   _saveHiddenTabs();
   _applyTabVisibility();
@@ -7625,7 +7637,7 @@ async function loadLayoutPreset(name) {
   const presets = await r.json();
   const p = presets.find(x => x.name === name);
   if (!p) return;
-  hiddenTabs = new Set(p.hidden);
+  hiddenTabs = _honourBoardHide(new Set(p.hidden));
   tabOrder = p.tab_order.length ? p.tab_order : ALL_TABS.map(t => t.id);
   _saveHiddenTabs();
   _saveTabOrder();
@@ -7770,7 +7782,7 @@ function _applyEmbedView() {
   if (layoutData) {
     try {
       const p = JSON.parse(atob(layoutData));
-      if (p.hidden) hiddenTabs = new Set(p.hidden);
+      if (p.hidden) hiddenTabs = _honourBoardHide(new Set(p.hidden));
       if (p.tab_order) tabOrder = p.tab_order;
       _saveHiddenTabs();
       _saveTabOrder();
@@ -12178,7 +12190,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1129';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1130';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
