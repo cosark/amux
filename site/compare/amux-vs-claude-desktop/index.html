@@ -4,13 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
-  <title>amux vs Claude Desktop — amux</title>
-    <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="Compare amux with the Claude Desktop app for development workflows.">
-  <meta name="keywords" content="amux vs claude desktop, claude app alternative, terminal vs desktop AI coding">
+  <title>amux vs Claude Desktop — Coding Agent Fleet vs Conversational App</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <meta name="description" content="Claude Desktop is for conversations and MCP tool connections. amux runs Claude Code agents in parallel for autonomous coding at scale. Side-by-side comparison with use-case guide.">
+  <meta name="keywords" content="amux vs claude desktop, claude desktop alternative, claude desktop mcp vs amux, claude code vs claude desktop, when to use claude desktop, ai coding agent fleet 2026">
   <link rel="canonical" href="https://amux.io/compare/amux-vs-claude-desktop/">
-  <meta property="og:title" content="amux vs Claude Desktop — amux">
-  <meta property="og:description" content="Compare amux with the Claude Desktop app for development workflows.">
+  <meta property="og:title" content="amux vs Claude Desktop — Coding Agent Fleet vs Conversational App">
+  <meta property="og:description" content="Claude Desktop is for conversations and MCP tool connections. amux runs Claude Code in parallel for autonomous coding at scale. Full comparison with decision guide.">
   <meta property="og:url" content="https://amux.io/compare/amux-vs-claude-desktop/">
   <meta property="og:image" content="https://amux.io/og-image.png">
   <meta property="og:type" content="article">
@@ -22,8 +22,9 @@
   <link rel="stylesheet" href="/style.css">
   <script src="/site.js"></script>
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Compare","item":"https://amux.io/compare/"},{"@type":"ListItem","position":3,"name":"amux vs Claude Desktop","item":"https://amux.io/compare/amux-vs-claude-desktop/"}]}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"amux vs Claude Desktop","description":"Compare amux with the Claude Desktop app for development workflows.","url":"https://amux.io/compare/amux-vs-claude-desktop/","about":{"@type":"SoftwareApplication","name":"amux","url":"https://amux.io/","applicationCategory":"DeveloperApplication"}}</script>
-  </head>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"amux vs Claude Desktop","description":"Claude Desktop is for conversations and MCP tool connections. amux runs Claude Code agents in parallel for autonomous coding at scale.","datePublished":"2026-03-06","dateModified":"2026-09-26","author":{"@type":"Organization","name":"amux"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"url":"https://amux.io/compare/amux-vs-claude-desktop/"}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is the difference between amux and Claude Desktop?","acceptedAnswer":{"@type":"Answer","text":"Claude Desktop is Anthropic's GUI app for conversational use of Claude — chat, document analysis, Projects, and MCP server connections. amux runs Claude Code (the coding-specialized CLI) in parallel terminal sessions with a web dashboard and agent orchestration layer. Claude Desktop is the right tool when you want to have a conversation. amux is the right tool when you want Claude to autonomously execute code changes in a repository, in parallel, without supervision."}},{"@type":"Question","name":"Can I use Claude Desktop and amux together?","acceptedAnswer":{"@type":"Answer","text":"Yes — they are complementary, not competing. A common workflow: use Claude Desktop (or Claude.ai) to plan a feature, generate the CLAUDE.md spec, and think through architecture. Then use amux to hand off the implementation to 5-10 parallel Claude Code sessions that each tackle one sub-task. Claude Desktop handles strategy and ideation; amux handles execution at scale."}},{"@type":"Question","name":"Does Claude Desktop replace Claude Code?","acceptedAnswer":{"@type":"Answer","text":"No. Claude Desktop uses the same Claude model but in a conversational interface. Claude Code is a separate CLI tool with direct filesystem access, shell execution, and long-horizon coding capabilities. Claude Desktop can use MCP filesystem tools to read files, but it is not designed for autonomous code execution across a large repository — that is Claude Code's domain."}},{"@type":"Question","name":"What is amux and how does it relate to Claude Code?","acceptedAnswer":{"@type":"Answer","text":"amux is the orchestration layer for Claude Code. Claude Code is a single coding agent. amux multiplies that into a fleet: it manages 10-50 parallel Claude Code sessions, coordinates their tasks via a shared kanban board, self-heals crashes and context exhaustion, and provides a web dashboard for monitoring. You install amux once, configure sessions for your project, and queue tasks for the fleet to execute."}},{"@type":"Question","name":"Does amux work with Claude Desktop MCP servers?","acceptedAnswer":{"@type":"Answer","text":"MCP servers configured in Claude Desktop's settings are separate from the MCP servers used by Claude Code. amux ships with a centralized mcp.json that configures MCP servers for all Claude Code sessions in the fleet — filesystem, memory, github, browser automation. You configure them once in amux and all sessions inherit them; you don't need to configure each session individually."}},{"@type":"Question","name":"Which is better for coding projects — Claude Desktop or amux?","acceptedAnswer":{"@type":"Answer","text":"For active coding on a real repository (adding features, fixing bugs, writing tests, refactoring), amux with Claude Code wins on every dimension: it makes file changes, runs tests, commits code, and operates overnight without supervision. Claude Desktop is better for discussing code, reviewing architecture, generating specs, and tasks that don't require direct filesystem writes."}}]}</script>
+</head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
@@ -40,18 +41,93 @@
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/compare/">Compare</a> <span class="sep">›</span> <span>amux vs Claude Desktop</span></div>
     <h1>amux vs Claude Desktop</h1>
-<p class="subtitle">Claude Desktop is for conversations. amux is for coding at scale. The comparison clarifies when to use which.</p>
-<p><strong>Claude Desktop</strong> is Anthropic's native macOS and Windows application for conversational use of Claude — chat, document analysis, MCP tool connections. <strong>amux</strong> runs Claude Code (the coding-specialized CLI) in parallel terminal sessions with a web dashboard and agent orchestration.</p>
-<h2>Key differences</h2>
-<table><thead><tr><th>Feature</th><th>amux</th><th>Claude Desktop</th></tr></thead><tbody><tr><td>Agent type</td><td>Claude Code (autonomous coding CLI)</td><td>Claude chat (conversational)</td></tr><tr><td>Parallel sessions</td><td>Dozens of independent coding sessions</td><td>Single conversation window</td></tr><tr><td>Codebase access</td><td>Direct filesystem, git, bash access</td><td>MCP filesystem (read-heavy)</td></tr><tr><td>Unattended operation</td><td>Self-healing overnight runs</td><td>Interactive, requires user prompts</td></tr><tr><td>Task coordination</td><td>Shared kanban board</td><td>No task management</td></tr><tr><td>Open source</td><td>Yes (MIT)</td><td>No</td></tr><tr><td>Mobile</td><td>PWA dashboard</td><td>iOS/Android app</td></tr></tbody></table>
-<h2>When to use Claude Desktop</h2>
-<p>Claude Desktop is excellent for <strong>general-purpose AI assistance</strong>: drafting documents, analyzing files, researching topics, having extended conversations. If you need Claude to help you think through a problem, write a document, or analyze data, Claude Desktop is the right tool.</p>
-<h2>When to use amux</h2>
-<p>When you need Claude to <strong>actually execute code changes</strong> in your repository — autonomously, in parallel, with self-healing, overnight. amux runs Claude Code, which has direct filesystem and shell access and is specifically optimized for long-horizon coding tasks. It's the right tool when the output is code, not conversation.</p>
-<div class="cta-box"><h3>Get started with amux</h3><p>Run dozens of Claude Code agents in parallel. Python 3 + tmux. Open source.</p><pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
-amux register myproject --dir ~/Dev/myproject --yolo
+    <p class="subtitle">Claude Desktop is for conversations. amux is for coding at scale. Updated September 2026.</p>
+
+    <!-- EXP-094: top-of-page CTA — amux-vs-claude-desktop, started 2026-09-26 -->
+    <div style="background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:8px;padding:1.2rem 1.6rem;margin:1.8rem 0;display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
+      <div>
+        <div style="font-weight:600;margin-bottom:4px;">Run Claude Code agents as a fleet — amux is free and open source</div>
+        <div style="font-size:0.875rem;color:var(--dim);">Queue 20 tasks before bed, wake up to finished pull requests. Self-healing, phone-manageable, 503 GitHub stars.</div>
+      </div>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;text-decoration:none;padding:.6rem 1.25rem;border-radius:6px;font-weight:600;font-size:.875rem;white-space:nowrap;flex-shrink:0;" onclick="typeof posthog!=='undefined'&&posthog.capture('exp094_claude_desktop_compare_topofpage_cta_click')">View amux on GitHub ★</a>
+    </div>
+
+    <p><strong>Claude Desktop</strong> is Anthropic's native macOS and Windows application for conversational use of Claude — chat, Projects, document analysis, and MCP server connections for tools like filesystem and web search. <strong>amux</strong> runs Claude Code (the coding-specialized CLI) in parallel terminal sessions with a web dashboard and agent orchestration layer. These tools solve different problems and work well together.</p>
+
+    <h2>Key differences</h2>
+    <table>
+      <thead><tr><th>Feature</th><th>amux + Claude Code</th><th>Claude Desktop</th></tr></thead>
+      <tbody>
+        <tr><td>Primary use</td><td>Autonomous code execution at scale</td><td>Conversational AI assistance</td></tr>
+        <tr><td>Parallel sessions</td><td>10-50 independent coding agents</td><td>Single conversation window</td></tr>
+        <tr><td>Codebase access</td><td>Direct filesystem, git, bash — full write access</td><td>MCP filesystem (read-oriented, requires approval)</td></tr>
+        <tr><td>Unattended operation</td><td>Self-healing overnight runs, 8h+ without supervision</td><td>Interactive — requires user prompts to continue</td></tr>
+        <tr><td>Task coordination</td><td>Shared SQLite kanban board with atomic claiming</td><td>No task management</td></tr>
+        <tr><td>Agent self-healing</td><td>Auto-compacts context, restarts crashes, handles rate limits</td><td>Session ends if context fills or rate limit hits</td></tr>
+        <tr><td>Deploy feedback loop</td><td>Workers wake when their commits go live (deploy-wake)</td><td>No CI/CD integration</td></tr>
+        <tr><td>Multi-runtime</td><td>Claude Code, Codex, Gemini CLI in the same fleet</td><td>Claude only</td></tr>
+        <tr><td>Mobile monitoring</td><td>PWA dashboard, iOS app (App Store)</td><td>iOS/Android app (conversational)</td></tr>
+        <tr><td>MCP servers</td><td>Centralized mcp.json for all sessions</td><td>Per-app settings, not fleet-wide</td></tr>
+        <tr><td>Open source</td><td>Yes — MIT + Commons Clause</td><td>No</td></tr>
+        <tr><td>Cost</td><td>Free (you pay for Claude API tokens)</td><td>Included with Claude subscription</td></tr>
+      </tbody>
+    </table>
+
+    <h2>When to use Claude Desktop</h2>
+    <p>Claude Desktop is the right tool for <strong>strategic and conversational work</strong>:</p>
+    <ul>
+      <li>Drafting documents, emails, reports</li>
+      <li>Researching and analyzing information</li>
+      <li>Planning architecture and generating CLAUDE.md specs for your Claude Code sessions</li>
+      <li>Reviewing code diffs and asking questions</li>
+      <li>Using MCP-connected tools (web search, browser, Calendar) interactively</li>
+      <li>Anything where you want a back-and-forth conversation rather than autonomous execution</li>
+    </ul>
+
+    <h2>When to use amux</h2>
+    <p>amux is the right tool when the output is <strong>code in a repository</strong>, not conversation:</p>
+    <ul>
+      <li>Implementing a backlog of features across multiple files</li>
+      <li>Running overnight coding sessions without supervision</li>
+      <li>Parallel test writing, refactoring, or documentation passes</li>
+      <li>CI/CD feedback loops where agents need to know when their commits deployed</li>
+      <li>Multi-agent coordination where one agent's output feeds another's input</li>
+      <li>Any task where 10 agents finishing 10 tasks simultaneously saves you 9 hours</li>
+    </ul>
+
+    <h2>Using Claude Desktop and amux together</h2>
+    <p>The most productive developers use both. A typical workflow:</p>
+    <ol>
+      <li><strong>Plan with Claude Desktop:</strong> Open a conversation, describe your goal, generate the spec, create a CLAUDE.md file for the project.</li>
+      <li><strong>Decompose with Claude Desktop:</strong> Ask Claude Desktop to break the spec into 10-15 discrete tasks, each small enough for one agent to handle.</li>
+      <li><strong>Execute with amux:</strong> Paste the tasks into the amux kanban board, start 10 Claude Code sessions, and let them claim and finish the tasks overnight.</li>
+      <li><strong>Review with Claude Desktop:</strong> In the morning, review the resulting PRs with Claude Desktop's code review conversation mode.</li>
+    </ol>
+    <p>This pattern — strategy in Claude Desktop, execution in amux — lets a solo developer ship at a team's pace without coordinating anyone manually.</p>
+
+    <h2 id="whats-new-sept-2026">What's new in amux (September 2026)</h2>
+    <p>Recent releases that extend the gap between amux and alternatives:</p>
+    <ul>
+      <li><strong>Deploy-wake (AMUX-5239):</strong> Workers automatically resume when their commits go live. After a session commits and pushes, amux detects the deployment and sends a wake message with deploy context so the agent can run smoke tests immediately.</li>
+      <li><strong>Named clearance signals:</strong> <code>amux signal wait</code> and <code>amux signal raise</code> let agents coordinate across the fleet without polling. Gate agent B on agent A's output without writing any coordination code.</li>
+      <li><strong>Grounded browser automation:</strong> The observe→act→verify loop prevents agents from acting on stale DOM snapshots. Every browser action confirms its effect before proceeding.</li>
+      <li><strong>Host pressure guard:</strong> amux monitors CPU and memory pressure and backs off from spawning new sessions under load — overnight runs on shared hardware are substantially more stable.</li>
+    </ul>
+
+    <h2>MCP servers: Claude Desktop vs amux</h2>
+    <p>Both tools use MCP servers to extend what Claude can do, but in different ways:</p>
+    <p><strong>Claude Desktop MCP</strong> connects tools to a single conversation — filesystem reading, web search, browser automation, Calendar. Each conversation uses the configured tools interactively, with approval prompts for sensitive operations. Great for one-off tool-augmented conversations.</p>
+    <p><strong>amux MCP</strong> configures a centralized <code>~/.amux/mcp.json</code> that applies to every Claude Code session in the fleet. Tools like playwright, github, and filesystem are available to all 10-50 agents simultaneously. You configure once, and every agent inherits the configuration without any per-session setup.</p>
+
+    <div class="cta-box">
+      <h3>Start your Claude Code fleet</h3>
+      <p>Run 10-50 Claude Code agents in parallel. Open source Rust binary. Installs in 30 seconds.</p>
+      <pre><code>brew install mixpeek/tap/amux
+amux register myproject --dir ~/Dev/myproject
 amux start myproject
-amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub</a></div>
+# Dashboard at https://localhost:8824</code></pre>
+      <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View on GitHub ★</a>
+    </div>
   </main>
   <footer class="sub-footer">
     <div class="footer-inner">
@@ -99,6 +175,6 @@ amux serve  # → https://localhost:8824</code></pre><a class="btn btn-primary" 
     </div>
   </footer>
 
-<script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='\u2605 '+d.stargazers_count}).catch(function(){})</script>
+<script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>
 </html>
