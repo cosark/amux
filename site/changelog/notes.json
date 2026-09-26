@@ -1,5 +1,59 @@
 [
   {
+    "hash": "447ca486",
+    "short": "447ca486",
+    "title": "Browser automation: grounded observe → act → verify loop",
+    "date": "2026-09-26",
+    "type": "feat",
+    "tags": ["browser", "automation", "reliability"],
+    "description": "GET /api/browser/state now returns an observation_id and structured element metadata (ref, role, accessible name, frame path, bounding rect, disabled/checked state) for every interactive element including same-origin iframes and shadow DOM. POST /api/browser/action click accepts ref + observation_id and refuses stale documents, disabled elements, and obscured targets. Every action reports an observed_effect (navigated, url_changed, dom_mutations counted, none_observed) so agents can verify their actions actually worked. An optional expect field polls for a specific post-action condition before returning. Replaces the older index-based clicking that could silently act on the wrong element after a page rerender."
+  },
+  {
+    "hash": "3f2aef8b",
+    "short": "3f2aef8b",
+    "title": "Board tab can be hidden from the dashboard",
+    "date": "2026-09-26",
+    "type": "feat",
+    "tags": ["dashboard", "board", "customization"],
+    "description": "The Board tab in the amux dashboard can now be toggled off via the worker tab customizer. Useful for sessions or setups where the kanban view is not relevant and a cleaner interface is preferred."
+  },
+  {
+    "hash": "2c75d1c8",
+    "short": "2c75d1c8",
+    "title": "Host pressure guard: automation backs off under load",
+    "date": "2026-09-26",
+    "type": "feat",
+    "tags": ["reliability", "performance", "mac"],
+    "description": "amux now monitors host CPU and memory pressure levels. When pressure crosses a threshold, the automation layer backs off from spawning new browser instances and renices runaway processes rather than letting them consume the machine. Overnight agent runs on shared or resource-constrained hardware are significantly more stable. The pressure level is visible in GET /api/health."
+  },
+  {
+    "hash": "15b1be62",
+    "short": "15b1be62",
+    "title": "Workers wake automatically when their commits go live",
+    "date": "2026-09-26",
+    "type": "feat",
+    "tags": ["deploy", "sessions", "workflow"],
+    "description": "amux now detects when a new build goes live by polling its own health endpoint and comparing the running commit hash. When the hash advances, it identifies which worker sessions authored commits in the deployed range (via the Amux-Session git trailer) and sends each one a wake message. Workers resume automatically with deploy context and can run smoke tests or verify their changes without any manual follow-up."
+  },
+  {
+    "hash": "912d93f3",
+    "short": "912d93f3",
+    "title": "Named clearance signals for cross-agent coordination",
+    "date": "2026-09-26",
+    "type": "feat",
+    "tags": ["board", "workflow", "coordination"],
+    "description": "Board cards can now wait on a named signal with amux signal wait <CARD> <name>, and any lane can raise the signal with amux signal raise <name> --note <text>. When a signal is raised, every card waiting on that name wakes automatically. Replaces polling loops and manual check-ins for cross-agent dependencies — the waiting session resumes as soon as the dependency clears."
+  },
+  {
+    "hash": "8ac0ca8c",
+    "short": "8ac0ca8c",
+    "title": "Outbound email approvals stay pending until resolved",
+    "date": "2026-09-26",
+    "type": "fix",
+    "tags": ["email", "approvals", "reliability"],
+    "description": "Outbound email approval requests now remain in a pending state until explicitly approved or rejected, rather than expiring silently. Repeated requests for the same email are deduplicated rather than stacked. A daily digest of pending approvals is delivered so nothing falls through the gaps."
+  },
+  {
     "hash": "ce1e91b0",
     "short": "ce1e91b0",
     "title": "Email inbox paginates past the 500-message cap",
