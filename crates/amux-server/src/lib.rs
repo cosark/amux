@@ -613,6 +613,10 @@ async fn async_main() {
     drop(runtime_jobs::capture_reconcile::spawn(state.clone()));
     // AMUX-5240: one daily owner digest of pending outbound-email approvals.
     drop(runtime_jobs::email_approval_digest::spawn(state.clone()));
+    // AMUX-5239: a lane that pushed and said "live in ~40 min" was never told
+    // when it was. This boot is that moment; tell the lanes whose commits it
+    // carries. One-shot, deduped per (lane, sha), AMUX_DEPLOY_WAKE=0 to stop.
+    runtime_jobs::deploy_wake::spawn(state.clone());
 
     // STORAGE RETENTION (AMUX-2700). Seven append-only tables and three cache
     // directories had no retention at all — not leaking, just working as
