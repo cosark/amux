@@ -233,7 +233,7 @@ fn iso(ts: i64) -> String {
 pub(crate) fn ensure_signal_table(conn: &Connection) -> rusqlite::Result<()> {
     // The migration creates it; this keeps a store opened by an older binary's
     // test fixture (or a DB restored from before 0088) from 500ing the verb.
-    conn.execute_batch(include_str!("../../migrations/0088_board_signals.sql"))
+    conn.execute_batch(include_str!("../../migrations/0089_board_signals.sql"))
 }
 
 /// Cards currently parked on `name`: live (not deleted, archived or terminal).

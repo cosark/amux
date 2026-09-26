@@ -1,4 +1,4 @@
--- 0090_cmd_history_repeat_of.sql: an owner message that repeats an earlier ask
+-- 0091_cmd_history_repeat_of.sql: an owner message that repeats an earlier ask
 -- (F8(e), AMUX-5241).
 --
 -- Ethan sent mixpeek-ops-server the same request on 2026-09-25 and 2026-09-26

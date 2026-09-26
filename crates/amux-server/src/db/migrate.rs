@@ -509,14 +509,14 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../migrations/0089_board_signals.sql"),
     },
     Migration {
-        version: 89,
-        name: "0089_schedule_run_shell_output",
-        sql: include_str!("../../migrations/0089_schedule_run_shell_output.sql"),
+        version: 90,
+        name: "0090_schedule_run_shell_output",
+        sql: include_str!("../../migrations/0090_schedule_run_shell_output.sql"),
     },
     Migration {
-        version: 90,
-        name: "0090_cmd_history_repeat_of",
-        sql: include_str!("../../migrations/0090_cmd_history_repeat_of.sql"),
+        version: 91,
+        name: "0091_cmd_history_repeat_of",
+        sql: include_str!("../../migrations/0091_cmd_history_repeat_of.sql"),
     },
 ];
 
