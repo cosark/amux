@@ -620,6 +620,38 @@ pub(crate) fn scope_env_layers(home: &std::path::Path, lane: &str) -> Vec<std::p
     out
 }
 
+/// A DEFAULT-ON kill switch for an automatic behaviour, resolved the way the
+/// other scoped gates are: the process env (`~/.amux/server.env`) wins, then
+/// the worker > group > global scope files. Only an explicit `0`, `false`,
+/// `off` or `no` turns it off; an absent or unreadable value leaves it on, so a
+/// typo cannot silently disable a guard.
+pub(crate) fn scoped_gate_on(lane: &str, key: &str) -> bool {
+    scoped_gate_on_in(&home(), lane, key, std::env::var(key).ok().as_deref())
+}
+
+pub(crate) fn scoped_gate_on_in(
+    home: &std::path::Path,
+    lane: &str,
+    key: &str,
+    process_value: Option<&str>,
+) -> bool {
+    fn is_off(v: &str) -> bool {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    }
+    if let Some(v) = process_value.filter(|v| !v.trim().is_empty()) {
+        return !is_off(v);
+    }
+    if lane.is_empty() {
+        return true;
+    }
+    !scoped_setting_in(home, lane, key)
+        .as_deref()
+        .is_some_and(is_off)
+}
+
 pub(crate) fn scoped_setting_in(home: &std::path::Path, lane: &str, key: &str) -> Option<String> {
     fn nonempty(v: &str) -> Option<String> {
         let t = v.trim();
@@ -6129,6 +6161,10 @@ pub(crate) enum Delivery {
     Queued,
     /// Accepted by the board controller; the raw command is not a pane send.
     Board,
+    /// Typed straight into the worker's pane by a person, bypassing amux's
+    /// send path. Observed afterwards from the provider's UserPromptSubmit
+    /// hook, so amux never delivered it (F8(c), AMUX-5241).
+    Pane,
 }
 
 impl Delivery {
@@ -6137,6 +6173,7 @@ impl Delivery {
             Delivery::Direct => "direct",
             Delivery::Queued => "queued",
             Delivery::Board => "board",
+            Delivery::Pane => "pane",
         }
     }
 }
@@ -6792,7 +6829,7 @@ pub(crate) async fn cmd_hist_record_full(
     let _ = cmd_hist_record_with_id(state, session, text, ctype, origin, skip_board, meta).await;
 }
 
-async fn cmd_hist_record_with_id(
+pub(crate) async fn cmd_hist_record_with_id(
     state: &AppState,
     session: &str,
     text: &str,
@@ -6876,7 +6913,12 @@ async fn cmd_hist_record_with_id(
     // messages get an explicit coordination receipt unless the owner has
     // opted into legacy board delegation. No semantic model call is needed
     // to classify the producer; questions and control prompts remain exempt.
-    let task_bearing = matches!(ctype.as_str(), "user" | "schedule" | "session");
+    // A PANE-TYPED PROMPT IS A RECORD, NOT A DISPATCH (F8(c)). The person typed
+    // it into the lane's own composer and the lane is already working on it;
+    // amux learns about it only after the fact. Carding it would mint work the
+    // board never assigned and race the lane's own card for the same request.
+    let task_bearing = matches!(ctype.as_str(), "user" | "schedule" | "session")
+        && meta.delivery != Some(Delivery::Pane);
     // Carry the recorded row id out of the write so auto-capture can link the card.
     let msg_row_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     // delivered_at IS NOT A COPY OF ts ANY MORE (AMUX-3541).
@@ -11572,6 +11614,11 @@ async fn send_text_inner_bound(
             "a concurrent send to this lane waited instead of clearing another send's composer"
         );
     }
+    // Every text amux types reaches this line, including sends that write no
+    // Messages row (a raw curl without record_history). Noting it here is what
+    // lets the UserPromptSubmit hook tell an amux delivery from a prompt a
+    // person typed into the pane (F8(c)).
+    super::pane_prompts::note_delivery(name, text);
     let SendMode {
         defer_if_busy,
         from_steering,

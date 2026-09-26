@@ -50,6 +50,17 @@ class NativeStatus(unittest.TestCase):
             self.assertTrue(all(v['event_ts']==100 for v in values))
             self.assertFalse(observer.observe(dict(data,agent_id='child'),root,'worker','abc','codex',101))
 
+    def test_only_user_prompt_submit_carries_the_prompt_bounded(self):
+        # F8(c): the server records a prompt typed into the pane, so the submit
+        # edge carries its text. No other edge does.
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            observer.observe({'hook_event_name':'UserPromptSubmit','prompt':'x'*25000},root,'worker','abc','claude',1.0)
+            observer.observe({'hook_event_name':'PostToolUse','prompt':'private prompt'},root,'worker','abc','claude',2.0)
+            values=[json.loads(p.read_text()) for p in sorted((root/'status-events/worker/abc').glob('0*.json'))]
+            self.assertEqual(len(values[0]['prompt']),20000)
+            self.assertNotIn('prompt',values[1])
+
     def test_question_notification_preserves_waiting_but_real_permission_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

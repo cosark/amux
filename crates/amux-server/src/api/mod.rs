@@ -66,6 +66,7 @@ pub mod offline_origin;
 pub mod orchestrate;
 pub mod orchestrations;
 pub mod org;
+pub(crate) mod pane_prompts;
 pub mod planning;
 pub mod policy;
 pub mod prefs;

@@ -128,6 +128,12 @@ fn apply(
     }
     let prev = reports[name].clone();
     let mut report = event.clone();
+    // The prompt text rides the hook only so `pane_prompts` can record a
+    // pane-typed prompt (F8(c)). It must not be copied into the fleet-wide
+    // `session_reports` blob or every status event row.
+    if let Some(map) = report.as_object_mut() {
+        map.remove("prompt");
+    }
     report["ts"] = event["event_ts"].clone();
     report["received_at"] = json!(now);
     report["origin"] = json!(name);
@@ -188,18 +194,39 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
     }
     let name = name.to_owned();
     let body = body.clone();
+    let prompt = submitted_prompt(&body);
+    let worker = name.clone();
     let outcome = state
         .store
         .write_async(move |conn| apply(conn, &name, &body, &generation(&name)))
         .await;
     match outcome {
-        Ok(out) => Json(json!({"ok":true,"applied":out.applied})).into_response(),
+        Ok(out) => {
+            // Only an APPLIED edge: a duplicate or replayed observation of the
+            // same submit must not write the prompt twice.
+            if out.applied {
+                if let Some(prompt) = prompt {
+                    super::pane_prompts::record(state, &worker, &prompt).await;
+                }
+            }
+            Json(json!({"ok":true,"applied":out.applied})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":e.to_string()})),
         )
             .into_response(),
     }
+}
+
+/// The prompt a UserPromptSubmit observation carries, if any. Older hooks and
+/// the chat adapter send none, which is simply "nothing to record".
+fn submitted_prompt(event: &Value) -> Option<String> {
+    (event["event"] == "UserPromptSubmit")
+        .then(|| event["prompt"].as_str())
+        .flatten()
+        .filter(|p| !p.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Recover delivery without another model turn. Replay only complete, atomic
@@ -245,18 +272,23 @@ fn replay_run(state: &AppState, name: &str, dir: &Path) {
             continue;
         };
         let worker = name.to_owned();
+        let prompt = submitted_prompt(&body);
         let current = dir.parent().unwrap_or(dir).join("current.json");
-        if state
-            .store
-            .write(move |conn| {
-                let launch = std::fs::read_to_string(current)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or(Value::Null);
-                apply(conn, &worker, &body, &launch)
-            })
-            .is_ok()
-        {
+        if let Ok(reply) = state.store.write(move |conn| {
+            let launch = std::fs::read_to_string(current)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(Value::Null);
+            apply(conn, &worker, &body, &launch)
+        }) {
+            // A prompt submitted while the server was down still belongs in
+            // the ledger once the spool is replayed (F8(c)).
+            if let (true, Some(prompt), Ok(rt)) =
+                (reply.applied, prompt, tokio::runtime::Handle::try_current())
+            {
+                let (st, n) = (state.clone(), name.to_owned());
+                rt.spawn(async move { super::pane_prompts::record(&st, &n, &prompt).await });
+            }
             let _ = std::fs::remove_file(path);
         } else {
             break;
@@ -340,6 +372,44 @@ mod tests {
             .unwrap(),
             4
         );
+    }
+
+    #[test]
+    fn the_submitted_prompt_is_read_from_the_submit_edge_and_never_stored_in_status() {
+        let mut e = event(1, 100.0, "t", "UserPromptSubmit");
+        assert_eq!(submitted_prompt(&e), None, "older hooks send no prompt");
+        e["prompt"] = json!("land the PRs");
+        assert_eq!(submitted_prompt(&e).as_deref(), Some("land the PRs"));
+        let mut other = event(2, 101.0, "t", "PostToolUse");
+        other["prompt"] = json!("land the PRs");
+        assert_eq!(submitted_prompt(&other), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&tmp.path().join("test.db")).unwrap();
+        let now = crate::config::now_f64();
+        let launch = json!({"run_id":"run","provider":"codex","started":now-20.0});
+        let mut e = event(1, now - 1.0, "t", "UserPromptSubmit");
+        e["prompt"] = json!("a private instruction");
+        store
+            .write(move |c| apply(c, "native-prompt-strip", &e, &launch))
+            .unwrap();
+        let conn = store.read().unwrap();
+        let reports: String = conn
+            .query_row(
+                "SELECT value FROM prefs WHERE key='session_reports'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let events: String = conn
+            .query_row(
+                "SELECT data FROM session_events WHERE session='native-prompt-strip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!reports.contains("a private instruction"));
+        assert!(!events.contains("a private instruction"));
     }
 
     #[test]

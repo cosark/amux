@@ -77,6 +77,11 @@ def observe(data, root, worker, run, provider, occurred_at):
                    'event': data['hook_event_name'], 'source': provider + '-hook',
                    'session_id': data.get('session_id', ''),
                    'turn_id': data.get('turn_id', ''), 'model': data.get('model', '')}
+        # The submitted text, so amux can record a prompt a person typed into
+        # the pane (it never passed through amux's send path). Bounded; the
+        # server strips it before storing the status report (F8(c)).
+        if data.get('hook_event_name') == 'UserPromptSubmit' and isinstance(data.get('prompt'), str):
+            payload['prompt'] = data['prompt'][:20000]
         target = folder / ('%020d.json' % seq)
         for path, value in ((counter, {'sequence': seq, 'state': state}), (target, payload)):
             temp = path.with_suffix('.tmp')

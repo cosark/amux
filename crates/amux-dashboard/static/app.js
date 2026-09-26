@@ -18965,6 +18965,12 @@ function _msgDeliveryChip(e) {
     label = rec === 'voided' ? 'not delivered' : 'delivery unknown';
     color = '#f85149'; bg = 'rgba(248,81,73,0.16)';
     title = rec === 'voided' ? 'The queued message was cancelled before delivery' : 'Delivery was interrupted; the message may or may not have reached the worker';
+  } else if (rec === 'pane') {
+    // F8(c): typed straight into the worker's terminal, observed from the
+    // provider's submit hook. amux did not deliver it; without this arm it
+    // would fall through to the "direct?" inference below.
+    label = 'typed in pane'; color = '#58a6ff'; bg = 'rgba(88,166,255,0.14)';
+    title = 'Typed directly into the worker\'s terminal, not sent through amux. Recorded from the provider\'s prompt-submit hook.';
   } else if (rec === 'direct') {
     label = 'direct'; color = '#3fb950'; bg = 'rgba(63,185,80,0.14)';
     title = 'Handed to a live session at the moment it was sent';
