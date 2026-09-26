@@ -10738,6 +10738,54 @@ pub async fn patch_item(
             }
             set_opt("unresolved", &mut next.unresolved, &mut changed);
             set_opt("blocked_on", &mut next.blocked_on, &mut changed);
+            // AMUX-5237: `blocked_on = "signal:<name>"` is a NAMED SIGNAL WAIT,
+            // cleared by POST /api/signals/<name>. Two rules at write time.
+            // A malformed name is refused, because it is a wait no raise could
+            // ever clear. And a worker may park only its OWN card: a wait on a
+            // peer's card is the cross-worker dependency edge the board
+            // contract forbids, reached by a different field.
+            if changed.iter().any(|c| c == "blocked_on") {
+                if let Some(raw) = next.blocked_on.clone() {
+                    match super::signals::parse_signal_wait(&raw) {
+                        super::signals::SignalWait::NotASignal => {}
+                        super::signals::SignalWait::Invalid(bad) => {
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::BAD_REQUEST,
+                                    json!({
+                                        "error": "invalid signal name in blocked_on",
+                                        "code": "invalid_signal_name",
+                                        "name": bad,
+                                        "rule": "signal:<name>, name 1-64 chars of [a-z0-9._-] starting with a letter or digit",
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                        super::signals::SignalWait::Valid(name) => {
+                            if let Some(refusal) = super::signals::wait_owner_refusal(
+                                &caller_lane,
+                                next.session.as_deref(),
+                            ) {
+                                tracing::warn!(target: "amux::signals", card = %id_w,
+                                    caller = %caller_lane, signal = %name,
+                                    verdict = "signal_wait_not_own_card",
+                                    "signal wait refused on another worker's card");
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(StatusCode::FORBIDDEN, refusal),
+                                    no_write(),
+                                );
+                            }
+                            // Canonical form, so the raise's equality match
+                            // cannot miss a card over case or spacing.
+                            next.blocked_on =
+                                Some(format!("{}{name}", super::signals::SIGNAL_PREFIX));
+                        }
+                    }
+                }
+            }
             // AF-711: acceptance_criteria used to route through `set_opt` like a
             // plain nullable string column, via `body_opt_str`'s
             // `Some(v) => Some(v.as_str().map(str::to_string))`. An incoming

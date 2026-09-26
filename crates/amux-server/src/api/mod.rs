@@ -90,6 +90,7 @@ pub mod sessions_legacy;
 pub mod settings;
 pub mod simple;
 pub mod skills;
+pub mod signals;
 pub mod skin;
 pub mod speedtest;
 pub mod sql;
@@ -156,6 +157,10 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/memories", memories::routes())
         .nest("/api/messages", messages::routes())
         .nest("/api/schedules", schedules::routes())
+        // AMUX-5237: named clearance signals. A card waits with
+        // blocked_on="signal:<name>"; POST /api/signals/<name> raises it,
+        // clears those waits and wakes their lanes.
+        .nest("/api/signals", signals::routes())
         // RR-0110: universal FTS5 search across cards (incl. their log lines),
         // messages, memories, workers, journal and schedules. Net-new — there
         // was never a /api/search in the Python server or the SPA.

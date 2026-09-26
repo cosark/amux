@@ -7026,6 +7026,17 @@ fn blocker_recoveries_with_policy(
         }
         let deps = deps_blocking(conn, &row);
         let blocked = row.blocked_on.as_deref().unwrap_or("").trim();
+        // A NAMED SIGNAL WAIT IS NOT A BLOCKER TO RECOVER FROM (AMUX-5237).
+        // Recovery exists to talk a lane out of free-text peer waits that
+        // nothing will ever clear. `signal:<name>` is cleared by the raiser
+        // (POST /api/signals/<name>), which also wakes this lane, so prompting
+        // the lane to "remove the foreign wait" would argue it out of the one
+        // wait that has a mechanism. Other blockers on the same card still count.
+        let blocked = if crate::api::signals::signal_wait_name(Some(blocked)).is_some() {
+            ""
+        } else {
+            blocked
+        };
         let trigger = row.source_ref.as_deref().unwrap_or("").trim();
         let missing_next = bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
             != bs::ContinuationVerdict::Ok;

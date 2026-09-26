@@ -5423,6 +5423,11 @@ ${BOLD}Interaction:${RESET}
                                  ${DIM}anything long, multi-line, or containing code.${RESET}
   amux send <name> --keys 'C-c'  Send raw key sequence (e.g., Ctrl-C)
 
+${BOLD}Coordination:${RESET}
+  amux signal wait <CARD> <name> Park YOUR card until a peer raises <name>
+  amux signal raise <name> --note <text>
+                                 Raise it: clears every waiting card, wakes their lanes
+
 ${BOLD}Info:${RESET}
   amux ls                        List all workers with status and previews
   amux info <name>               Show worker config details
@@ -5939,6 +5944,105 @@ _warn_stale_amux_url() {
   return 0
 }
 
+# ── Named clearance signals (AMUX-5237) ─────────────────────────────────────
+#
+# A card waits on a NAMED signal instead of a peer's pane: gs-3-bucket-objects
+# regex-polled mvs-infra's peek for "clearance" and got a false positive, and
+# mixpeek-frustrations held ~145 cards on an approval already given in prose.
+#   amux signal wait <CARD> <name>       park YOUR card (blocked_on=signal:<name>)
+#   amux signal raise <name> --note ...  record it, clear every wait, wake lanes
+#   amux signal ls | show <name>         history and current waiters
+_signal_usage() {
+  cat <<USAGE
+${BOLD}amux signal${RESET} — wait on, or raise, a named clearance signal
+
+  amux signal wait <CARD> <name>              park YOUR card until <name> is raised
+  amux signal raise <name> [--note <text>]    raise it: clears every waiting card,
+                                              wakes each owning lane with the note
+  amux signal raise <name> --note-stdin       note read from stdin
+  amux signal show <name>                     raises of <name> and cards waiting on it
+  amux signal ls                              recent raises and all live waits
+
+  Names: 1-64 chars of [a-z0-9._-]. The wait is stored as blocked_on="signal:<name>",
+  so dispatch skips the card until the raise clears it. You may wait only on your own
+  card. Use a signal for an event another actor produces (a clearance, an approval),
+  not for work you could do yourself.
+USAGE
+}
+
+cmd_signal() {
+  local sub="${1:-help}"; shift 2>/dev/null || true
+  local me="${AMUX_WORKER:-${AMUX_SESSION:-}}"
+  case "$sub" in
+    wait)
+      local card="${1:-}" name="${2:-}"
+      [[ -n "$card" && -n "$name" ]] || die "Usage: amux signal wait <CARD> <name>"
+      local result
+      result=$(N="$name" python3 -c 'import json,os; print(json.dumps({"blocked_on": "signal:" + os.environ["N"].strip()}))' \
+        | _curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: $me" -d @- "$AMUX_API/api/board/$card")
+      echo "$result" | _board_outcome "$card" "" "waiting on signal $name" || return $?
+      # The event may already have happened. Say so, with who and when, rather
+      # than letting the card wait for a raise that already came and went.
+      _curl -sk "$AMUX_API/api/signals/$(printf '%s' "$name" | tr 'A-Z' 'a-z')" 2>/dev/null \
+        | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+last = d.get("last_raised")
+if last:
+    note = (" (note: " + last["note"] + ")") if last.get("note") else ""
+    print("note: " + d["name"] + " was last raised by " + last["raised_by"] + " at "
+          + last["raised_at_iso"] + note + ". If that was the event you need, unpark the card: "
+          "amux board unblock <CARD>.", file=sys.stderr)
+' || true
+      ;;
+    raise)
+      local name="${1:-}"; shift 2>/dev/null || true
+      [[ -n "$name" ]] || die "Usage: amux signal raise <name> [--note <text> | --note-stdin]"
+      local note=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --note)       note="${2:-}"; shift 2 ;;
+          --note-stdin) note="$(cat)"; shift ;;
+          *)            die "amux signal raise: unknown argument '$1'" ;;
+        esac
+      done
+      local resp
+      resp=$(NOTE="$note" python3 -c 'import json,os; print(json.dumps({"note": os.environ["NOTE"]}))' \
+        | _curl -sk -X POST -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: $me" -d @- "$AMUX_API/api/signals/$name") || die "cannot reach the server to raise $name"
+      RESP="$resp" python3 - <<'PY'
+import json, os, sys
+try:
+    d = json.loads(os.environ["RESP"])
+except Exception:
+    print("signal raise: unreadable response: " + os.environ["RESP"][:200], file=sys.stderr)
+    sys.exit(1)
+if not d.get("ok"):
+    print("signal raise FAILED: " + str(d.get("error") or d), file=sys.stderr)
+    sys.exit(1)
+cleared = d.get("cleared") or []
+print(f"raised {d['name']} at {d['raised_at_iso']} (id {d['id']}): cleared {len(cleared)} waiting card(s)")
+for w in d.get("woken") or []:
+    print(f"  {w['session'] or '(unowned)'}: {', '.join(w['cards'])} -> {w['delivery']}")
+PY
+      ;;
+    show)
+      local name="${1:-}"
+      [[ -n "$name" ]] || die "Usage: amux signal show <name>"
+      _curl -sk "$AMUX_API/api/signals/$name" | python3 -m json.tool
+      ;;
+    ls|list)
+      _curl -sk "$AMUX_API/api/signals" | python3 -m json.tool
+      ;;
+    help|--help|-h) _signal_usage ;;
+    *) _signal_usage; return 1 ;;
+  esac
+}
+
 # AF-928's actual check: everything below this point (dispatch, and the
 # tail's unconditional `exit "$?"`) must never run when sourced. Placed here,
 # not near the top comment, because every function above — including
@@ -5983,6 +6087,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     resume-all)       cmd_resume_all ;;
     serve|web)        shift; cmd_serve "$@" ;;
     board|b)          shift; cmd_board "$@" ;;
+    signal)           shift; cmd_signal "$@" ;;
     browser|br)      shift; cmd_browser "$@" ;;
     delegate)        shift; cmd_delegate "$@" ;;
     crm)              shift; cmd_crm "$@" ;;

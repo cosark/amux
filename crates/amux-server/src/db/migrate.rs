@@ -503,6 +503,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0088_window_stats_indexes",
         sql: include_str!("../../migrations/0088_window_stats_indexes.sql"),
     },
+    Migration {
+        version: 89,
+        name: "0089_board_signals",
+        sql: include_str!("../../migrations/0089_board_signals.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

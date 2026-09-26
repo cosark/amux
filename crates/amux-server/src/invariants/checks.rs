@@ -1116,6 +1116,9 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("board_overlap_members", "created_at", false),
     ("board_overlap_members", "last_seen_at", false),
     ("board_overlap_refs", "created_at", false),
+    // SECONDS: api/signals.rs `raise_in_store` stamps chrono::Utc::now().timestamp()
+    // (migration 0088, AMUX-5237).
+    ("board_signals", "raised_at", false),
     // SECONDS: DEFAULT (unixepoch('subsec')) in migration 0061.
     ("board_change_log", "changed_at", false),
     ("cmd_history", "delivered_at", true),

@@ -1731,6 +1731,15 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         path: "/api/schedules/{id}/run",
         methods: &["POST"],
     },
+    // AMUX-5237: named clearance signals.
+    RouteEntry {
+        path: "/api/signals",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/signals/{name}",
+        methods: &["GET", "POST"],
+    },
     RouteEntry {
         path: "/api/verify/{id}",
         methods: &["GET", "POST"],

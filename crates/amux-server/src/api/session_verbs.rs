@@ -17222,6 +17222,10 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
      directories. Do not create assignments or depends_on edges on other workers' \
      boards. Peer messages do not automatically become recipient tasks. Reuse \
      artifacts without waiting for their author's availability.\n\n\
+     When YOUR card truly needs an event only another lane can produce (a clearance, an \
+     approval), park it with `amux signal wait <CARD> <name>` instead of polling their pane. \
+     The lane that produces it runs `amux signal raise <name> --note <text>`, which clears \
+     every wait on that name and wakes you.\n\n\
      | worker | groups | description | provider / model | workspace / branch |\n|---|---|---|---|---|\n";
 
 /// The fleet roster every worker gets, regenerated on each write.
@@ -46160,6 +46164,9 @@ mod roster_tests {
         // And the header still says the things it exists to say.
         assert!(FLEET_ROSTER_HEADER.contains("| worker | groups | description |"));
         assert!(FLEET_ROSTER_HEADER.contains("INCLUDING YOU"));
+        // AMUX-5237: every worker learns the signal verbs without opting in.
+        assert!(FLEET_ROSTER_HEADER.contains("amux signal wait <CARD> <name>"));
+        assert!(FLEET_ROSTER_HEADER.contains("amux signal raise <name>"));
     }
 
     /// A header over nothing is itself a claim ("this lane recorded nothing").
