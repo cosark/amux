@@ -692,7 +692,7 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::MODEL_CATALOG_REFRESH,
         name: "Model catalog refresh",
-        purpose: "Probes each vendor's own list-models API (Anthropic, OpenAI, Gemini) when a key is configured and caches the merged result for /api/models and every ProviderAdapter::models(); a vendor with no key or a failed probe just keeps serving the static fallback.",
+        purpose: "Probes each vendor's own list-models API (Anthropic, OpenAI, Gemini) when a key is configured and caches the merged result for /api/models and every ProviderAdapter::models(). Each vendor is asked at most hourly after a success; a failed probe serves the last good listing (persisted in model-catalog-live.json, so it survives restarts) and is retried on the next 5-minute tick. A vendor with no key serves the static fallback.",
         env: &[EnvControl {
             var: "AMUX_MODEL_CATALOG_REFRESH_SECS",
             effect: "tick seconds; 0 disables the job (static catalog only)",

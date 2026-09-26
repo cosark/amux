@@ -5,15 +5,16 @@ use crate::provider::live_catalog;
 
 const JOB: &str = super::registry::ids::MODEL_CATALOG_REFRESH;
 
-/// Hourly. Vendor catalogs do not change minute to minute, and a refresh on
-/// every tick would be an unforced network call for no fresher an answer
-/// (ethos rule 2) — `AMUX_MODEL_CATALOG_REFRESH_SECS` overrides for anyone
-/// who wants tighter freshness. `spawn_periodic` ticks once immediately, so
-/// a fresh server boot with keys already configured populates the live
-/// catalog before the first `/api/models` request in practice, not an hour
-/// later.
+/// Every 5 minutes, but each vendor is only ASKED once per
+/// `live_catalog::FRESH_SECS` (an hour) after a success, so a healthy fleet
+/// still makes one call per vendor per hour (ethos rule 2). The short tick is
+/// for the failure case: a probe that times out is retried within minutes
+/// instead of leaving that vendor on its cached or static list for an hour
+/// (2026-09-26: a timed-out boot probe hid `claude-opus-5-5` for 47 minutes).
+/// `spawn_periodic` ticks once immediately, so a fresh boot populates the
+/// catalog before the first `/api/models` request in practice.
 pub fn spawn() -> super::PeriodicTask {
-    super::spawn_periodic(JOB, 3600, || async {
+    super::spawn_periodic(JOB, 300, || async {
         live_catalog::refresh(&crate::config::amux_home()).await;
     })
 }

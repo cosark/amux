@@ -32,6 +32,74 @@ use super::model_catalog::{self, ModelDescriptor};
 /// One budget for every vendor probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Last successful listing per vendor, persisted under the amux home.
+///
+/// Before this, the live ids lived only in process memory and a failed probe
+/// replaced them with nothing. The builder restarts this binary on every
+/// commit, so ONE slow first probe after a deploy dropped the pickers back to
+/// the compiled-in list until the next hourly tick. Measured 2026-09-26: the
+/// 19:20 boot probe timed out on both vendors, `claude-opus-5-5` (live-only,
+/// newer than the static catalog) vanished from every model picker, and came
+/// back at 20:07. A failed probe now serves this cache instead, marked as such.
+const LAST_GOOD_FILE: &str = "model-catalog-live.json";
+
+/// A vendor listed successfully within this window is not asked again. The
+/// refresh job ticks more often than this so a FAILED vendor is retried soon,
+/// without re-fetching the ones that answered.
+pub const FRESH_SECS: i64 = 3600;
+
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq)]
+pub struct LastGood {
+    pub ids: Vec<String>,
+    pub fetched_at: i64,
+}
+
+fn load_last_good(home: &Path) -> BTreeMap<String, LastGood> {
+    std::fs::read(home.join(LAST_GOOD_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_last_good(home: &Path, map: &BTreeMap<String, LastGood>) {
+    let path = home.join(LAST_GOOD_FILE);
+    let tmp = home.join(format!("{LAST_GOOD_FILE}.tmp"));
+    let ok = serde_json::to_vec(map)
+        .ok()
+        .and_then(|b| std::fs::write(&tmp, b).ok())
+        .and_then(|()| std::fs::rename(&tmp, &path).ok())
+        .is_some();
+    if !ok {
+        tracing::warn!(kind = "provider_model_catalog_cache_write_failed", path = %path.display(),
+            "could not persist the last good model listing; a restart will not be able to reuse it");
+    }
+}
+
+/// What one vendor contributes to this refresh.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VendorOutcome {
+    /// Listed by this probe.
+    Live { ids: Vec<String>, fetched_at: i64 },
+    /// The probe failed; serving the last good listing from `fetched_at`.
+    Cached { ids: Vec<String>, fetched_at: i64, error: String },
+    /// The probe failed and nothing was ever listed.
+    Failed(String),
+    /// No credential for this vendor.
+    Unconfigured,
+}
+
+/// Pure decision, so the fallback can be tested without a network.
+pub fn decide(prev: Option<&LastGood>, attempt: Option<Result<Vec<String>, String>>, now: i64) -> VendorOutcome {
+    match attempt {
+        None => VendorOutcome::Unconfigured,
+        Some(Ok(ids)) => VendorOutcome::Live { ids, fetched_at: now },
+        Some(Err(error)) => match prev {
+            Some(p) if !p.ids.is_empty() => VendorOutcome::Cached { ids: p.ids.clone(), fetched_at: p.fetched_at, error },
+            _ => VendorOutcome::Failed(error),
+        },
+    }
+}
+
 /// (vendor label, amux provider id, env key that must hold that vendor's key)
 /// — the only three vendors with a real list-models HTTP endpoint today.
 /// Ollama already lists live via `ollama list` (`static_providers.rs`); Muse
@@ -53,8 +121,9 @@ pub struct CatalogEntry {
     pub model_type: String,
     pub worker_selectable: bool,
     /// "live" when this id came from the vendor's own listing on the most
-    /// recent successful refresh; "static" when it is only known from the
-    /// compiled-in fallback.
+    /// recent successful refresh; "cached" when the latest probe failed and
+    /// this id is from the last good listing; "static" when it is only known
+    /// from the compiled-in fallback.
     pub source: &'static str,
 }
 
@@ -80,6 +149,9 @@ pub struct ProviderStatus {
     pub fetched_at: Option<i64>,
     pub model_count: Option<usize>,
     pub error: Option<String>,
+    /// True when the probe failed and the ids served are the last good
+    /// listing (from `fetched_at`), not a fresh one.
+    pub serving_cached: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,8 +210,17 @@ pub async fn refresh(home: &Path) {
         by_id.insert((m.provider, m.id.to_string()), CatalogEntry::from(*m));
     }
 
+    let mut last_good = load_last_good(home);
+    let now = chrono::Utc::now().timestamp();
     let mut providers = Vec::with_capacity(HTTP_VENDORS.len());
     for (vendor, provider, env_key) in HTTP_VENDORS {
+        let prev = last_good.get(vendor).cloned();
+        if let Some(p) = prev.as_ref().filter(|p| !p.ids.is_empty() && now - p.fetched_at < FRESH_SECS) {
+            merge_ids(&mut by_id, vendor, provider, p.ids.clone(), "live");
+            providers.push(ProviderStatus { vendor, configured: true, live: true, fetched_at: Some(p.fetched_at),
+                model_count: Some(p.ids.len()), error: None, serving_cached: false });
+            continue;
+        }
         // Claude: prefer the subscription OAuth token every Claude Code
         // install already holds (super::claude::probe_models_raw) — it
         // answers the public list-models endpoint too, verified live
@@ -175,56 +256,40 @@ pub async fn refresh(home: &Path) {
             }
         };
         let configured = attempt.is_some();
-        let status = match attempt {
-            None => ProviderStatus {
-                vendor,
-                configured,
-                live: false,
-                fetched_at: None,
-                model_count: None,
-                error: None,
+        let status = match decide(prev.as_ref(), attempt, now) {
+            VendorOutcome::Unconfigured => ProviderStatus {
+                vendor, configured, live: false, fetched_at: None, model_count: None, error: None, serving_cached: false,
             },
-            Some(Ok(ids)) => {
-                let now = chrono::Utc::now().timestamp();
+            VendorOutcome::Live { ids, fetched_at } => {
                 let count = ids.len();
-                for id in ids {
-                    let existing = by_id.get(&(provider, id.clone()));
-                    let (model_type, worker_selectable) = classify(existing, &id);
-                    by_id.insert(
-                        (provider, id.clone()),
-                        CatalogEntry {
-                            vendor: vendor.to_string(),
-                            provider: provider.to_string(),
-                            id,
-                            model_type,
-                            worker_selectable,
-                            source: "live",
-                        },
-                    );
-                }
+                last_good.insert(vendor.to_string(), LastGood { ids: ids.clone(), fetched_at });
+                merge_ids(&mut by_id, vendor, provider, ids, "live");
                 ProviderStatus {
-                    vendor,
-                    configured,
-                    live: true,
-                    fetched_at: Some(now),
-                    model_count: Some(count),
-                    error: None,
+                    vendor, configured, live: true, fetched_at: Some(fetched_at), model_count: Some(count),
+                    error: None, serving_cached: false,
                 }
             }
-            Some(Err(reason)) => ProviderStatus {
-                vendor,
-                configured,
-                live: false,
-                fetched_at: None,
-                model_count: None,
-                error: Some(reason),
+            VendorOutcome::Cached { ids, fetched_at, error } => {
+                let count = ids.len();
+                tracing::warn!(kind = "provider_model_catalog_serving_cached", vendor, %error,
+                    cached_from = fetched_at, n_ids = count, measured = true, n_considered = count,
+                    "vendor model listing failed; serving the last good listing instead of dropping to the static catalog");
+                merge_ids(&mut by_id, vendor, provider, ids, "cached");
+                ProviderStatus {
+                    vendor, configured, live: false, fetched_at: Some(fetched_at), model_count: Some(count),
+                    error: Some(error), serving_cached: true,
+                }
+            }
+            VendorOutcome::Failed(error) => ProviderStatus {
+                vendor, configured, live: false, fetched_at: None, model_count: None, error: Some(error), serving_cached: false,
             },
         };
         providers.push(status);
     }
 
+    save_last_good(home, &last_good);
     let entries: Vec<CatalogEntry> = by_id.into_values().collect();
-    let n_live = entries.iter().filter(|e| e.source == "live").count();
+    let n_live = entries.iter().filter(|e| e.source != "static").count();
     tracing::info!(
         kind = "provider_model_catalog_refreshed",
         measured = true,
@@ -242,6 +307,24 @@ pub async fn refresh(home: &Path) {
     };
     if let Ok(mut g) = cell().write() {
         *g = Some(snapshot);
+    }
+}
+
+/// Union one vendor's ids over the catalog, keyed by (provider, id).
+fn merge_ids(
+    by_id: &mut BTreeMap<(&'static str, String), CatalogEntry>,
+    vendor: &str,
+    provider: &'static str,
+    ids: Vec<String>,
+    source: &'static str,
+) {
+    for id in ids {
+        let existing = by_id.get(&(provider, id.clone()));
+        let (model_type, worker_selectable) = classify(existing, &id);
+        by_id.insert(
+            (provider, id.clone()),
+            CatalogEntry { vendor: vendor.to_string(), provider: provider.to_string(), id, model_type, worker_selectable, source },
+        );
     }
 }
 
@@ -411,6 +494,36 @@ async fn fetch_gemini(key: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_probe_serves_the_last_good_listing_not_the_static_list() {
+        let prev = LastGood { ids: vec!["claude-opus-5-5".into()], fetched_at: 100 };
+        // Failure with a previous success: the old ids stay, marked cached.
+        assert_eq!(
+            decide(Some(&prev), Some(Err("timeout".into())), 500),
+            VendorOutcome::Cached { ids: vec!["claude-opus-5-5".into()], fetched_at: 100, error: "timeout".into() }
+        );
+        // Failure with nothing ever listed: an honest failure, not an empty success.
+        assert_eq!(decide(None, Some(Err("timeout".into())), 500), VendorOutcome::Failed("timeout".into()));
+        let empty = LastGood { ids: vec![], fetched_at: 100 };
+        assert_eq!(decide(Some(&empty), Some(Err("x".into())), 500), VendorOutcome::Failed("x".into()));
+        // Success replaces the cache.
+        assert_eq!(
+            decide(Some(&prev), Some(Ok(vec!["a".into()])), 500),
+            VendorOutcome::Live { ids: vec!["a".into()], fetched_at: 500 }
+        );
+        assert_eq!(decide(Some(&prev), None, 500), VendorOutcome::Unconfigured);
+    }
+
+    #[test]
+    fn the_last_good_listing_survives_a_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let mut m = BTreeMap::new();
+        m.insert("anthropic".to_string(), LastGood { ids: vec!["claude-opus-5-5".into()], fetched_at: 42 });
+        save_last_good(home.path(), &m);
+        assert_eq!(load_last_good(home.path()), m);
+        assert!(load_last_good(tempfile::tempdir().unwrap().path()).is_empty());
+    }
 
     #[test]
     fn known_id_keeps_its_static_classification() {
