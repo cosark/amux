@@ -1,0 +1,10 @@
+-- 0090_cmd_history_repeat_of.sql: an owner message that repeats an earlier ask
+-- (F8(e), AMUX-5241).
+--
+-- Ethan sent mixpeek-ops-server the same request on 2026-09-25 and 2026-09-26
+-- because the first result was not findable. The send path now notices a
+-- near-duplicate owner message to the same lane within 14 days and records
+-- the earlier message's id here, so the Messages tab can show "repeats
+-- MSG-<id>". NULL on every existing row and on every message that is not a
+-- repeat; nothing is backfilled.
+-- ADDCOL: cmd_history repeat_of INTEGER

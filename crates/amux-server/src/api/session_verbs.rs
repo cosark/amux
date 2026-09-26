@@ -5965,6 +5965,8 @@ pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Resu
         [],
     );
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN queue_id TEXT", []);
+    // Migration 0088 carries the same ADDCOL for migrated DBs (F8(e)).
+    let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN repeat_of INTEGER", []);
     // Dead-lettered vs delivered must be distinguishable in history
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
     // this covers a DB bootstrapped through this legacy path).
@@ -6256,6 +6258,9 @@ pub(crate) struct DeliveryMeta<'a> {
     /// promise is removed rather than softened, because a docstring that
     /// describes an unbuilt mechanism is what got `delivered_at` believed.
     pub submit_verdict: Option<&'a str>,
+    /// The earlier owner message this one repeats (F8(e), migration 0088).
+    /// None for everything that is not a detected repeat.
+    pub repeat_of: Option<i64>,
 }
 
 impl DeliveryMeta<'_> {
@@ -6265,6 +6270,7 @@ impl DeliveryMeta<'_> {
             queued_at_ms: Some(at_ms),
             submit_verdict: Some("accepted"),
             client_meta: None,
+            repeat_of: None,
         }
     }
     /// A send handed straight to a live lane, with nothing to verify.
@@ -6298,6 +6304,7 @@ impl DeliveryMeta<'_> {
             queued_at_ms: Some(at_ms),
             submit_verdict: None,
             client_meta: None,
+            repeat_of: None,
         }
     }
 }
@@ -6849,6 +6856,7 @@ pub(crate) async fn cmd_hist_record_with_id(
     let board_delivery = delivery.as_deref() == Some("board");
     let submit_verdict = meta.submit_verdict.map(|v| v.to_string());
     let queued_at_ms = meta.queued_at_ms;
+    let repeat_of = meta.repeat_of;
     // Bounded, and only if it parses as a JSON OBJECT. This lands in a column
     // the Messages tab renders and the Ask panel feeds to a model, so a client
     // must not be able to write a megabyte of arbitrary text into it, nor a
@@ -6996,12 +7004,12 @@ pub(crate) async fn cmd_hist_record_with_id(
                 dup_prior_ts_w.store(pts, std::sync::atomic::Ordering::SeqCst);
             }
             conn.execute(
-                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO cmd_history (text, type, session, ts, origin, delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
                     delivery, queued_at_ms, delivered_at_ms, submit_verdict, capture_pending,
-                    client_meta
+                    client_meta, repeat_of
                 ],
             )?;
             let row_id = conn.last_insert_rowid();
@@ -25054,6 +25062,22 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             }),
         );
     }
+    // A REPEAT ASK IS SAID OUT LOUD (F8(e), AMUX-5241). Ethan sent
+    // mixpeek-ops-server the same request on 09-25 and 09-26 because the first
+    // result was not findable, and the lane got the second copy as new work.
+    // Owner messages only: a peer or automation resend is a different problem,
+    // and an isolated lane receives the owner's text untouched. The note goes
+    // on the DELIVERED text; the history row keeps the original words and
+    // records the link in `repeat_of`.
+    let repeat = if matches!(send_origin, SendOrigin::Owner) && !isolated {
+        super::repeat_ask::lookup(state, name, &orig_text).await
+    } else {
+        None
+    };
+    if let Some((rid, rts)) = repeat {
+        text = format!("{}{text}", super::repeat_ask::note(rid, rts));
+    }
+    let repeat_of = repeat.map(|(rid, _)| rid);
     if !isolated && parse_env(name).get("CC_PROJECT").is_some() {
         let task = state
             .store
@@ -25131,7 +25155,10 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             "user",
             actor,
             skip_board,
-            DeliveryMeta::board(now_i64() * 1000),
+            DeliveryMeta {
+                repeat_of,
+                ..DeliveryMeta::board(now_i64() * 1000)
+            },
         )
         .await;
         let receipt = state.store.read().ok().and_then(|c| {
@@ -25293,6 +25320,7 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             // composing human and no device, so attaching this to it would
             // invent a sender context for a machine.
             client_meta: None,
+            repeat_of,
         };
         if record_history {
             let email = headers
@@ -25386,6 +25414,7 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
                 queued_at_ms: None,
                 submit_verdict: Some(verdict),
                 client_meta: None,
+                repeat_of,
             };
             if record_history {
                 let email = headers
@@ -34754,6 +34783,7 @@ mod tests {
                 queued_at_ms: None,
                 submit_verdict: Some("stuck"),
                 client_meta: None,
+                repeat_of: None,
             },
         )
         .await;
@@ -34808,6 +34838,7 @@ mod tests {
                 queued_at_ms: None,
                 submit_verdict: Some("stuck"),
                 client_meta: None,
+                repeat_of: None,
             },
         )
         .await;
@@ -34942,6 +34973,7 @@ mod tests {
                 queued_at_ms: Some(1_000),
                 submit_verdict: Some("retried"),
                 client_meta: None,
+                repeat_of: None,
             },
         )
         .await;
@@ -36113,6 +36145,7 @@ mod tests {
                     queued_at_ms: None,
                     submit_verdict: Some("confirmed"),
                     client_meta: None,
+                    repeat_of: None,
                 },
             )
             .await;
@@ -36235,6 +36268,7 @@ mod tests {
                 queued_at_ms: None,
                 submit_verdict: Some("confirmed"),
                 client_meta: None,
+                repeat_of: None,
             },
         )
         .await;

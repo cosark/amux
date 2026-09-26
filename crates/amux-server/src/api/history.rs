@@ -180,7 +180,7 @@ async fn get_history_item(
     let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
         let conn = store.read()?;
         let sql = "SELECT id, text, type, session, ts, origin, card_id, \
-                   delivery, queued_at, delivered_at, submit_verdict, capture_pending, queue_id, \
+                   delivery, queued_at, delivered_at, submit_verdict, capture_pending, queue_id, repeat_of, \
                    (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
                    (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
                    (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \
@@ -827,7 +827,7 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
                 // NULL — the UI distinguishes "not recorded" from "direct", and
                 // coalescing here would assert a delivery path nobody observed.
                 "SELECT id, text, type, session, ts, origin, card_id, \
-             delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, \
+             delivery, queued_at, delivered_at, submit_verdict, capture_pending, client_meta, repeat_of, \
              (SELECT title FROM issues WHERE issues.id=cmd_history.card_id) AS card_title, \
              (SELECT status FROM issues WHERE issues.id=cmd_history.card_id) AS card_status, \
              (SELECT archived FROM issues WHERE issues.id=cmd_history.card_id) AS card_archived, \

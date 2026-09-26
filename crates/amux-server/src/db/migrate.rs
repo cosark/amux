@@ -513,6 +513,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0089_schedule_run_shell_output",
         sql: include_str!("../../migrations/0089_schedule_run_shell_output.sql"),
     },
+    Migration {
+        version: 90,
+        name: "0090_cmd_history_repeat_of",
+        sql: include_str!("../../migrations/0090_cmd_history_repeat_of.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

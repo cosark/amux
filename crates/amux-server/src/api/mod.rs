@@ -85,6 +85,7 @@ pub mod scope;
 pub mod screen;
 pub mod search;
 pub mod self_update;
+pub(crate) mod repeat_ask;
 pub(crate) mod send_probe;
 pub mod session_verbs;
 pub mod sessions_git;
