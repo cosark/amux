@@ -129,6 +129,24 @@ pub(crate) fn tail_paragraphs(text: &str, n: usize) -> String {
     paras[start..].join("\n\n")
 }
 
+/// The paragraphs an ask can sit in: the last two, plus the one before them
+/// when it ends with a colon, because then it INTRODUCES the list below it.
+/// gs-4, 2026-09-26: "Everything else remaining is waiting on your reply to my
+/// previous message:" followed by a two-item list and a closing line; the ask
+/// was the third paragraph from the end and read as no ask at all.
+pub(crate) fn ask_tail(said: &str) -> String {
+    let paras: Vec<&str> = rx!(r"\n[ \t]*\n")
+        .split(said)
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut start = paras.len().saturating_sub(2);
+    while start > 0 && paras[start - 1].trim_end().ends_with(':') && paras.len() - start < 4 {
+        start -= 1;
+    }
+    paras[start..].join("\n\n")
+}
+
 /// Sentences, split on terminal punctuation and on line breaks (a bullet is a
 /// sentence), with list markers and markdown emphasis stripped.
 pub(crate) fn sentences(text: &str) -> Vec<String> {
@@ -265,9 +283,9 @@ pub(crate) enum OwnerAsk {
 /// for a go-ahead; none matches a worker merely reporting that it asked
 /// somebody. Real specimens from the 2026-09-26 review are the test fixtures.
 fn is_ask_sentence(s: &str) -> bool {
-    let pats: [&regex::Regex; 12] = [
+    let pats: [&regex::Regex; 13] = [
         rx!(r"\bsay go\b|\bsay the word\b"),
-        rx!(r"\b(awaiting|waiting (on|for)|need|needs|want) your (word|go|go-?ahead|call|decision|approval|sign-?off|ok|okay|green ?light|confirmation|answer)\b"),
+        rx!(r"\b(awaiting|waiting (on|for)|need|needs|want) your (word|go|go-?ahead|call|decisions?|approvals?|sign-?off|ok|okay|green ?light|confirmation|answers?|reply|replies|input)\b"),
         rx!(r"\bon your (word|go|signal|say-?so)\b"),
         rx!(r"\bunless you (want|would like|'d like|prefer|say|object)\b"),
         rx!(r"\bneeds? (one|a|1|two|2) (thing|things|decision|decisions|answer|call|input) from you\b|\bone thing from you\b"),
@@ -278,6 +296,9 @@ fn is_ask_sentence(s: &str) -> bool {
         rx!(r"\bready (to go |to proceed )?(when|once) you (are|say|give)\b"),
         rx!(r"\byour call\b|\bgo/no-?go\b"),
         rx!(r"^blocked-ask\b"),
+        // gs-4-gke-minimization, 2026-09-26: "Still waiting for your answers:
+        // the six permission lines, the re-login, and the ten decisions".
+        rx!(r"\bstill (waiting|blocked) (on|for) (you|your)\b"),
     ];
     pats.iter().any(|p| p.is_match(s))
 }
@@ -338,7 +359,7 @@ pub(crate) fn classify_owner_ask(text: &str) -> OwnerAsk {
         .rev()
         .find(|l| l.starts_with("blocked-ask"))
         .map(str::to_string);
-    let tail = tail_paragraphs(&said, 2);
+    let tail = ask_tail(&said);
     let sents = sentences(&tail);
     let hit = sents
         .iter()
@@ -612,9 +633,10 @@ async fn file_ask_card(
     origin: &str,
 ) -> Result<(String, bool, AskPath), String> {
     let ask_type = kind.map(Boundary::ask_type).unwrap_or("decision");
-    file_ask_card_via(state, lane, kind, question, context, origin, AskPath::for_type(lane, ask_type)).await
+    file_ask_card_via(state, lane, kind, question, context, origin, AskPath::for_type(lane, ask_type), false).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn file_ask_card_via(
     state: &AppState,
     lane: &str,
@@ -623,6 +645,7 @@ async fn file_ask_card_via(
     context: &str,
     origin: &str,
     path: AskPath,
+    isolated: bool,
 ) -> Result<(String, bool, AskPath), String> {
     use crate::db::board_store as bs;
     let tag = question_key(question);
@@ -631,6 +654,10 @@ async fn file_ask_card_via(
     let label = kind.map(Boundary::label).unwrap_or("decision");
     let title = format!("Owner ask ({label}): {}", clip(question, 110));
     let why = match kind {
+        _ if isolated => format!(
+            "because {lane} is isolated: amux may not steer it and only the owner's own messages reach it, \
+             so the ask is recorded here instead of living only in its terminal"
+        ),
         Some(_) => format!(
             "because the ask touches the standing-authority boundary ({label}), so it was not steered"
         ),
@@ -639,6 +666,9 @@ async fn file_ask_card_via(
             .to_string(),
     };
     let unblocks = match kind {
+        None if isolated => format!(
+            "{owner} answers on this card and sends the answer to {lane} directly (an isolated lane only accepts the owner's messages)."
+        ),
         Some(k) => k.unblocks(&owner, lane),
         None => format!(
             "{owner} confirms or overrides the choice on this card; {lane} has already proceeded on its recommended option."
@@ -647,10 +677,13 @@ async fn file_ask_card_via(
     let desc = format!(
         "{lane} asked the owner. Filed automatically by the {origin} (AMUX-5234) {why}.\n\n\
          Question: {question}\n\nContext, in the worker's words:\n\n{}",
-        clip(context, 1500)
+        clip(context, if isolated { 6000 } else { 1500 })
     );
     let needsyou = path == AskPath::NeedsYou;
     let mut tags = vec![tag.clone()];
+    if isolated {
+        tags.push(ISOLATED_ASK_TAG.to_string());
+    }
     if needsyou {
         tags.insert(0, bs::NEEDS_YOU_TAG.to_string());
     }
@@ -685,6 +718,7 @@ async fn file_ask_card_via(
     let rationale = format!("{why}. {unblocks}");
     let lane_s = lane.to_string();
     let q = question.to_string();
+    let update_ctx = context.to_string();
     let found = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, bool)>));
     let slot = found.clone();
     state
@@ -700,15 +734,44 @@ async fn file_ask_card_via(
                     |r| r.get(0),
                 )
                 .optional()?;
+            // An isolated lane repeats its ask every turn in slightly different
+            // words (gs-4 did so nine times in a row under a goal check). One
+            // open card per lane, updated, beats a card per rephrasing.
+            let existing = match existing {
+                Some(id) => Some((id, false)),
+                None if isolated => conn
+                    .query_row(
+                        "SELECT i.id FROM issues i JOIN issue_tags t ON t.issue_id = i.id \
+                         WHERE i.session = ?1 AND t.tag = ?2 AND i.deleted IS NULL \
+                         AND i.status NOT IN ('done','verified','discarded') \
+                         ORDER BY i.updated DESC LIMIT 1",
+                        rusqlite::params![lane_s, ISOLATED_ASK_TAG],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|id| (id, true)),
+                None => None,
+            };
             let out = match existing {
-                Some(id) => (id, false),
+                Some((id, false)) => (id, false),
+                Some((id, true)) => {
+                    if let Some(mut row) = bs::get_issue(conn, &id)? {
+                        row.desc.push_str(&format!(
+                            "\n\n--- Update {}: the lane asked again ---\n\nQuestion: {q}\n\n{}",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M"),
+                            clip(&update_ctx, 4000)
+                        ));
+                        bs::save_patched(conn, &mut row)?;
+                    }
+                    (id, false)
+                }
                 None => {
                     let row = bs::create_issue(conn, &new, crate::config::now_f64() as i64)?;
                     if !needsyou {
                         // NewIssue has no decision/wait fields; set them the way
                         // PATCH does, through the one row writer.
                         if let Some(mut row) = bs::get_issue(conn, &row.id)? {
-                            row.decision_question = Some(q);
+                            row.decision_question = Some(q.clone());
                             row.decision_rationale = Some(rationale);
                             row.waiting_on = Some(waiting_on);
                             bs::save_patched(conn, &mut row)?;
@@ -725,6 +788,69 @@ async fn file_ask_card_via(
     let out = found.lock().unwrap_or_else(|e| e.into_inner()).take();
     out.map(|(id, created)| (id, created, path))
         .ok_or_else(|| "card write returned no id".into())
+}
+
+/// Kill switch for recording an ISOLATED lane's owner asks as cards.
+pub(crate) const ISOLATED_ASK_KEY: &str = "AMUX_ISOLATED_ASK_CARDS";
+/// Tag on every card this path files, so a repeat updates the open card.
+pub(crate) const ISOLATED_ASK_TAG: &str = "isolated-owner-ask";
+
+/// Items in a list: numbered or bulleted lines, and numbered table rows
+/// (gs-4 put its ten decisions in a `| # | Decision | My default |` table).
+fn enumerated_lines(text: &str) -> usize {
+    text.lines()
+        .filter(|l| {
+            rx!(r"^\s*(\d{1,2}[.)]|[-*\u{2022}])\s+\S").is_match(l)
+                || rx!(r"^\s*\|\s*#?\d{1,2}\s*\|").is_match(l)
+        })
+        .count()
+}
+
+/// A message that only points back at an earlier one ("in my earlier
+/// message", "from two messages ago", "still waiting"). gs-4 sent six of those
+/// in a row; attaching one of them would hand the owner another pointer.
+fn is_pointer_message(lower: &str) -> bool {
+    rx!(r"\b(previous|earlier|last|prior) message\b|\bmessages? ago\b|\bmessage above\b|\bstill (waiting|stopped|blocked)\b")
+        .is_match(lower)
+}
+
+/// The list an ask points back to. gs-4's turns end on "Still waiting for your
+/// answers: the six permission lines, the re-login, and the ten decisions",
+/// while the lines and the decisions themselves are in an EARLIER message. A
+/// card carrying only the pointer is useless to the owner, so when the final
+/// text enumerates fewer than three items, attach the newest earlier assistant
+/// message (main thread, last 60 messages) that enumerates at least three and
+/// talks about decisions, permissions, grants or answers.
+pub(crate) fn earlier_ask_list(records: &[Value], final_text: &str) -> Option<String> {
+    if enumerated_lines(final_text) >= 3 {
+        return None;
+    }
+    let final_norm = final_text.trim();
+    let mut seen = 0;
+    for r in records.iter().rev() {
+        if r["type"] != "assistant" || r["isSidechain"] == true {
+            continue;
+        }
+        let t = text_blocks(&r["message"]["content"]).join("\n\n");
+        let t = t.trim();
+        if t.is_empty() || t == final_norm || final_norm.contains(t) {
+            continue;
+        }
+        seen += 1;
+        if seen > 60 {
+            break;
+        }
+        let lower = t.to_lowercase();
+        if is_pointer_message(&lower) {
+            continue;
+        }
+        if enumerated_lines(t) >= 3
+            && rx!(r"\b(decisions?|permissions?|grants?|answers?|approve|approval|sign[- ]?in|re-?login|questions?|defaults?)\b").is_match(&lower)
+        {
+            return Some(t.to_string());
+        }
+    }
+    None
 }
 
 const BOUNDARY_TEXT: &str = "spending money, anything a customer or outside person \
@@ -745,9 +871,10 @@ fn steer_text(sentence: &str) -> String {
 /// The turn-end consumer. Spawned from the report handler on the idle edge
 /// (legacy Stop hook) and on an applied native `Stop` event.
 pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: String) {
-    if sv::session_is_isolated(&name) || sv::provider_of(&sv::parse_env(&name)) != "claude" {
+    if sv::provider_of(&sv::parse_env(&name)) != "claude" {
         return;
     }
+    let isolated = sv::session_is_isolated(&name);
     // The Stop hook fires as the final record is written; give the transcript
     // writer a moment so the classifier reads the turn that just ended.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -761,6 +888,10 @@ pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: Strin
         return;
     };
     let verdict = classify_owner_ask(&turn.text);
+    if isolated {
+        isolated_owner_ask(&state, &name, &records, &turn, verdict).await;
+        return;
+    }
     match verdict {
         OwnerAsk::None => {
             tracing::debug!(session = %name, verdict = "owner_ask_none", "turn-end: no owner ask at the end of the turn");
@@ -825,6 +956,47 @@ pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: Strin
     }
 }
 
+/// An ISOLATED lane's turn ended on an owner ask. Nothing may steer it (only the
+/// owner's own messages reach it), so the ask becomes a card on the lane's own
+/// board with the full list it refers to. Measured 2026-09-26: gs-4 ended nine
+/// turns in a row on "Still waiting for your answers: the six permission lines,
+/// the re-login, and the ten decisions", the goal paused, and the only record
+/// of those ten decisions was its terminal.
+async fn isolated_owner_ask(state: &AppState, name: &str, records: &[Value], turn: &TurnTail, verdict: OwnerAsk) {
+    let (sentence, kind) = match verdict {
+        OwnerAsk::None => return,
+        OwnerAsk::InBoundary { sentence } => (sentence, None),
+        OwnerAsk::Boundary { sentence, kind } => (sentence, Some(kind)),
+    };
+    if !enabled(name, ISOLATED_ASK_KEY) {
+        tracing::info!(session = %name, verdict = "isolated_ask_disabled", sentence = %clip(&sentence, 160),
+            "turn-end: isolated lane's owner ask not recorded ({ISOLATED_ASK_KEY} is off)");
+        return;
+    }
+    if !claim_once(state, name, "turn_end.isolated_ask", format!("isolated-ask:{name}:{}", turn.uuid),
+        json!({"sentence": sentence, "uuid": turn.uuid})).await
+    {
+        return;
+    }
+    let question = as_question(&sentence, name);
+    let mut context = tail_paragraphs(&turn.text, 3);
+    let earlier = earlier_ask_list(records, &turn.text);
+    if let Some(list) = &earlier {
+        context.push_str("\n\nThe earlier message this ask refers to:\n\n");
+        context.push_str(list);
+    }
+    let ask_type = kind.map(Boundary::ask_type).unwrap_or("decision");
+    let path = AskPath::for_type(name, ask_type);
+    match file_ask_card_via(state, name, kind, &question, &context, "turn-end isolated-lane recorder", path, true).await {
+        Ok((id, created, path)) => tracing::warn!(session = %name, verdict = if created { "isolated_ask_card_filed" } else { "isolated_ask_card_updated" },
+            card = %id, path = path.label(), with_earlier_list = earlier.is_some(),
+            boundary = kind.map(Boundary::label).unwrap_or("none"),
+            "turn-end: isolated lane ended on an owner ask; recorded on its board (not steered)"),
+        Err(e) => tracing::warn!(session = %name, verdict = "isolated_ask_card_failed", error = %e,
+            "turn-end: isolated lane's owner ask could not be recorded"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AskUserQuestion under an active /goal (PreToolUse, scripts/hooks/ask-guard.py)
 // ---------------------------------------------------------------------------
@@ -869,6 +1041,24 @@ pub(crate) async fn ask_user_question_post(
         Json(json!({"decision": "allow", "why": why})).into_response()
     };
     if sv::session_is_isolated(name) {
+        // Never denied (the owner answers isolated lanes directly), but
+        // recorded, so the question is on the board and not only in a picker
+        // nobody is looking at (gs-4's sat ~19 minutes on 2026-09-26).
+        if enabled(name, ISOLATED_ASK_KEY) {
+            let (question, options) = describe_questions(&body["tool_input"]);
+            if !question.trim().is_empty() {
+                let kind = boundary_of(&format!("{question} {options}"));
+                let q = as_question(&question, name);
+                let ctx = format!("AskUserQuestion on an isolated lane.\n\nOptions: {options}");
+                let path = AskPath::for_type(name, kind.map(Boundary::ask_type).unwrap_or("decision"));
+                match file_ask_card_via(state, name, kind, &q, &ctx, "AskUserQuestion isolated recorder", path, true).await {
+                    Ok((id, _, _)) => tracing::warn!(session = %name, verdict = "ask_intercept_isolated_recorded", card = %id,
+                        "ask intercept: isolated lane's AskUserQuestion recorded as a card and allowed through"),
+                    Err(e) => tracing::warn!(session = %name, verdict = "ask_intercept_isolated_card_failed", error = %e,
+                        "ask intercept: could not record isolated lane's question"),
+                }
+            }
+        }
         return allow("ask_intercept_isolated");
     }
     if !enabled(name, OWNER_ASK_KEY) {
@@ -1144,7 +1334,7 @@ mod tests {
         let (_tmp, state) = hermetic_state();
         let q = "May gs-10 proceed with this: enable the paid Staging E2E suite?";
         let (id, created, path) =
-            file_ask_card_via(&state, "gs-10", Some(Boundary::Money), q, "ctx", "test", AskPath::NeedsYou)
+            file_ask_card_via(&state, "gs-10", Some(Boundary::Money), q, "ctx", "test", AskPath::NeedsYou, false)
                 .await
                 .unwrap();
         assert!(created);
@@ -1152,7 +1342,7 @@ mod tests {
         // Same question, different casing and punctuation: the same ask.
         let again = "may gs-10 proceed with this -- enable the PAID staging e2e suite?";
         let (id2, created2, _) =
-            file_ask_card_via(&state, "gs-10", Some(Boundary::Money), again, "ctx", "test", AskPath::NeedsYou)
+            file_ask_card_via(&state, "gs-10", Some(Boundary::Money), again, "ctx", "test", AskPath::NeedsYou, false)
                 .await
                 .unwrap();
         assert_eq!((id2.as_str(), created2), (id.as_str(), false));
@@ -1177,7 +1367,7 @@ mod tests {
         let (_tmp, state) = hermetic_state();
         let q = "Needs one thing from you: a semantic-search sign-in so I can validate parity?";
         let (id, created, path) = file_ask_card_via(
-            &state, "tubescience-parity", Some(Boundary::OwnerOnly), q, "ctx", "test", AskPath::Decision,
+            &state, "tubescience-parity", Some(Boundary::OwnerOnly), q, "ctx", "test", AskPath::Decision, false,
         )
         .await
         .unwrap();
@@ -1196,11 +1386,99 @@ mod tests {
         drop(conn);
         // Dedupe works across both shapes: the same question finds this card.
         let (id2, created2, _) = file_ask_card_via(
-            &state, "tubescience-parity", Some(Boundary::OwnerOnly), q, "ctx", "test", AskPath::NeedsYou,
+            &state, "tubescience-parity", Some(Boundary::OwnerOnly), q, "ctx", "test", AskPath::NeedsYou, false,
         )
         .await
         .unwrap();
         assert_eq!((id2, created2), (id, false));
+    }
+
+    // --- Isolated lanes (gs-4-gke-minimization, 2026-09-26) ------------------
+
+    const GS4_FINAL: &str = "Everything else remaining is waiting on your reply to my previous message:\n\n\
+        - The six permission lines, plus the info@mixpeek.com re-login.\n\
+        - The ten decisions. \"defaults\" accepts all of them.\n\n\
+        With those I can drive the rest to completion.";
+
+    #[test]
+    fn gs4_still_waiting_for_your_answers_is_an_ask() {
+        let t = "Still waiting for your answers: the six permission lines, the re-login, and the ten decisions (\"defaults\" accepts all).";
+        assert_ne!(ask(t), OwnerAsk::None, "{:?}", ask(t));
+        assert_ne!(ask(GS4_FINAL), OwnerAsk::None, "{:?}", ask(GS4_FINAL));
+        // Control: a lane reporting that SOMEONE ELSE is waiting is not an ask.
+        assert_eq!(ask("mvs-infra is still waiting for the shard roll to finish."), OwnerAsk::None);
+    }
+
+    fn asst_text(uuid: &str, mid: &str, text: &str) -> Value {
+        json!({"type":"assistant","uuid":uuid,"message":{"id":mid,"content":[{"type":"text","text":text}]}})
+    }
+
+    #[test]
+    fn a_pointer_ask_carries_the_earlier_list_it_points_to() {
+        let list = "Ten decisions, each with my default:\n\n\
+            1. Delete ClickHouse after export (default: yes)\n\
+            2. Move web apps to Cloud Run (default: yes)\n\
+            3. Drop the load-test namespace (default: yes)\n\
+            4. Smaller node pools after grant #1 (default: yes)";
+        let recs = vec![
+            asst_text("a1", "m1", list),
+            asst_text("a2", "m2", "Checked the autoscaler; no scale-down because of disk pinning."),
+            asst_text("a3", "m3", GS4_FINAL),
+        ];
+        let got = earlier_ask_list(&recs, GS4_FINAL).expect("the list is found");
+        assert!(got.contains("1. Delete ClickHouse"));
+        // A final message that already enumerates its asks needs nothing more.
+        assert_eq!(earlier_ask_list(&recs, list), None);
+        // No enumerated earlier message: nothing attached rather than a guess.
+        let plain = vec![asst_text("b1", "n1", "Working on it."), asst_text("b2", "n2", GS4_FINAL)];
+        assert_eq!(earlier_ask_list(&plain, GS4_FINAL), None);
+    }
+
+    #[test]
+    fn the_list_behind_a_chain_of_pointers_is_the_one_attached() {
+        // The live shape, 2026-09-26 20:33-20:44Z: the decisions as a table,
+        // then messages that only point back at it.
+        let original = "Here is everything I need from you, in one pass.\n\n\
+            ## 2. Decisions (reply \"defaults\" to accept all)\n\n\
+            | # | Decision | My default |\n|---|---|---|\n\
+            | 1 | ClickHouse data: delete its disks | Export first, keep 7 days |\n\
+            | 2 | Stored data: delete untouched objects | Scratch buckets only |\n\
+            | 3 | Container images: prune old versions | Yes |\n\
+            | 10 | Alert email | Keep |";
+        let pointer = "Everything else remaining needs your answers from two messages ago:\n\
+            1. The six permission lines.\n2. The ten decisions.\n3. The re-login.";
+        let recs = vec![
+            asst_text("o", "m0", original),
+            asst_text("p", "m1", pointer),
+            asst_text("f", "m2", GS4_FINAL),
+        ];
+        let got = earlier_ask_list(&recs, GS4_FINAL).expect("found");
+        assert!(got.contains("| 1 | ClickHouse data"), "the table, not the pointer: {got}");
+    }
+
+    #[tokio::test]
+    async fn an_isolated_lane_gets_one_card_that_is_updated_on_each_rephrasing() {
+        let (_tmp, state) = hermetic_state();
+        let lane = "gs-4-gke-minimization";
+        let (id, created, _) = file_ask_card_via(
+            &state, lane, None, "Still waiting for your answers?", "ctx one", "test", AskPath::NeedsYou, true,
+        ).await.unwrap();
+        assert!(created);
+        let (id2, created2, _) = file_ask_card_via(
+            &state, lane, None, "Everything else is waiting on your reply?", "ctx two", "test", AskPath::NeedsYou, true,
+        ).await.unwrap();
+        assert_eq!((id2.as_str(), created2), (id.as_str(), false), "a rephrased repeat updates the open card");
+        let conn = state.store.read().unwrap();
+        let row = crate::db::board_store::get_issue(&conn, &id).unwrap().unwrap();
+        assert_eq!(row.status, "needsyou");
+        assert!(row.tags.iter().any(|t| t == ISOLATED_ASK_TAG));
+        assert!(row.desc.contains("is isolated"), "{}", row.desc);
+        assert!(row.desc.contains("ctx two"), "the update is appended");
+        drop(conn);
+        // A NON-isolated lane never merges different questions.
+        let (a, _, _) = file_ask_card_via(&state, "peer", None, "First ask?", "c", "test", AskPath::NeedsYou, false).await.unwrap();
+        let (b, created_b, _) = file_ask_card_via(&state, "peer", None, "Second ask?", "c", "test", AskPath::NeedsYou, false).await.unwrap();
+        assert!(created_b && a != b);
     }
 
     #[tokio::test]
