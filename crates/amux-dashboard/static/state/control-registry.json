@@ -1,9 +1,15 @@
 {
   "measured": true,
-  "n_considered": 2145,
+  "n_considered": 2200,
   "command_handlers": {
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_applyPeekTabVisibility": {
+      "kind": "command._applyPeekTabVisibility",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -550,6 +556,12 @@
     },
     "_connDelete": {
       "kind": "command._connDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connPillClick": {
+      "kind": "command._connPillClick",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1634,6 +1646,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_openLinkedPath": {
+      "kind": "command._openLinkedPath",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_openPathFromOutput": {
       "kind": "command._openPathFromOutput",
       "feedback_required": true,
@@ -1930,6 +1948,12 @@
     },
     "_peekScrollTo": {
       "kind": "command._peekScrollTo",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekShellRun": {
+      "kind": "command._peekShellRun",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2480,6 +2504,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_runWorkerActionNames": {
+      "kind": "command._runWorkerActionNames",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_saveChips": {
       "kind": "command._saveChips",
       "feedback_required": true,
@@ -2536,6 +2566,12 @@
     },
     "_selectProvider": {
       "kind": "command._selectProvider",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_selectWorkerType": {
+      "kind": "command._selectWorkerType",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2840,6 +2876,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_vaultRemove": {
+      "kind": "command._vaultRemove",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultSave": {
+      "kind": "command._vaultSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_voiceStart": {
       "kind": "command._voiceStart",
       "feedback_required": true,
@@ -2882,6 +2930,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_workerTypeSet": {
+      "kind": "command._workerTypeSet",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_writeUserStorage": {
       "kind": "command._writeUserStorage",
       "feedback_required": true,
@@ -2890,6 +2944,12 @@
     },
     "_wsTermSetupHandlers": {
       "kind": "command._wsTermSetupHandlers",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_wselRun": {
+      "kind": "command._wselRun",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3674,6 +3734,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "resetGroupView": {
+      "kind": "command.resetGroupView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "resetTokenStats": {
       "kind": "command.resetTokenStats",
       "feedback_required": true,
@@ -3712,6 +3778,12 @@
     },
     "runVisibleWorkerAction": {
       "kind": "command.runVisibleWorkerAction",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "runWorkerGroupAction": {
+      "kind": "command.runWorkerGroupAction",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

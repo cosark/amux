@@ -17,6 +17,7 @@ pub mod browser;
 pub mod browser_import;
 pub mod calendar;
 pub mod channels;
+pub mod chat_worker;
 pub mod commit_mentions;
 pub mod config_iac;
 pub mod connection;
@@ -38,6 +39,7 @@ pub mod gmail;
 pub mod gmail_auth;
 pub mod google_sa;
 pub mod grants;
+pub mod vault;
 pub mod graph;
 pub mod groups;
 pub mod habits;
@@ -105,6 +107,7 @@ pub mod usage;
 pub mod verify;
 pub mod why;
 pub mod worker_create;
+pub mod worker_exec;
 pub mod workers;
 pub mod workers_deadletters;
 
@@ -277,12 +280,14 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/layout-presets", layout_presets::routes())
         // The New Worker / Connect modals' supporting reads (AMUX-2871).
         .merge(worker_create::routes())
+        .merge(worker_exec::routes())
         .nest("/api/saved-messages", saved_messages::routes())
         .merge(habits::routes())
         .merge(observability::routes())
         .merge(connectors::routes())
         .nest("/api/telegram", telegram::routes())
         .merge(grants::routes())
+        .merge(vault::routes())
         .merge(self_update::routes())
         .nest("/api/proxies", proxies::routes())
         // AMUX-2888: the client controls the SPA and CLI already call. Status

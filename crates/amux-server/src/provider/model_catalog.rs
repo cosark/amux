@@ -14,7 +14,7 @@
 
 use serde::Serialize;
 
-pub const CATALOG_UPDATED_AT: &str = "2026-09-08";
+pub const CATALOG_UPDATED_AT: &str = "2026-09-26";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ModelDescriptor {
@@ -319,6 +319,7 @@ pub fn catalog() -> Vec<ModelDescriptor> {
         "opus",
         true,
         &[
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-opus-5[1m]",
             "claude-opus-4-8",
@@ -624,6 +625,7 @@ mod tests {
             "gpt-realtime-2.1",
             "text-embedding-3-large",
             "claude-fable-5-1",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-sonnet-5",
             "gemini-3.8-flash",

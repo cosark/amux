@@ -4949,3 +4949,69 @@ FIX: One project-owned checkout and branch, serialized claims and direct starts,
 - **Root cause:** receipt polling propagated validation failures before checking current-turn liveness; correction eligibility special-cased one validation message.
 - **Fix:** refuse incomplete receipts without interrupting a live turn. At a confirmed end, classify the invalid receipt for bounded normal repair. A fully validated same-claim first report can recover without another model turn; authorization holds, suspension, generation/input identity and clean-candidate checks remain required. Log `project.report_incomplete_observed` and the existing corrected-receipt recovery event.
 - **Verification:** active-to-stopped observation regression, bounded attempts, and clean corrected-first-receipt recovery without incrementing attempts. Live publication remains a separate gate.
+
+### 2026-09-24 — project said Driving while Codex waited at checkout selector
+
+- **Symptom:** `bucket-objects-gs3` showed Driving and POG-2 working for hours, but the live worker was parked on Codex's resume directory picker. Its queued task packet could not land.
+- **Root cause:** project list and overview treated a durable `working` assignment as live execution; the status join existed only on task cards. After the one-worktree migration, Codex asked whether to use the old session checkout or the current registered project checkout, and the harness did not resolve its own directory choice.
+- **Fix:** join project summaries with current worker observations in the list and overview. For an active project claim, resolve only the exact Codex directory selector to the registered project checkout, with no persistent provider preference or trust change. Record a `project.checkout_selector_resolved` event and measured warning.
+- **Verification:** picker safety and project-card status regressions added; live 8824 retest pending deployment.
+- **Follow-up:** the first deploy moved POG-2 to `repair` after its old claim timed out. The original picker guard covered only `reserved` and `working` claims, so it still could not clear the menu; the project also called a `repair` task Driving. Permit only an exact, planner-approved repair claim to clear the registered checkout selector, and label queued repairs as queued until a worker actually runs. The guard logs `project.checkout_selector_held` if it cannot justify continuation.
+- **Transport check:** the second deploy proved the exact choice was recognized but `send_keys_op` refused digit `2` (`registered_project_checkout_selected ok=false`). Add that key to the existing narrow sender allowlist and assert the actual choice is sendable, as the hook-choice test already does for `3`.
+- **Next observed blocker:** after the directory choice finally sent, Codex displayed its exclusive-conversation Retry screen. The old generation's packet was stale, so delivery's bounded Retry path could not run, while the project driver refused to claim a non-boundary worker. The status correctly changed to Repair queued, but no recovery occurred. The periodic sweep now retries only that exact Codex screen for an enabled, unpaused, planner-claimable repair, at most once per five minutes, then reobserves. It does not change provider permissions or force a new task claim. A focused test covers provider, lifecycle, exact screen, key transport, and cooldown gates.
+- **Live retry result:** port 8824 sent `r` and Codex returned to the same exclusive-conversation screen. A successful key send alone was insufficient. If the screen remains after the bounded retry, the sweep now stops only this locked local worker, clears its old conversation identity, and lets the project's normal claim path start a fresh one from retained files and task packet. It keeps the other app's conversation untouched.
+
+## A project worktree and the main checkout overwrite each other's crates in the one shared cargo target
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-24
+SESSION: amux-chat-worker
+CARD: AF-791
+SYMPTOM: In `.worktrees/amux-chat-worker`, `cargo test` with the mandated `CARGO_TARGET_DIR=~/.amux/rust-build-target` failed with `no field worker_type on WorkerConfig` right after the same command had compiled it clean. The pre-commit hook then refused the commit, naming five of my files as broken. `cargo -v` showed why: rustc is invoked on `crates/amux-core/src/lib.rs` (workspace-relative) with `-C metadata=4725de00443ab6cf`, and a workspace member's metadata hash does not include the checkout's absolute path. So `libamux_core-164022c04585c70a.rlib` is ONE file for every checkout of this repo. The main-checkout builder and a worktree build take turns overwriting it with different sources.
+COST: ~20 minutes and one refused commit. Nothing in the error names another checkout. It reads as your own broken change, and this is the same shape as AF-791's three phantom errors.
+FIX: A per-checkout target for any checkout that is not the main one (the hook already setdefaults CARGO_TARGET_DIR, so exporting e.g. `~/.amux/rust-build-target-<worktree>` works today). Or have safe-cargo.sh derive the target from `git rev-parse --show-toplevel` when it is not the main checkout, and print which target it chose.
+
+## A second amux server on the same machine re-points every live lane's pane log into its own home
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-24
+SESSION: amux-chat-worker
+CARD: ACW-1
+SYMPTOM: I ran a test server from a worktree with its own AMUX_HOME and port (TMUX_TMPDIR set, but $TMUX from my pane still pointed at the real tmux server). Its first `pipe_reconcile_tick` logged `re-armed pipe-pane session=<lane> writer_changed=true` for 20 real fleet lanes: its `.pipe-writer-version` marker did not exist yet, so every `amux-*` pane on the machine looked like it needed the new writer. For ~2 hours those lanes' pane output went to the test home's logs dir. The live server never noticed, because its own marker was current.
+COST: ~2 hours of pane logs for 20 lanes written to a scratch dir (recovered to ~/.amux/logs/recovered-acw-2026-09-24/), and 30 minutes to find and restore. Nothing in the live server's view showed it: pane_pipe stayed 1.
+FIX: pipe_reconcile_tick now skips any `amux-<name>` pane with no `<name>.env` in its own sessions dir and counts them (`pipe_reconcile_foreign_panes_skipped`). Restoring was the server's own path: move `.pipe-writer-version` aside so the live reconciler re-arms. Branch feature/worker-type.
+
+## Every spawn on this Mac costs about 12x the CPU because the tmux tree runs under Rosetta, and nothing said so
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-09-26
+SESSION: mac-ops
+CARD: MO-3622
+SYMPTOM: 15-minute load 46.6 on 28 cores with 33% sys and 21% idle and no process to blame. The pid counter showed 240-320 spawns/s and 88% of the sampled ones were translated (`sysctl -n sysctl.proc_translated` prints 1 in a lane shell). The first visible sign was elsewhere: `colima list` from a lane failed with "limactl is running under rosetta, please reinstall lima with native arch". The tmux server is an Intel-only /usr/local/bin/tmux, and the x86_64 preference is inherited down the whole tree, so even an arm64 `claude` spawns translated bash. 400 spawns cost 7.7 CPU-s translated, 0.65 native.
+COST: about 90 minutes of RCA, three tick escalations in 30 minutes, and every tool call in every lane carried the tax until the hook fix. The cost sits in sys time and in oahd, trustd, syspolicyd and XProtect waking on each exec, so a per-process ranking cannot show it.
+FIX: The signal exists now: the mac-health tick logs translated_procs and WARNs rosetta_translated_tree (commit 36906988). Still open: the tree is still translated. That needs an arm64 tmux plus a restart of every lane, or lane launches under `arch -arm64 -x86_64`, and both change every lane's environment, so it is the owner's call. Detail: docs/incidents/2026-09-26-mac-cpu-rosetta-spawn-storm.md.
+
+## hook-report.sh forked about 20 processes on every tool call, roughly 4.7 cores fleet-wide, and its cost was invisible
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-26
+SESSION: mac-ops
+CARD: MO-3622
+SYMPTOM: The PostToolUse hook ran 8.0 times per second across the fleet. A tracer caught 16 descendants per run (13 bash, 2 python3, cat). Translated, one run cost 0.6 s of CPU and 0.7 s of wall time; native, 0.14 s and 0.17 s.
+COST: 0.7 s of added latency after every tool call in every lane, and about half of all process spawns on the box. Nothing reported hook cost anywhere.
+FIX: e5b632de re-execs the script under `arch -arm64 -x86_64` (opt out with AMUX_NATIVE_ARCH=0), with a test cell that fails if the children stay translated. Further cuts are possible (two python3 startups and a curl remain) but were not needed for this incident.
+
+## TmuxBackend::reconcile probed every session twice every 2 seconds, and a spawn leaves no trace
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-26
+SESSION: mac-ops
+CARD: MO-3622
+SYMPTOM: amux-server-rs forked about 50 processes per second, 26 of them the bootstrap loop's per-session `has-session` and `list-panes` (13.0/s of each at 28 sessions). The one sweep that calls reconcile reads only the session name.
+COST: half of the server's spawns and about 0.5 core of translated tmux clients, invisible in the logs because a process that has exited leaves nothing to grep.
+FIX: 63c2614d makes reconcile one `list-panes -a` census, and TmuxBackend spawns are now counted per 60 s window with a WARN (`tmux_spawn_rate_high`) and `tmux_spawns` in GET /api/debug/tmux. The count covers TmuxBackend::run only; peek captures and the session-verb helpers spawn tmux from their own call sites and are not counted.

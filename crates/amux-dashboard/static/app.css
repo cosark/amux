@@ -219,9 +219,34 @@
   /* Paused sits directly above Archived, below the worker cards (Ethan,
      2026-09-14), so it takes Archived's side padding and spaces itself from the
      cards above rather than below. */
-  #review-section { padding: 0 12px; }
+  #project-workers-section, #review-section { padding: 0 12px; }
   #paused-section { padding: 0 12px; }
   #expired-section { padding: 0 12px; }
+  .project-footer { display:flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--accent);border-radius:8px;color:var(--accent);background:var(--card);font-size:.82rem;font-weight:600;margin-top:8px; }
+  .project-chevron { font-size:.65rem;transition:transform .15s; }
+  .project-chevron.open { transform:rotate(90deg); }
+  .project-workers-body { display:flex;flex-direction:column;gap:5px;margin-top:6px; }
+  .project-worker-row { display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--card);min-width:0; }
+  .project-worker-row-main { flex:1;min-width:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:.8rem; }
+  .project-worker-row-main strong { overflow-wrap:anywhere; }
+  .project-worker-row p { flex:1;min-width:0;margin:0;color:var(--dim);font-size:.74rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+  .worker-group-footer { position:relative;min-height:44px;box-sizing:border-box; }
+  .worker-group-toggle { flex:1;align-self:stretch;min-width:0;display:flex;align-items:center;gap:8px;border:0;background:transparent;color:inherit;text-align:left;font:inherit;font-weight:inherit;cursor:pointer; }
+  .worker-group-menu { position:relative;margin-left:auto;color:var(--text); }
+  .worker-group-menu summary { display:grid;place-items:center;width:40px;min-height:40px;list-style:none;border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:20px;line-height:1; }
+  .worker-group-menu summary::-webkit-details-marker { display:none; }
+  .worker-group-menu[open] summary { border-color:var(--accent); }
+  .worker-group-dropdown { position:absolute;z-index:30;right:0;top:calc(100% + 4px);min-width:170px;display:flex;flex-direction:column;padding:4px;background:var(--card);border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.18); }
+  .worker-group-dropdown button,.worker-group-dropdown span { width:100%;border:0;background:transparent;color:var(--text);text-align:left;padding:10px 12px;font:inherit;font-size:.8rem;cursor:pointer; }
+  .worker-group-dropdown button:hover { background:var(--bg); }
+  .worker-group-note { color:var(--dim) !important;cursor:default !important;font-size:.75rem !important; }
+  .wsel { display:inline-flex;align-items:center;justify-content:center;min-width:28px;min-height:28px;flex:0 0 auto;cursor:pointer; }
+  .wsel input { width:16px;height:16px;margin:0;cursor:pointer;accent-color:var(--accent); }
+  .worker-selbar { position:fixed;left:12px;right:12px;margin:0 auto;width:fit-content;bottom:calc(12px + env(safe-area-inset-bottom));z-index:900;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:8px;max-width:calc(100vw - 24px);box-sizing:border-box;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.25); }
+  .worker-selbar-count { font-size:.85rem;font-weight:600;color:var(--text); }
+  .worker-selbar-note { font-size:.8rem;color:var(--dim); }
+  @media(max-width:600px) { .wsel { min-width:44px;min-height:44px; } .worker-selbar .btn { min-height:44px; } }
+  @media(max-width:600px) { .project-worker-row { flex-wrap:wrap; }.project-worker-row-main,.project-worker-row p { flex-basis:100%; }.project-worker-row .btn { min-height:44px;width:100%; }.worker-group-menu summary { min-width:44px;min-height:44px; } }
 
   .review-footer {
     display: flex; align-items: center; gap: 8px;
@@ -568,6 +593,37 @@
   .badge.yolo { background: rgba(210,153,34,0.2); color: var(--yellow); }
   .badge.worktree { background: rgba(45,212,191,0.15); color: #2dd4bf; border: 1px dashed rgba(45,212,191,0.4); }
   .badge.ephemeral { background: rgba(251,146,60,0.15); color: #fb923c; }
+  .badge.worker-type { background: rgba(88,166,255,0.14); color: var(--accent); }
+  /* Chat renderer (ACW-7): the peek body shows a transcript, not a terminal. */
+  #peek-body.peek-chat {
+    background: var(--bg) !important; color: var(--text) !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    white-space: normal; font-size: 0.92rem; line-height: 1.5;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+  }
+  .chat-log { display: flex; flex-direction: column; gap: 12px; max-width: 860px; margin: 0 auto; }
+  .chat-msg { display: flex; flex-direction: column; max-width: 88%; min-width: 0; }
+  .chat-msg.chat-user { align-self: flex-end; align-items: flex-end; }
+  .chat-msg.chat-assistant { align-self: flex-start; }
+  .chat-bubble {
+    padding: 8px 12px; border-radius: 12px; overflow-wrap: anywhere; min-width: 0; max-width: 100%;
+    background: var(--card); border: 1px solid var(--border); color: var(--text);
+  }
+  .chat-user .chat-bubble { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+  .chat-bubble p { margin: 0 0 8px; } .chat-bubble p:last-child { margin-bottom: 0; }
+  .chat-bubble pre { overflow-x: auto; max-width: 100%; white-space: pre; }
+  .chat-bubble ol, .chat-bubble ul { padding-left: 1.5em; margin: 4px 0 8px; }
+  .chat-meta { font-size: 0.7rem; color: var(--dim); margin-top: 3px; padding: 0 4px; }
+  .chat-msg.is-error .chat-bubble { border-color: var(--red, #f85149); }
+  .chat-error { display: block; color: var(--red, #f85149); font-weight: 600; margin-bottom: 4px; white-space: pre-wrap; }
+  .chat-tool { font-size: 0.75rem; color: var(--dim); margin-top: 6px; font-style: italic; }
+  .chat-empty, .chat-queued { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 16px 8px; }
+  .chat-queued { padding: 4px; font-size: 0.75rem; }
+  .chat-typing { display: inline-flex; gap: 4px; padding: 4px 0; }
+  .chat-typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); animation: chat-dot 1.2s infinite ease-in-out; }
+  .chat-typing i:nth-child(2) { animation-delay: 0.15s; } .chat-typing i:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes chat-dot { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+  @media (max-width: 600px) { .chat-msg { max-width: 94%; } #peek-body.peek-chat { padding: 10px 8px; } }
   /* Mobile hit area: expanded to ~32px, NOT the 44px the css-mobile rule asks
      for, and that is a deliberate deviation rather than an oversight. 44px-tall
      pills would push the task label and preview below the fold on a 375px card,
@@ -1001,7 +1057,16 @@
      a 154-column terminal re-wraps at ~224 characters on a wide desktop and the
      author's line breaks and spacing stop making sense. Falls back to 220, the
      spawn width, when a frame carries no pane_cols. */
-  #pk-earlier, #pk-hist, #pk-live { max-width: calc(var(--peek-cols, 220) * 1ch); }
+  #pk-live { max-width: calc(var(--peek-cols, 220) * 1ch); }
+  /* HISTORY IS FORMATTED FOR THE SCREEN (Ethan 2026-09-25: "shit should be
+     formatted for the screen based on the screen resolution", with tables cut
+     at 599px on a 1876px desktop). The transcript is not tmux output any more:
+     the server lays its tables out at the viewer's measured columns. Prose keeps
+     a readable measure (the pane width, never under 120 characters, which is
+     what the cap above protected); tables and code blocks break out of it to
+     the full width of the peek body (--peek-body-w, measured per render). */
+  #pk-earlier, #pk-hist { max-width: calc(max(var(--peek-cols, 220), 120) * 1ch); }
+  #pk-earlier .peek-box, #pk-hist .peek-box { width: max-content; max-width: var(--peek-body-w, 100%); }
   .peek-rule {
     display: inline-flex; width: 100%; align-items: center; gap: 6px;
     height: 1.15em; vertical-align: middle;
@@ -6130,6 +6195,10 @@
 .mdai-row-meta { font-size: 0.7rem; color: var(--dim); margin-top: 3px; }
 .mdai-row-go { flex: 0 0 auto; color: var(--dim); font-size: 1.1rem; line-height: 1; }
 
+/* Viewer header actions: always visible, unlike the .file-actions dropdown. */
+.mdai-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+@media (max-width: 600px) { .mdai-actions .file-view-tab, .mdai-actions .file-menu-btn { min-height: 44px; min-width: 44px; } }
+
 /* Node overlay body (reuses .file-overlay chrome, but normal prose, not mono). */
 .mdai-node-body {
   flex: 1; overflow: auto; background: var(--bg);
@@ -7158,8 +7227,21 @@ select.input { height:var(--control-height); }
 .project-tab-panel[hidden]{display:none!important}
 .project-overview-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:12px;align-items:start}
 .project-overview-grid>.project-empty{grid-column:1/-1}
+.project-overview-grid>.project-section,.project-overview-grid>.project-evidence-intro,.project-overview-grid>.project-evidence-groups{grid-column:1/-1}
 .project-overview-card{grid-column:span 4;border:1px solid var(--border);border-radius:14px;background:var(--card-bg);padding:14px;min-width:0;box-shadow:0 1px 4px rgba(0,0,0,.03)}
 .project-overview-card.wide{grid-column:span 8}
+.project-next{grid-column:span 5}.project-task-preview{grid-column:span 7}.project-evidence-preview{grid-column:1/-1}
+.project-next strong{display:block;font-size:15px;line-height:1.35;margin-bottom:7px}.project-next p{margin-bottom:12px}
+.project-task-preview .project-task-table td{overflow-wrap:anywhere}.project-task-preview>.project-muted{margin-top:8px}
+.project-overview-grid>.project-section{border:1px solid var(--border);border-radius:12px;background:var(--card-bg);padding:0 14px;margin:0}
+.project-overview-grid>.project-section summary{min-height:48px;display:flex;align-items:center;cursor:pointer;font-weight:600}
+.project-overview-grid>.project-section .project-context{margin:16px 0}
+.project-evidence-intro,.project-evidence-groups{border:1px solid var(--border);border-radius:14px;background:var(--card-bg);padding:16px;min-width:0}
+.project-evidence-intro h3,.project-evidence-groups h3{margin:0 0 8px;font-size:16px}.project-evidence-intro p{line-height:1.45;overflow-wrap:anywhere}
+.project-evidence-groups .project-section{margin:8px 0;padding:0 10px;border:1px solid var(--border);border-radius:9px}.project-evidence-groups .project-section summary{overflow-wrap:anywhere}
+.project-asset-list{list-style:none;padding:0 0 10px;margin:0}.project-asset-list li{padding:7px 0;border-top:1px solid var(--border);overflow-wrap:anywhere}.project-asset-list .project-link{font-size:13px}
+.project-update{border-top:1px solid var(--border);margin-top:12px;padding-top:4px}.project-update summary{min-height:44px;cursor:pointer;font-weight:600;color:var(--accent)}.project-update>p{font-size:13px;color:var(--muted);margin:4px 0 12px}
+.project-outcome-counts{font-size:13px;color:var(--muted)!important}
 .project-outcome{grid-column:1/-1;border:2px solid var(--border);border-radius:16px;background:var(--card-bg);padding:18px;min-width:0}
 .project-outcome-passed{border-color:#72c691;background:color-mix(in srgb,#e7f6ec 72%,var(--card-bg))}.project-outcome-review{border-color:#e4b64c;background:color-mix(in srgb,#fff7df 74%,var(--card-bg))}.project-outcome-failed{border-color:#ef8b7f;background:color-mix(in srgb,#fff1ee 76%,var(--card-bg))}.project-outcome-running{border-color:var(--accent)}
 .project-outcome-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.project-outcome-heading h3{font-size:20px;line-height:1.25;margin:0}.project-outcome>p{font-size:14px;line-height:1.5;color:var(--text);max-width:920px;margin:10px 0 0}
@@ -7182,6 +7264,7 @@ select.input { height:var(--control-height); }
 .project-worker-card .project-card-heading h3{min-width:0;overflow-wrap:anywhere}
 .project-worker-card .project-context{margin-bottom:12px}
 .project-worker-card .project-context dd{word-break:break-word}
+.project-worker-card .project-worker-actions{margin:10px 0}.project-worker-card .project-section{margin-bottom:0}.project-worker-card .project-section summary{min-height:44px}
 .project-status-chip.active{color:#137333;background:#e7f6ec;border-color:#bbdfc6}
 .project-status-chip.paused,.project-status-chip.review,.project-status-chip.archived{color:#8a5b00;background:#fff3cd;border-color:#f0d98c}
 .project-status-chip.expired{color:#475569;background:#f1f5f9;border-color:#cbd5e1}
@@ -7196,7 +7279,7 @@ select.input { height:var(--control-height); }
 @media(max-width:900px){.project-shell{grid-template-columns:1fr}.project-list{position:static;max-height:none}.project-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:1100px){.project-overview-card,.project-overview-card.wide{grid-column:span 6}.project-timeline{grid-template-columns:repeat(5,120px)}}
 @media(max-width:700px){.project-overview-card,.project-overview-card.wide{grid-column:1/-1}}
-@media(max-width:600px){.project-metrics{grid-template-columns:1fr}.project-command-center{padding:14px}.project-select-control{width:100%}.project-tab{min-height:44px;padding:0 12px}.project-outcome{padding:14px}.project-outcome-heading{flex-direction:column}.project-outcome-badge{min-height:36px}.project-outcome-checklist{grid-template-columns:minmax(0,1fr)}.project-outcome-actions .btn{width:100%;min-height:44px}}
+@media(max-width:600px){.project-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.project-command-center{padding:14px}.project-select-control{width:100%}.project-tab{min-height:44px;padding:0 12px}.project-outcome{padding:14px}.project-outcome-heading{flex-direction:column}.project-outcome-badge{min-height:36px}.project-outcome-checklist{grid-template-columns:minmax(0,1fr)}.project-outcome-actions .btn{width:100%;min-height:44px}}
 .projects-view label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:600}
 .projects-view input,.projects-view select,.projects-view textarea{font:inherit;padding:11px;border:1px solid var(--border);border-radius:9px;background:var(--bg);color:var(--text);box-sizing:border-box;min-width:0}
 .projects-view textarea{width:100%;resize:vertical;margin:8px 0}.project-composer-label{margin-top:20px}
@@ -7290,3 +7373,65 @@ select.input { height:var(--control-height); }
    text, not at the left edge, as they do in the terminal (see _hangIndent). */
 .pk-hang { display: inline-block; max-width: 100%; box-sizing: border-box; vertical-align: top;
   padding-left: var(--h); text-indent: calc(-1 * var(--h)); }
+
+/* Settings → Integrations → Vault */
+.vault-item { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin: 8px 0; font-size: 0.82rem; }
+.vault-item-head { margin-bottom: 6px; overflow-wrap: anywhere; }
+.vault-pending { color: var(--yellow, #d29922); }
+.vault-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.vault-actions .btn { min-height: 44px; }
+.tag-filter.tag-reset-btn { font: inherit; font-size: 0.72rem; cursor: pointer; color: var(--accent); }
+@media (max-width: 600px) { .tag-filter.tag-reset-btn { min-height: 44px; } }
+
+/* Reconnect checklist: a checkbox per row that ticks as each write lands. */
+.sync-item { display: flex; align-items: center; gap: 8px; padding: 3px 0; transition: opacity .2s; }
+.sync-item .sync-box { flex: 0 0 auto; width: 16px; height: 16px; border: 1.5px solid var(--dim); border-radius: 4px;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 11px; line-height: 1; }
+.sync-item.running .sync-box { border-color: var(--accent); border-top-color: transparent; border-radius: 50%; animation: sync-spin .8s linear infinite; }
+.sync-item.done .sync-box { background: var(--green, #3fb950); border-color: var(--green, #3fb950); color: #fff; animation: sync-pop .25s ease-out; }
+.sync-item.failed .sync-box { background: var(--red, #f85149); border-color: var(--red, #f85149); color: #fff; }
+.sync-item.pending, .sync-item.waiting { opacity: .7; }
+@keyframes sync-spin { to { transform: rotate(360deg); } }
+@keyframes sync-pop { 0% { transform: scale(.4); } 70% { transform: scale(1.2); } 100% { transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { .sync-item .sync-box { animation: none !important; } }
+
+/* Compact worker-group bars (project workers, paused, expired, archived):
+   Ethan, 2026-09-24, "make these narrower". Desktop drops to ~34px; phones
+   keep the 44px touch target the mobile rules require. */
+.worker-group-footer { min-height: 34px; padding: 3px 6px 3px 12px; margin-top: 6px; }
+.worker-group-menu summary { width: 30px; min-height: 26px; font-size: 16px; border-radius: 6px; }
+@media (max-width: 600px) {
+  .worker-group-footer { min-height: 44px; padding: 0 0 0 12px; }
+  .worker-group-menu summary { width: 44px; min-width: 44px; min-height: 44px; }
+}
+
+/* Chat: media fits the bubble; code and tables scroll inside it, never widen it. */
+.chat-bubble img, .chat-bubble video { max-width: 100%; height: auto; border-radius: 6px; display: block; margin: 6px 0; }
+.chat-bubble audio { max-width: 100%; }
+.chat-bubble pre { max-width: 100%; overflow-x: auto; }
+.chat-bubble .table-scroll { max-width: 100%; overflow-x: auto; }
+.chat-bubble a[href^="streamdown:"], .chat-bubble a:not([href]) { color: inherit; text-decoration: none; pointer-events: none; }
+.chat-bubble pre { background: rgba(127,127,127,0.12); border-radius: 6px; padding: 8px 10px; font-size: 0.8rem; line-height: 1.45; }
+.chat-bubble :not(pre) > code { background: rgba(127,127,127,0.14); border-radius: 4px; padding: 1px 4px; font-size: 0.88em; }
+.chat-bubble table { border-collapse: collapse; margin: 6px 0; font-size: 0.85rem; }
+.chat-bubble th, .chat-bubble td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }
+.chat-bubble th { background: rgba(127,127,127,0.08); }
+.chat-bubble h1, .chat-bubble h2, .chat-bubble h3 { margin: 4px 0 6px; line-height: 1.25; }
+.chat-bubble h1 { font-size: 1.15rem; } .chat-bubble h2 { font-size: 1.05rem; } .chat-bubble h3 { font-size: 0.98rem; }
+
+/* Worker Shell tab: shell schedules run on this machine; their output streams here. */
+.peek-shell-panel { padding: 10px 12px; gap: 10px; overflow-y: auto; }
+.peek-shell-head { display: flex; flex-direction: column; gap: 2px; }
+.peek-shell-sub, .peek-shell-meta, .peek-shell-empty { font-size: 0.75rem; color: var(--dim); }
+.peek-shell-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+.peek-shell-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; font-size: 0.85rem; }
+.peek-shell-status { font-size: 0.7rem; font-weight: 600; padding: 1px 6px; border-radius: 3px; background: rgba(127,127,127,0.14); white-space: nowrap; }
+.peek-shell-status.st-running { background: rgba(210,153,34,0.18); color: var(--yellow, #d29922); animation: peek-shell-pulse 1.4s ease-in-out infinite; }
+.peek-shell-status.st-ok, .peek-shell-status.st-delivered { background: rgba(63,185,80,0.15); color: #3fb950; }
+.peek-shell-status.st-error, .peek-shell-status.st-failed, .peek-shell-status.st-refused { background: rgba(248,81,73,0.15); color: #f85149; }
+.peek-shell-cmd { overflow-wrap: anywhere; }
+.peek-shell-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.peek-shell-actions .btn, .peek-shell-actions select { min-height: 36px; }
+@media (max-width: 600px) { .peek-shell-actions .btn, .peek-shell-actions select { min-height: 44px; } }
+.peek-shell-out { margin: 0; max-height: 360px; overflow: auto; background: #010409; color: #c9d1d9; border-radius: 6px; padding: 8px 10px; font-size: 0.74rem; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
+@keyframes peek-shell-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }

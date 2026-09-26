@@ -277,7 +277,7 @@ fn project_effort_flags(provider: &str, effort: &str) -> Option<String> {
     }
 }
 
-fn executor_flags(provider: &str, effort: Option<&str>, full_host_access: bool) -> String {
+pub(super) fn executor_flags(provider: &str, effort: Option<&str>, full_host_access: bool) -> String {
     let mut flags = if provider == "claude" {
         "--dangerously-skip-permissions".to_string()
     } else if provider == "codex" && full_host_access {
@@ -327,7 +327,7 @@ fn configure_executor_env(env: &mut sv::EnvFile, p: &store::Project, row: &bs::I
     env.set("CC_FLAGS", &flags);
 }
 
-async fn sync_shared_checkout(repo: &str) -> Result<(), String> {
+pub(super) async fn sync_shared_checkout(repo: &str) -> Result<(), String> {
     let root = workspace::git(repo, &["rev-parse", "--show-toplevel"]).await?;
     if !workspace::project_clean_status(&root).await?.is_empty() {
         return Err(
@@ -381,7 +381,7 @@ async fn verify(
         }
         Ok(())
     };
-    let report = e.report.as_ref().ok_or("no report")?;
+    let original_report = e.report.as_ref().ok_or("no report")?;
     verification_permit()?;
     if sv::is_running(&e.worker).await {
         sv::stop_for_pause(state, &e.worker).await.map_err(|e|e.to_string())?;
@@ -408,22 +408,27 @@ async fn verify(
             base: String::new(),
         }
     };
-    if workspace::git(&w.path, &["rev-parse", "HEAD"]).await? != report.head {
-        return Err("reported head is stale".into());
+    let candidate_head = workspace::git(&w.path, &["rev-parse", "HEAD"]).await?;
+    if candidate_head != original_report.head {
+        workspace::git(&w.path, &["merge-base", "--is-ancestor", &original_report.head, &candidate_head])
+            .await.map_err(|_| "reported head is stale or no longer in project history".to_string())?;
     }
+    let report = original_report.clone();
+    archive_declared_diagnostics(&home, p, id, e, &w, &report).await?;
     if !workspace::project_clean_status(&w.path).await?.is_empty() {
         return Err("worktree has uncommitted changes".into());
     }
-    let commands = validated_verification_commands(&w, &p.policy.verify_command, report, p.policy.acceptance.as_ref())?;
+    let commands = validated_verification_commands(&w, &p.policy.verify_command, &report, p.policy.acceptance.as_ref())?;
     tracing::info!(task=id,measured=true,n_considered=report.checks.len()+1,distinct=commands.len(),verdict="project.verification_commands","byte-identical commands run once per immutable candidate phase; criterion mappings retained");
     let timeout = std::time::Duration::from_secs(p.policy.verification_timeout_secs);
-    workspace::verify_commands(&w, &w.path, &commands, timeout, &verification_permit).await?;
-    if workspace::git(&w.path, &["rev-parse", "HEAD"]).await? != report.head
+    workspace::verify_commands_with_cleanup(&w, &w.path, &commands, timeout, &verification_permit,
+        || archive_declared_diagnostics(&home, p, id, e, &w, &report)).await?;
+    if workspace::git(&w.path, &["rev-parse", "HEAD"]).await? != candidate_head
         || !workspace::project_clean_status(&w.path).await?.is_empty()
     {
         return Err("verification changed the reported worktree".into());
     }
-    let retained = super::assets::retain(&home, std::path::Path::new(&w.path), report)
+    let retained = super::assets::retain_at_candidate(&home, std::path::Path::new(&w.path), &report, &candidate_head)
         .await
         .map_err(|e| e.to_string())?;
     // Task verification proves one immutable worker head. It must not publish that head: whole-
@@ -431,9 +436,9 @@ async fn verify(
     // and wait for the human criterion. Publishing here made "Verified" indistinguishable from
     // "approved and delivered" and let a prose-only task land before its claimed runtime outcome
     // had been reviewed.
-    let candidate = report.head.clone();
+    let candidate = candidate_head.clone();
     verification_permit()?;
-    if workspace::git(&w.path, &["rev-parse", "HEAD"]).await? != report.head
+    if workspace::git(&w.path, &["rev-parse", "HEAD"]).await? != candidate_head
         || !workspace::project_clean_status(&w.path).await?.is_empty()
     {
         return Err("worktree changed during verification".into());
@@ -441,7 +446,7 @@ async fn verify(
     workspace::write_integration_status(
         &home,
         &e.worker,
-        &json!({"status":"verified_pending_review","head":report.head,"candidate":candidate,"mode":if p.policy.worktree {"worktree"} else {"shared_checkout"},"branch":w.branch}),
+        &json!({"status":"verified_pending_review","head":candidate_head,"source_head":report.head,"candidate":candidate,"mode":if p.policy.worktree {"worktree"} else {"shared_checkout"},"branch":w.branch}),
     );
     let verified_worker = e.worker.clone();
     let expected_policy = p.policy.clone();
@@ -454,12 +459,97 @@ async fn verify(
         super::assets::check(&retained).map_err(store::sql_error)?;
         super::assets::register(c,&id,&retained)?;
         current.retained_assets=retained;
+        current.report=Some(report.clone());
         current.stage="verified".into();current.waiting=None;current.verification_retry_pending=false;
         c.execute("UPDATE issues SET status='verified',evidence=?2,lease_owner=NULL,lease_expires_at=NULL WHERE id=?1",params![id,json!({"report":current.report,"candidate":candidate,"integration":"pending_project_acceptance","gate":policy.policy.verify_command}).to_string()])?;
         planner::save_execution(c,&row,&current,"project.verified").map_err(store::sql_error)
     }).await.map_err(|e|e.to_string())?;
     let env = sv::env_path(&verified_worker);
     if env.exists() { sv::set_review_hold_at(&env, true)?; }
+    Ok(())
+}
+
+/// Retain only declared, untracked runtime outputs outside the candidate.
+/// Verifiers may generate these on both success and failure; they are not
+/// source edits and must not poison the next task in the one project checkout.
+/// Tracked files, report assets, symlinks and all undeclared dirt stay put.
+async fn archive_declared_diagnostics(
+    home: &std::path::Path,
+    p: &store::Project,
+    id: &str,
+    e: &Execution,
+    w: &workspace::Workspace,
+    report: &planner::Report,
+) -> Result<(), String> {
+    if workspace::project_clean_status(&w.path).await?.is_empty() {
+        return Ok(());
+    }
+    let Some(contract) = p.policy.acceptance.as_ref() else { return Ok(()) };
+    let root = std::fs::canonicalize(&w.path).map_err(|error| error.to_string())?;
+    let mut paths = std::collections::BTreeSet::new();
+    for check in &report.checks {
+        let Some(key) = check.criterion.strip_prefix("contract:") else { continue };
+        let Some(criterion) = contract.criterion(key) else { continue };
+        if !matches!(criterion.verifier, amux_core::project::ContractVerifier::Execution { .. }) {
+            continue;
+        }
+        paths.extend(criterion.evidence.iter().cloned());
+    }
+    // A failed older invocation can have written the same declared filenames
+    // below artifacts/ before the approved runner was corrected to use the
+    // contract's root-relative paths. Preserve these exact untracked outputs
+    // as diagnostics too; never match an arbitrary source file or directory.
+    let names = paths.iter().filter_map(|path| std::path::Path::new(path).file_name()
+        .map(|name| name.to_os_string())).collect::<std::collections::HashSet<_>>();
+    let status = workspace::git(&w.path, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    for line in status.lines().filter(|line| line.starts_with("?? artifacts/")) {
+        let path = &line[3..];
+        if std::path::Path::new(path).file_name().is_some_and(|name| names.contains(name)) {
+            paths.insert(path.to_string());
+        }
+    }
+    for relative in paths {
+        let relative_path = std::path::Path::new(&relative);
+        if !relative_path.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+            return Err(format!("unsafe execution diagnostic path {relative}"));
+        }
+        if report.assets.iter().any(|asset| asset.path == relative) {
+            continue;
+        }
+        let source = root.join(relative_path);
+        if !source.exists() { continue; }
+        let metadata = std::fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink()
+            || !std::fs::canonicalize(&source).map_err(|error| error.to_string())?.starts_with(&root) {
+            return Err(format!("refusing unsafe execution diagnostic {relative}"));
+        }
+        if workspace::git(&w.path, &["ls-files", "--error-unmatch", "--", &relative]).await.is_ok() {
+            continue;
+        }
+        let archive_root = home.join("artifacts/verification-diagnostics")
+            .join(&p.name).join(id).join(e.generation.to_string());
+        std::fs::create_dir_all(&archive_root).map_err(|error| error.to_string())?;
+        let mut archived = false;
+        for sequence in 0..1000 {
+            let folder = archive_root.join(sequence.to_string());
+            match std::fs::create_dir(&folder) {
+                Ok(()) => {
+                    let target = folder.join(relative_path);
+                    std::fs::create_dir_all(target.parent().ok_or("invalid diagnostic target")?)
+                        .map_err(|error| error.to_string())?;
+                    std::fs::rename(&source, &target).map_err(|error| error.to_string())?;
+                    tracing::info!(project=%p.name,task=id,path=%relative,archive=%target.display(),
+                        measured=true,n_considered=1,verdict="project.verification_diagnostic_retained",
+                        "declared untracked runtime output retained outside candidate");
+                    archived = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        if !archived { return Err("verification diagnostic archive exhausted".into()); }
+    }
     Ok(())
 }
 
@@ -765,6 +855,8 @@ async fn ingest_matching_report_file(
             return Ok(false);
         }
     }
+    let (receipt_task, receipt_worker, receipt_generation) =
+        (id.to_string(), expected.worker.clone(), expected.generation);
     let (project, id, expected) = (project.to_string(), id.to_string(), expected.clone());
     let out = state
         .store
@@ -812,7 +904,6 @@ async fn ingest_matching_report_file(
                     events: vec![],
                 });
             }
-            tracing::info!(task=%id,worker=%current.worker,generation=current.generation,measured=true,n_considered=1,verdict="project_report_file_ingested", "durable worker receipt file accepted before terminal boundary");
             planner::record_report(
                 c,
                 &project,
@@ -825,6 +916,9 @@ async fn ingest_matching_report_file(
             .map_err(store::sql_error)
         })
         .await?;
+    if out.applied {
+        tracing::info!(task=%receipt_task,worker=%receipt_worker,generation=receipt_generation,measured=true,n_considered=1,verdict="project_report_file_ingested", "durable worker receipt accepted before terminal boundary");
+    }
     Ok(out.applied)
 }
 
@@ -1142,6 +1236,190 @@ async fn reconcile_corrected_candidate(state: &AppState, p: &store::Project) -> 
     Ok(())
 }
 
+// A corrected receipt can arrive after verification rejected an earlier
+// candidate. A malformed correction belongs to that task: it must not stop
+// planning or recovery for every other task in the project.
+async fn recover_corrected_reports(state: &AppState, name: &str) -> anyhow::Result<()> {
+    let reports={let c=state.store.read()?;bs::project_issues(&c,name)?.into_iter().filter_map(|row| {
+        let e=planner::execution(&c,&row.id).ok()?;
+        if e.stage!="waiting" { return None; }
+        let file=read_project_report_file(&e.worker).ok().flatten()?;
+        (planner::report_correction_allowed(&e,&file.report) && report_file_matches_execution(&file,&e) && planner::validate_report(&row,&file.report).is_ok()).then_some((row.id,e,file))
+    }).collect::<Vec<_>>()};
+    for (id,e,file) in reports {
+        match ingest_matching_report_file(state,name,&id,&e,file).await {
+            Ok(true) => tracing::info!(project=name,task=%id,measured=true,n_considered=1,verdict="project.corrected_receipt_recovered","current-attempt corrected candidate returned to independent verification without model retry"),
+            Ok(false) => {},
+            Err(error) => {
+                if crate::log_dedupe::first_this_bucket(
+                    &format!("project-corrected-receipt-refused:{name}:{id}"),
+                    crate::log_dedupe::hour_bucket(crate::config::now_f64()),
+                ) {
+                    tracing::warn!(project=name,task=%id,%error,measured=true,n_considered=1,verdict="project.corrected_receipt_refused","invalid task receipt retained; other project tasks continue");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn committed_assets_match(w: &workspace::Workspace, report: &planner::Report, head: &str) -> bool {
+    if report.assets.is_empty() { return false; }
+    for asset in &report.assets {
+        let path = std::path::Path::new(&asset.path);
+        if !path.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+            return false;
+        }
+        let blob = format!("{head}:{}", asset.path);
+        let Ok(output) = std::process::Command::new("git").arg("-C").arg(&w.path)
+            .arg("show").arg(&blob).output() else { return false };
+        if !output.status.success() || output.stdout.len() > 16 * 1024 * 1024
+            || hex::encode(Sha256::digest(&output.stdout)) != asset.sha256 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Correct a mistyped full SHA only when its substantial prefix resolves to a
+/// unique commit and every declared asset matches the bytes in that commit.
+/// No prefix-only inference can mark a task verified: the normal independent
+/// checks still run on the clean assembled descendant.
+async fn recover_reported_head(w: &workspace::Workspace, report: &planner::Report) -> Option<String> {
+    if report.head.len() != 40 || !report.head.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || report.assets.is_empty() { return None; }
+    if workspace::git(&w.path, &["cat-file", "-t", &report.head]).await.as_deref() == Ok("commit") {
+        return Some(report.head.clone());
+    }
+    let prefix = &report.head[..10];
+    let revision = format!("{prefix}^{{commit}}");
+    let resolved = workspace::git(&w.path, &["rev-parse", "--verify", &revision]).await.ok()?;
+    if resolved.len() != 40 || resolved == report.head
+        || !committed_assets_match(w, report, &resolved) { return None; }
+    tracing::info!(worker=%w.branch,reported=%report.head,resolved,
+        measured=true,n_considered=report.assets.len(),verdict="project.reported_head_recovered",
+        "unique commit prefix and all committed asset hashes agree; full checks remain required");
+    Some(resolved)
+}
+
+/// A diagnostic file or a later project commit is an operational change, not
+/// authorization for another paid model turn. Re-enter verification only once
+/// the shared candidate is clean and the reported commit remains an ancestor.
+async fn recover_mechanical_verification_wait(
+    state: &AppState,
+    p: &store::Project,
+) -> anyhow::Result<()> {
+    if !p.policy.enabled || p.policy.paused || !p.policy.worktree { return Ok(()) }
+    let candidates = {
+        let c = state.store.read()?;
+        let rows = bs::project_issues(&c, &p.name)?;
+        let states = rows.iter().map(|row| planner::execution(&c, &row.id))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if states.iter().any(|e| matches!(e.stage.as_str(), "reserved" | "working" | "reported" | "verifying")) {
+            return Ok(());
+        }
+        rows.into_iter().zip(states).filter(|(_, e)| {
+            e.stage == "waiting" && e.report.is_some() && e.wait_category.is_none()
+                && matches!(e.waiting.as_deref(), Some("reported head is stale" | "worktree has uncommitted changes" | "asset identity mismatch"))
+        }).collect::<Vec<_>>()
+    };
+    let home = crate::config::amux_home();
+    for (row, expected) in candidates {
+        let Some(w) = workspace::load(&home, &expected.worker) else { continue };
+        if !workspace::same_repository(&w.repo, &p.policy.repository)
+            || !super::checkout::assignment_matches(&home, &p.name, &expected.worker, &w) {
+            continue;
+        }
+        let report = expected.report.as_ref().expect("filtered report");
+        let corrected_head = recover_reported_head(&w, report).await;
+        let mut corrected = report.clone();
+        if let Some(head) = corrected_head { corrected.head = head; }
+        if expected.waiting.as_deref() == Some("asset identity mismatch")
+            && !committed_assets_match(&w, &corrected, &corrected.head) { continue; }
+        if let Err(error) = archive_declared_diagnostics(&home, p, &row.id, &expected, &w, &corrected).await {
+            tracing::warn!(project=%p.name,task=%row.id,%error,verdict="project.verification_diagnostic_recovery_held");
+            continue;
+        }
+        let Ok(status) = workspace::project_clean_status(&w.path).await else { continue };
+        if !status.is_empty() { continue; }
+        let Ok(head) = workspace::git(&w.path, &["rev-parse", "HEAD"]).await else { continue };
+        if head != corrected.head
+            && workspace::git(&w.path, &["merge-base", "--is-ancestor", &corrected.head, &head]).await.is_err() {
+            continue;
+        }
+        let project = p.name.clone();
+        let id = row.id.clone();
+        let updated = state.store.write_async(move |c| {
+            let row = bs::get_issue(c, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let mut current = planner::execution(c, &id).map_err(store::sql_error)?;
+            let policy = store::get(c, &project).map_err(store::sql_error)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            if !policy.policy.enabled || policy.policy.paused || current.stage != "waiting"
+                || current.generation != expected.generation || current.report != expected.report
+                || current.waiting != expected.waiting || current.input_hash != expected.input_hash
+                || planner::input_hash(&row) != expected.input_hash {
+                return Ok(WriteOutcome { applied:false, events:vec![] });
+            }
+            current.stage = "reported".into();
+            current.report = Some(corrected);
+            current.last_failure = current.waiting.take();
+            planner::save_execution(c, &row, &current, "project.verification_recovered")
+                .map_err(store::sql_error)
+        }).await?;
+        if updated.applied {
+            tracing::info!(project=%p.name,task=%row.id,measured=true,n_considered=1,
+                verdict="project.mechanical_verification_recovered",
+                "clean descendant returned to checks without a provider retry");
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// A provider sandbox can report a missing repository runtime while the host
+/// later provisions it. Re-probe the exact checkout capability and grant one
+/// bounded continuation; the original commit hooks and project gates remain.
+async fn recover_repository_runtime_wait(state: &AppState, p: &store::Project) -> anyhow::Result<()> {
+    if !p.policy.enabled || p.policy.paused || !p.policy.worktree { return Ok(()) }
+    let candidates = {
+        let c = state.store.read()?;
+        bs::project_issues(&c, &p.name)?.into_iter().filter_map(|row| {
+            let e = planner::execution(&c, &row.id).ok()?;
+            let reason = e.waiting.as_deref()?.to_ascii_lowercase();
+            (e.stage == "waiting" && e.report.is_none() && e.wait_category.as_deref() == Some("operational")
+                && reason.contains("server/.venv/bin/python") && reason.contains("missing")
+                && !e.retry_grants.iter().any(|grant| grant.request.idempotency_key
+                    .starts_with(&format!("environment-recovered:{}:{}:",p.name,row.id))))
+                .then_some((row.id,e))
+        }).collect::<Vec<_>>()
+    };
+    let home = crate::config::amux_home();
+    for (id, expected) in candidates {
+        let Some(w) = workspace::load(&home, &expected.worker) else { continue };
+        if !workspace::same_repository(&w.repo, &p.policy.repository)
+            || !super::checkout::assignment_matches(&home, &p.name, &expected.worker, &w) {
+            continue;
+        }
+        let python = std::path::Path::new(&w.path).join("server/.venv/bin/python");
+        if !python.is_file() { continue; }
+        let probe = tokio::time::timeout(std::time::Duration::from_secs(10),
+            tokio::process::Command::new(&python).arg("--version").output()).await;
+        if !matches!(probe, Ok(Ok(output)) if output.status.success()) { continue; }
+        let project = p.name.clone();
+        let task = id.clone();
+        let result = state.store.write_async(move |c|
+            planner::grant_environment_recovery(c,&project,&task,&expected).map_err(store::sql_error)).await;
+        match result {
+            Ok(_) => tracing::info!(project=%p.name,task=%id,measured=true,n_considered=1,
+                verdict="project.repository_runtime_recovered","checkout Python measured; one bounded continuation granted"),
+            Err(error) => tracing::warn!(project=%p.name,task=%id,%error,
+                verdict="project.repository_runtime_recovery_held"),
+        }
+        break;
+    }
+    Ok(())
+}
+
 pub(crate) async fn drive_project(state: &AppState, name: &str) -> anyhow::Result<()> {
     let project_name = name.to_string();
     state.store.write_async(move |c| {
@@ -1154,6 +1432,9 @@ pub(crate) async fn drive_project(state: &AppState, name: &str) -> anyhow::Resul
         let c = state.store.read()?;
         store::get(&c, name)?.ok_or_else(|| anyhow::anyhow!("project missing"))?
     };
+    if p.policy.mode == amux_core::project::ProjectExecutionMode::Lead {
+        return super::lead::drive(state, &p).await;
+    }
     super::checkout::consolidate(state, &p).await?;
     state
         .store
@@ -1173,19 +1454,9 @@ pub(crate) async fn drive_project(state: &AppState, name: &str) -> anyhow::Resul
         })
         .await?;
     reconcile_corrected_candidate(state, &p).await?;
-    // A corrected receipt can arrive after verification rejected the earlier
-    // candidate. Consume only current-attempt clean descendants; no new model turn.
-    let reports={let c=state.store.read()?;bs::project_issues(&c,name)?.into_iter().filter_map(|row| {
-        let e=planner::execution(&c,&row.id).ok()?;
-        if e.stage!="waiting" { return None; }
-        let file=read_project_report_file(&e.worker).ok().flatten()?;
-        (planner::report_correction_allowed(&e,&file.report) && report_file_matches_execution(&file,&e) && planner::validate_report(&row,&file.report).is_ok()).then_some((row.id,e,file))
-    }).collect::<Vec<_>>()};
-    for (id,e,file) in reports {
-        if ingest_matching_report_file(state,name,&id,&e,file).await? {
-            tracing::info!(project=name,task=%id,measured=true,n_considered=1,verdict="project.corrected_receipt_recovered","current-attempt corrected candidate returned to independent verification without model retry");
-        }
-    }
+    recover_corrected_reports(state, name).await?;
+    recover_mechanical_verification_wait(state, &p).await?;
+    recover_repository_runtime_wait(state, &p).await?;
     let held={let c=state.store.read()?;bs::project_issues(&c,name)?.into_iter().filter_map(|row| {
         let e=planner::execution(&c,&row.id).ok()?;
         (e.stage=="waiting" && e.report.is_none() && e.output_wait.is_none()).then_some((row.id,e))
@@ -1518,6 +1789,26 @@ pub(crate) async fn apply_pause(state: &AppState, name: &str, paused: bool) -> a
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+    #[tokio::test]
+    async fn mistyped_report_head_needs_unique_commit_and_matching_asset_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        workspace::git(root, &["init"]).await.unwrap();
+        std::fs::write(dir.path().join("report.md"), b"measured candidate\n").unwrap();
+        workspace::git(root, &["add", "report.md"]).await.unwrap();
+        workspace::git(root, &["-c", "user.name=Amux Test", "-c", "user.email=test@local",
+            "commit", "-m", "candidate"]).await.unwrap();
+        let actual = workspace::git(root, &["rev-parse", "HEAD"]).await.unwrap();
+        let claimed = format!("{}{}", &actual[..10], "0".repeat(30));
+        let workspace = workspace::Workspace { repo:root.into(), path:root.into(),
+            branch:"test".into(), base:actual.clone() };
+        let mut report = planner::Report { head:claimed, summary:"candidate".into(), checks:vec![],
+            assets:vec![super::super::assets::Asset {path:"report.md".into(),
+                sha256:hex::encode(Sha256::digest(b"measured candidate\n"))}] };
+        assert_eq!(recover_reported_head(&workspace,&report).await,Some(actual));
+        report.assets[0].sha256 = "0".repeat(64);
+        assert_eq!(recover_reported_head(&workspace,&report).await,None);
+    }
     #[test]
     fn required_output_file_survives_network_loss_but_refuses_stale_or_paused_claims() {
         let home=tempfile::tempdir().unwrap();let _home=crate::api::settings::test_env::set_home(home.path());
@@ -1819,6 +2110,47 @@ mod observation_tests {
                 .action,
             "claim"
         );
+        drop(c);
+
+        // Reconsidering the durable receipt after a failed turn must not make
+        // this one invalid task abort the rest of the project's driver tick.
+        let git=|args:&[&str]| {
+            let out=std::process::Command::new("git").arg("-C").arg(&worktree).args(args).output().unwrap();
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init","-q"]);
+        git(&["config","user.name","test"]);
+        git(&["config","user.email","test@example.com"]);
+        std::fs::write(worktree.join("wrong-path.md"),"wrong receipt").unwrap();
+        git(&["add","wrong-path.md"]);
+        git(&["commit","-qm","produce incomplete candidate"]);
+        let head=git(&["rev-parse","HEAD"]);
+        state.store.write(|c| {
+            c.execute("UPDATE issues SET status='doing' WHERE id='A'",[])?;
+            let row=bs::get_issue(c,"A")?.unwrap();
+            let mut e=planner::execution(c,"A").unwrap();
+            e.stage="waiting".into();
+            e.wait_category=None;
+            planner::save_execution(c,&row,&e,"test.invalid_correction").map_err(store::sql_error)
+        }).unwrap();
+        let current=planner::execution(&state.store.read().unwrap(),"A").unwrap();
+        std::fs::write(worktree.join(".amux/project-report.json"),serde_json::to_vec(&json!({
+            "generation":current.generation,
+            "input_hash":current.input_hash,
+            "report":{
+                "head":head,
+                "summary":"still uses substituted verifier",
+                "checks":[{"criterion":"contract:goal-artifact","command":"test -f wrong-path.md"}],
+                "assets":[{"path":"wrong-path.md","sha256":hex::encode(Sha256::digest(b"wrong receipt"))}]
+            }
+        })).unwrap()).unwrap();
+        let file=read_project_report_file(&current.worker).unwrap().unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(ingest_matching_report_file(&state,"sample","A",&current,file).await.is_err());
+            recover_corrected_reports(&state,"sample").await.unwrap();
+        });
+        assert_eq!(planner::execution(&state.store.read().unwrap(),"A").unwrap().stage,"waiting");
     }
     #[test]
     fn project_observation_rejects_delayed_delivery_old_idle_and_report_races() {
@@ -2819,6 +3151,7 @@ mod command_tests {
         )
         .is_empty());
         assert_eq!(published, git(&repo, &["rev-parse", "origin/main"]));
+        assert_eq!(published, git(&repo, &["rev-parse", "main"]), "a clean checked-out local main should fast-forward with publication");
         assert_eq!(
             git(&repo, &["show", "origin/main:docs/lifecycle-report.md"]),
             body.trim()

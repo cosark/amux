@@ -261,6 +261,10 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-cli-worktree-dirty-warn.sh
+      - name: amux start makes no worktree for a start the server owns (DESKT-55)
+        run: |
+          set -uo pipefail
+          ./scripts/test-cli-start-no-orphan-worktree.sh
       # AMUX-4823. The pre-push refusal for an unwired harness. Its first cell
       # is the control that makes the other five mean anything: the fixture's
       # own wired-check always exits non-zero, so an ALLOWED push can only mean
@@ -357,6 +361,22 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-mac-cleanup-tick.sh
+      - name: the lima data-disk report names orphaned VM disks and deletes none (DESKT-47)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-lima.sh
+      - name: the idle cargo-target reaper keeps anything it cannot prove idle and unopened (DESKT-51)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-targets.sh
+      - name: the assess stage names what is still constrained and escalates it once per cooldown (DESKT-57)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-assess.sh
+      - name: launchd runs the cleanup tick when the scheduler goes quiet, and says so once a day (DESKT-58)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-fallback.sh
       # AF-677. AF-346's ratchet (above) recorded 31 harnesses as unwired rather
       # than wiring them blind, because that decision belongs to each one's
       # owner (ethos rule 8). This is that decision, made for 28 of the 31:

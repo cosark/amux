@@ -189,7 +189,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div class="header-row">
   <div class="header-brand" style="display:flex;gap:8px;align-items:center;">
     <h1 role="button" tabindex="0" aria-label="About amux" title="About amux" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openAbout()}" id="brand-header" style="margin:0;cursor:pointer;display:flex;align-items:center;gap:6px;" onclick="openAbout()"><span id="brand-icon-header"></span><span id="brand-name-header">amux</span></h1>
-    <span role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showConnHistory()}" id="conn-status" class="conn-status online" title="Connection status — click for disconnection history" onclick="showConnHistory()"></span>
+    <span role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();_connPillClick()}" id="conn-status" class="conn-status online" title="Connection and sync status. Tap for pending changes or disconnection history" onclick="_connPillClick()"></span>
     <div style="position:relative;">
       <button id="notif-btn" onclick="toggleNotifPanel()" title="Notifications" style="cursor:pointer;padding:2px 4px;font-size:1rem;opacity:0.7;line-height:1;position:relative;" aria-label="Notifications" aria-controls="notif-panel" aria-expanded="false">&#x1F514;<span id="notif-badge" class="notif-badge" style="display:none;">0</span></button>
       <div id="notif-panel" class="notif-panel">
@@ -445,6 +445,12 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <details><summary>Browser blocks HTTPS before sign-in?</summary><p>On the server machine, open <code>http://localhost:&lt;this server's port&gt;/connection-setup</code> for local trust and install instructions. This page cannot grant OS/browser trust. Ask the operator to provide a trusted certificate; do not disable TLS checks.</p></details>
         </section>
         <div class="settings-sep"></div>
+        <section class="settings-section" id="settings-vault-section">
+          <div class="settings-section-label">Vault</div>
+          <p class="connection-help">Cards workers can use without seeing. amux types the card into the worker's checkout page; the number never reaches a prompt or a log. A charge above an item's limit waits for your approval in the approvals banner.</p>
+          <div id="vault-items">Loading…</div>
+        </section>
+        <div class="settings-sep"></div>
         <div class="settings-section" id="settings-apikeys-section">
           <div class="settings-section-label">API Keys</div>
           <div style="font-size:0.72rem;color:var(--dim);margin-bottom:6px;">Also used to fetch each vendor's own live model list instead of amux's static fallback.</div>
@@ -646,6 +652,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div id="pinned-notes-home" class="pinned-notes-home"></div>
 <div id="cards" class="cards"></div>
+<div id="project-workers-section"></div>
 <div id="review-section"></div>
 <div id="paused-section"></div>
 <div id="expired-section"></div>
@@ -2097,6 +2104,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         oninput="_createNameChanged(this.value)"
         onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('create-dir').focus({preventScroll:true});}">
     </div>
+    <div class="field-group" id="create-type-field">
+      <label class="field-label">Type</label>
+      <div id="create-type-row" style="display:flex;gap:6px;"></div>
+      <div id="create-type-hint" class="field-optional" style="margin-top:4px;font-size:0.75rem;"></div>
+    </div>
     <div class="field-group">
       <label class="field-label">Provider</label>
       <div style="display:flex;gap:6px;">
@@ -2113,7 +2125,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <input id="create-model-custom" type="text" placeholder="Exact model ID" autocomplete="off" autocorrect="off" style="display:none;margin-top:6px;">
     </div>
     <div class="field-group">
-      <label class="field-label">Working directory</label>
+      <label class="field-label" id="create-dir-label">Working directory</label>
       <div class="ac-wrap">
         <input id="create-dir" type="text" placeholder="/path/to/project" autocomplete="off" autocorrect="off"
           oninput="acFetch(this.value);_branchesLoaded='';clearTimeout(_gitCheckTimer);_gitCheckTimer=setTimeout(()=>_checkDirGit(this.value),500)" onfocus="acFetch(this.value)"
@@ -2319,6 +2331,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-simple" onclick="setPeekTab('simple')" title="Translate this worker's output — plain English by default, or your own prompt"><span class="tab-ico">◍</span><span class="tab-lbl">Translate</span></button>
     <button class="peek-tab" id="peek-tab-steering" onclick="setPeekTab('steering')"><span class="tab-ico">⇉</span><span class="tab-lbl">Steering</span><span class="peek-tab-count" id="peek-tab-steering-count"></span></button>
     <button class="peek-tab" id="peek-tab-schedules" onclick="setPeekTab('schedules')"><span class="tab-ico">⏱</span><span class="tab-lbl">Schedules</span><span class="peek-tab-count" id="peek-tab-schedules-count"></span></button>
+    <button class="peek-tab" id="peek-tab-shell" onclick="setPeekTab('shell')" title="This worker's shell schedules: what runs on this machine for it, live and past output"><span class="tab-ico">$</span><span class="tab-lbl">Shell</span></button>
     <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="Edit this worker's configuration and see which layer supplies each value"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Configurations</span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this worker"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
@@ -2708,6 +2721,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
   </div>
   <!-- Schedules panel — same view as the homepage Scheduler, scoped to this session -->
+  <div id="peek-shell-panel" class="peek-tasks-panel peek-shell-panel">
+    <div class="peek-shell-head"><b>Shell</b><span class="peek-shell-sub">Shell schedules run on this machine, not in the worker. Output streams here as they run.</span></div>
+    <div id="peek-shell-list"></div>
+  </div>
   <div id="peek-schedules-panel" class="peek-tasks-panel" style="padding:0;gap:0;">
     <div style="padding:10px 12px 8px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--border);flex-shrink:0;">
       <span style="font-weight:600;font-size:0.9rem;">Scheduler</span>
@@ -2880,7 +2897,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="sync-banner" class="sync-banner">
   <div class="sync-title">
     <span id="sync-title-text">Syncing...</span>
-    <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="document.getElementById('sync-banner').classList.remove('active')">Dismiss</button>
+    <button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="_syncBannerRequested=false;_syncChecklist=[];document.getElementById('sync-banner').classList.remove('active')">Dismiss</button>
   </div>
   <div id="sync-items"></div>
 </div>
@@ -3119,10 +3136,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <h2 id="mdai-title">node</h2>
       <div id="mdai-subpath" class="file-subpath"></div>
     </div>
-    <div class="file-actions">
+    <!-- NOT .file-actions: that container is display:none until the file
+         viewer's own toggle opens it, so Run, Raw and the menu were never shown. -->
+    <div class="mdai-actions">
       <button id="mdai-run-btn" class="file-view-tab" onclick="_mdaiRun()" title="Run the DAG chain">Run</button>
-      <button id="mdai-raw-btn" class="file-view-tab" onclick="_mdaiOpenRaw()" title="Open the raw .mdai file">Raw</button>
-      <button id="mdai-menu-btn" class="file-view-tab" onclick="event.stopPropagation();_mdaiMenu(this)" title="Download, copy, read aloud">&#x22EF;</button>
+      <button id="mdai-menu-btn" class="file-menu-btn" onclick="event.stopPropagation();_mdaiMenu(this)" title="Copy, export, raw file, read aloud" aria-label="More actions">&#x22EF;</button>
     </div>
     <button class="btn" onclick="closeMdaiNode()" style="flex-shrink:0;">&#x2715;</button>
   </div>
@@ -3150,8 +3168,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <script src="/app.js"></script>
 
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
+<!-- marked + DOMPurify + remend, served by amux so markdown renders offline (scripts/build-md.mjs) -->
+<script src="/vendor/md.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/quilljs-markdown@latest/dist/quilljs-markdown.js"></script>

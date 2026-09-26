@@ -579,6 +579,7 @@ let sessions = [];
 let _sessionsSnapshotEpoch = 0;
 let pausedExpanded = false;
 let reviewExpanded = false;
+let projectWorkersExpanded = false;
 let expiredExpanded = false;
 let _expiredWorkerInventory = new Map();
 let _expiredWorkerInventoryAt = 0;
@@ -2459,9 +2460,15 @@ function showFormModal(title, innerHTML, confirmLabel = 'Save') {
 }
 // Single-line prompt on the same chrome. Resolves the string, or null if cancelled.
 async function showPrompt(msg, placeholder = '') {
-  const ok = await showFormModal(msg,
-    '<input id="modal-prompt-input" class="dict-modal-input" placeholder="' + esc(placeholder) + '" style="width:100%">',
+  // Focused, and Enter submits: a prompt you must click into and then click
+  // OK on invited pressing OK on an empty box (the bulk-delete "Delete
+  // cancelled" report, 2026-09-24).
+  const shown = showFormModal(msg,
+    '<input id="modal-prompt-input" class="dict-modal-input" placeholder="' + esc(placeholder) + '" style="width:100%"'
+    + ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();_modalClose(true)}">',
     'OK');
+  setTimeout(() => document.getElementById('modal-prompt-input')?.focus(), 30);
+  const ok = await shown;
   if (!ok) return null;
   return (document.getElementById('modal-prompt-input')?.value || '').trim();
 }
@@ -2477,9 +2484,17 @@ function _clRow(s) {
     ? `<span style="margin-left:auto;color:var(--dim);font-size:0.76rem;white-space:nowrap;">${esc(s.credit_limit_model)}</span>` : '';
   return `<div style="display:flex;align-items:center;gap:8px;font-size:0.82rem;padding:4px 8px;border-radius:6px;background:rgba(255,255,255,0.04);"><span style="color:#e0555b;flex-shrink:0;">&#x25CF;</span> <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(s.name)}</span>${model}</div>`;
 }
+// Limited NOW: a future reset time, or the server's `rate_limited` status with no
+// reset time it could read. The second case used to be dropped by every bulk
+// "continue" control below, silently: a weekly limit ("resets Oct 2 at 3am") left
+// `rate_limited_until` at 0 and the click reached no worker (2026-09-26).
+function _isLimitedNow(s, now) {
+  return (s.rate_limited_until && s.rate_limited_until > now)
+    || (s.status === 'rate_limited' && !s.rate_limited_until);
+}
 function openBulkActions() {
   const now = Date.now() / 1000;
-  const limited = sessions.filter(s => s.rate_limited_until && s.rate_limited_until > now);
+  const limited = sessions.filter(s => _isLimitedNow(s, now));
   const creditLimited = sessions.filter(s => s.credit_limited);
   // Transient API errors (529 Overloaded / 5xx). Retryable immediately — no reset
   // to wait for, no model to switch — so "continue" IS the fix. These were
@@ -2616,6 +2631,7 @@ const _VISIBLE_ACTIONS = {
   stop:    { label: 'Stop',    verb: 'Stopping',  done: 'stopped',  path: n => '/api/sessions/' + encodeURIComponent(n) + '/stop' },
   pause:   { label: 'Pause',   verb: 'Pausing',   done: 'paused',   path: n => '/api/workers/' + encodeURIComponent(n) + '/pause' },
   archive: { label: 'Archive', verb: 'Archiving', done: 'archived', path: n => '/api/sessions/' + encodeURIComponent(n) + '/archive', ui: true },
+  wake:    { label: 'Wake',    verb: 'Waking',    done: 'woken',    path: n => '/api/sessions/' + encodeURIComponent(n) + '/wake' },
   delete:  { label: 'Delete',  verb: 'Deleting',  done: 'deleted',  path: n => '/api/sessions/' + encodeURIComponent(n) + '/delete', ui: true, danger: true },
 };
 function openVisibleWorkerActions() {
@@ -2631,15 +2647,22 @@ function openVisibleWorkerActions() {
   document.getElementById('bulk-actions-overlay').classList.add('open');
 }
 async function runVisibleWorkerAction(key) {
+  return _runWorkerActionNames(key, _visibleWorkerNames());
+}
+async function _runWorkerActionNames(key, names, note) {
   const a = _VISIBLE_ACTIONS[key];
-  const names = _visibleWorkerNames();
-  if (!a || !names.length) return;
+  if (!a || !names.length) return null;
   closeBulkActions();
   const list = names.length > 8 ? names.slice(0, 8).join(', ') + ' and ' + (names.length - 8) + ' more' : names.join(', ');
-  if (!await showConfirm(a.label + ' ' + names.length + ' worker' + (names.length === 1 ? '' : 's') + '?\n\n' + list, a.label, !!a.danger)) return;
-  if (a.danger) {
-    const typed = await showPrompt('Type ' + names.length + ' to delete ' + names.length + ' worker' + (names.length === 1 ? '' : 's'), String(names.length));
-    if (typed !== String(names.length)) { showToast('Delete cancelled'); return; }
+  if (!await showConfirm(a.label + ' ' + names.length + ' worker' + (names.length === 1 ? '' : 's') + '?\n\n' + list + (note ? '\n\n' + note : ''), a.label, !!a.danger)) return null;
+  // THE TYPED COUNT ONLY FOR A REAL SWEEP, AND NEVER AS A PLACEHOLDER (Ethan,
+  // 2026-09-24: "i try to delete via all shown ... but it says delete
+  // canceled"). The count sat grey inside the box, which reads as prefilled,
+  // so OK submitted an empty box and every delete was refused.
+  if (a.danger && names.length > 3) {
+    const typed = await showPrompt('Type the number ' + names.length + ' to delete ' + names.length + ' workers', '');
+    if (typed === null) { showToast('Delete cancelled'); return null; }
+    if (typed !== String(names.length)) { showToast('Nothing deleted: you typed "' + typed + '", expected ' + names.length); return null; }
   }
   const failed = []; let done = 0;
   const queue = names.slice();
@@ -2655,7 +2678,142 @@ async function runVisibleWorkerAction(key) {
   await Promise.all(Array.from({ length: Math.min(4, names.length) }, one));
   try { amuxTrack('bulk_visible_action', { action: key, n: names.length, ok: done, failed: failed.length }); } catch (e) {}
   showToast(done + ' of ' + names.length + ' ' + a.done + (failed.length ? '. Not ' + a.done + ': ' + failed.join(', ') : ''));
+  if (key === 'archive' || key === 'resume') {
+    names.forEach(name => _expiredWorkerInventory.delete(name));
+    _expiredWorkerInventoryAttemptAt = 0;
+  }
   await fetchSessions();
+  return { done, failed };
+}
+const _workerGroupMenuOpen = new Map();
+const _workerGroupActions = {
+  project: ['start','pause','resume','archive','wake','delete'],
+  review: ['archive','delete'],
+  paused: ['resume','archive','delete'],
+  expired: ['resume','archive'],
+  archived: ['wake','delete']
+};
+// THE LIST'S FILTERS, AS ONE PREDICATE (Ethan 2026-09-26: "when i click a
+// group tab, the paused, expired, archived etc. workers in the accordion should
+// reflect the filters"). The main list applied the group pill, hidden groups
+// and the provider/model facets inline, and every accordion section built its
+// own list from search alone, so picking a group narrowed the cards while the
+// sections below kept showing the whole fleet. The main list, every section,
+// and the group actions/checkboxes (_workerGroupMembers) all read this now.
+// The STATUS facet stays main-list only: it describes live state (working,
+// idle), which a paused, archived or expired worker does not have.
+function _workerListFilterPass(s) {
+  const tags = (s && s.tags) || [];
+  if (activeTag && !tags.includes(activeTag)) return false;
+  if (hiddenTags.size && !_workerVisibleWithHiddenTags(tags, activeTag, hiddenTags)) return false;
+  if (filterProviders.size && !filterProviders.has(sessionProvider(s))) return false;
+  if (filterModels.size && !filterModels.has(_modelClass(sessionConfiguredModel(s)))) return false;
+  return true;
+}
+function _workerGroupMembers(kind) {
+  const q=searchQuery.toLowerCase().trim();
+  if(kind==='project') {
+    const registered=new Set(sessions.map(s=>s.name));
+    const retired=[..._expiredWorkerInventory.values()].filter(w=>w.project && !registered.has(w.name)).map(w=>({...w,running:false,archived:false}));
+    return [...sessions.filter(s=>!!s.project),...retired].filter(_workerListFilterPass).filter(s=>!q || [s.name,s.project,s.dir,s.desc,s.task_name,...(s.tags||[])].some(v=>String(v||'').toLowerCase().includes(q)));
+  }
+  if(kind==='expired') {
+    const registered=new Set(sessions.map(s=>s.name));
+    const names=new Set(boardItems.map(c=>c.session).filter(name=>name && !registered.has(name) && _expiredWorkerInventory.has(name) && !_expiredWorkerInventory.get(name)?.project && _workerListFilterPass({name,..._expiredWorkerInventory.get(name)})));
+    return [...names].map(name=>({name,lifecycle:'expired',archived:false})).filter(s=>!q || s.name.toLowerCase().includes(q));
+  }
+  return sessions.filter(s=>{
+    const belongs=kind==='review'?s.lifecycle==='review'&&!s.archived&&!s.project:kind==='paused'?s.lifecycle==='paused'&&!s.archived&&!s.project:kind==='archived'?!!s.archived&&!s.project:false;
+    return belongs && _workerListFilterPass(s) && (!q || [s.name,s.dir,s.desc,s.task_name,...(s.tags||[])].some(v=>String(v||'').toLowerCase().includes(q)));
+  });
+}
+// One predicate for the group menus and the cross-group selection, so a count
+// on a button is the number the action will actually touch.
+function _workerActionEligible(s,key) {
+  const lifecycle=s.lifecycle||'active';
+  if(key==='start') return !s.running && !s.archived && lifecycle==='active';
+  if(key==='pause') return !!s.running && !s.archived && lifecycle==='active';
+  if(key==='resume') return lifecycle==='paused'||lifecycle==='expired';
+  if(key==='archive') return !s.archived && ['review','paused','expired'].includes(lifecycle);
+  if(key==='wake') return !!s.archived;
+  // The server refuses a RUNNING project worker (409: it shares its project's
+  // checkout) and pinned ones (403). A stopped project worker is deletable and
+  // its checkout is kept. An expired worker with no session has nothing to delete.
+  if(key==='delete') return !(s.project && s.running) && !s.pinned && sessions.some(x=>x.name===s.name);
+  return false;
+}
+function _workerGroupActionNames(kind,key) {
+  return _workerGroupMembers(kind).filter(s=>_workerActionEligible(s,key)).map(s=>s.name);
+}
+const _workerGroupDeleteNote = {
+  project: 'Delete: running project workers must be paused or archived first',
+  expired: 'Delete: expired workers have no session left to delete'
+};
+function _workerGroupMenu(kind) {
+  const items=(_workerGroupActions[kind]||[]).map(key=>{
+    const count=_workerGroupActionNames(kind,key).length;
+    return count?'<button type="button" onclick="event.stopPropagation();runWorkerGroupAction(\''+key+'\',\''+kind+'\')">'+esc(_VISIBLE_ACTIONS[key].label)+' '+count+'</button>':'';
+  }).filter(Boolean).join('')+(_workerGroupDeleteNote[kind]?'<span class="worker-group-note">'+esc(_workerGroupDeleteNote[kind])+'</span>':'');
+  return '<details class="worker-group-menu"'+(_workerGroupMenuOpen.get(kind)?' open':'')+' ontoggle="_workerGroupMenuOpen.set(\''+kind+'\',this.open)"><summary aria-label="Actions for '+esc(kind)+' workers" title="Actions for this group">⋯</summary><div class="worker-group-dropdown">'+(items||'<span>No available actions</span>')+'</div></details>';
+}
+function _workerGroupFooter(kind,label,expanded,onclick) {
+  const members=_workerGroupMembers(kind).map(s=>s.name);
+  const nSel=members.filter(n=>_workerSel.has(n)).length;
+  const all=members.length&&nSel===members.length;
+  const box=members.length?'<label class="wsel" onclick="event.stopPropagation()" title="'+(all?'Clear':'Select')+' every worker in this group"><input type="checkbox"'+(all?' checked':'')+' onchange="_wselGroup(\''+kind+'\',this.checked)" aria-label="Select all '+esc(kind)+' workers"></label>':'';
+  return '<div class="'+kind+'-footer worker-group-footer">'+box+'<button type="button" class="worker-group-toggle" aria-expanded="'+expanded+'" onclick="'+onclick+'()"><span class="'+kind+'-chevron'+(expanded?' open':'')+'">&#x25B6;</span> '+label+'</button>'+_workerGroupMenu(kind)+'</div>';
+}
+// Checked workers across every group (Ethan 2026-09-26: "add a way to bulk
+// delete for each accordion group and let me do checkboxes to do multiple
+// across all"). Rows and group headers toggle names here; the bar at the
+// bottom acts on the whole set with the same runner and confirmations.
+const _workerSel = new Set();
+function _wselBox(name) {
+  return '<label class="wsel" onclick="event.stopPropagation()" title="Select '+esc(name)+'"><input type="checkbox"'+(_workerSel.has(name)?' checked':'')+' onchange="_wselToggle(\''+escJs(name)+'\',this.checked)" aria-label="Select '+esc(name)+'"></label>';
+}
+function _wselRerender() {
+  _renderProjectWorkersSection(); _renderReviewSection(); _renderPausedSection(); _renderExpiredSection(); _renderArchivedSection();
+}
+function _wselToggle(name,on) { if(on) _workerSel.add(name); else _workerSel.delete(name); _wselRerender(); }
+function _wselGroup(kind,on) { _workerGroupMembers(kind).forEach(s=>{ if(on) _workerSel.add(s.name); else _workerSel.delete(s.name); }); _wselRerender(); }
+function _wselClear() { _workerSel.clear(); _wselRerender(); }
+function _wselWorker(name) {
+  const s=sessions.find(x=>x.name===name);
+  if(s) return s;
+  const w=_expiredWorkerInventory.get(name);
+  return w?{...w,name,lifecycle:'expired',archived:false,running:false}:null;
+}
+const _WSEL_ACTIONS=['resume','wake','archive','delete'];
+function _renderWorkerSelBar() {
+  [..._workerSel].forEach(n=>{ if(!_wselWorker(n)) _workerSel.delete(n); });
+  let bar=document.getElementById('worker-selbar');
+  if(!_workerSel.size) { if(bar) bar.remove(); return; }
+  if(!bar) { bar=document.createElement('div'); bar.id='worker-selbar'; bar.className='worker-selbar'; bar.setAttribute('role','toolbar'); bar.setAttribute('aria-label','Selected workers'); document.body.appendChild(bar); }
+  const picked=[..._workerSel].map(_wselWorker);
+  const btns=_WSEL_ACTIONS.map(k=>{
+    const n=picked.filter(s=>_workerActionEligible(s,k)).length;
+    return n?'<button type="button" class="btn'+(_VISIBLE_ACTIONS[k].danger?' danger':'')+'" onclick="_wselRun(\''+k+'\')">'+_VISIBLE_ACTIONS[k].label+' '+n+'</button>':'';
+  }).join('');
+  const html='<span class="worker-selbar-count">'+picked.length+' selected</span>'+(btns||'<span class="worker-selbar-note">No action applies to these</span>')+'<button type="button" class="btn" onclick="_wselClear()">Clear</button>';
+  if(bar.innerHTML!==html) bar.innerHTML=html;
+}
+async function _wselRun(key) {
+  const picked=[..._workerSel].map(_wselWorker).filter(Boolean);
+  const names=picked.filter(s=>_workerActionEligible(s,key)).map(s=>s.name);
+  if(!names.length) return;
+  const left=picked.length-names.length;
+  const note=left?left+' other selected worker'+(left===1?' is':'s are')+' not eligible and will be left alone.':'';
+  const out=await _runWorkerActionNames(key,names,note);
+  if(!out) return;
+  const failed=new Set(out.failed);
+  names.forEach(n=>{ if(!failed.has(n)) _workerSel.delete(n); });
+  _wselRerender();
+}
+async function runWorkerGroupAction(key,kind) {
+  const names=_workerGroupActionNames(kind,key);
+  if(!names.length) {showToast('No matching workers remain in this group');return;}
+  _workerGroupMenuOpen.set(kind,false);
+  await _runWorkerActionNames(key,names);
 }
 function closeBulkActions() {
   document.getElementById('bulk-actions-overlay').classList.remove('open');
@@ -2667,7 +2825,7 @@ async function bulkContinueLimited() {
   const now = Date.now() / 1000;
   const seen = new Set();
   const targets = sessions.filter(s => {
-    const lim = (s.rate_limited_until && s.rate_limited_until > now) || s.credit_limited;
+    const lim = _isLimitedNow(s, now) || s.credit_limited;
     if (!lim || seen.has(s.name)) return false;
     seen.add(s.name); return true;
   });
@@ -2688,9 +2846,9 @@ async function bulkContinueLimited() {
 async function bulkSendContinue(cappedOnly) {
   const now = Date.now() / 1000;
   const isCapped = s => s.rate_limit_banner || s.rate_limit_weekly;
-  const matched = sessions.filter(s => s.rate_limited_until && s.rate_limited_until > now
+  const matched = sessions.filter(s => _isLimitedNow(s, now)
     && (cappedOnly ? isCapped(s) : !isCapped(s)));
-  if (!matched.length) { closeBulkActions(); return; }
+  if (!matched.length) { closeBulkActions(); showToast('No limited workers to continue'); return; }
   closeBulkActions();
   let sent = 0;
   for (const s of matched) {
@@ -2853,6 +3011,9 @@ function updateConnectionStatus() {
     } else if (offlineQueue.some(_outboxNeedsAttention) || drafts.length) {
       el.className = 'conn-status polling';
       el.textContent = (offlineQueue.length + drafts.length) + ' pending';
+    } else if (_syncPillText) {
+      el.className = 'conn-status polling';
+      el.textContent = _syncPillText;
     } else if (_liveSSE) {
       el.className = 'conn-status online';
       el.textContent = 'Live';
@@ -3053,6 +3214,12 @@ function setOnline(val) {
   if (!was && val) {
     // The visible sync checklist is the receipt; a toast would cover its rows.
     if (!offlineQueue.length && !drafts.length) showToast('Reconnected');
+    // A RECONNECT WITH A BACKLOG SHOWS THE CHECKLIST (Ethan, 2026-09-24: "when
+    // reconnecting and there's a backlog of tasks to sync ... bring the
+    // animation up that goes thru each one by one with check boxes ... on the
+    // homepage visible"). Routine retries stay in the pill (his earlier "it's
+    // in the way"), and so does a reconnect while a worker terminal is open.
+    _syncBannerAuto = true;
     runSyncBanner(false);
     // Reconnect SSE (reset fallback so we can get back to Live mode)
     _sseFallback = false; _sseRetries = 0;
@@ -3099,6 +3266,7 @@ function runSyncBanner(quiet = false) {
     .catch(e => { _writeError = String(e.message || e); showToast('Sync failed: ' + _writeError); })
     .finally(() => {
       _syncFlight = null;
+      _syncPillText = '';   // nothing in flight; the pill falls back to "N pending"
       // Progress resets the backoff: an interval earned during an outage must
       // not persist into a working server.
       if (offlineQueue.length < before || drafts.length < draftsBefore) _syncBackoffReset();
@@ -3123,6 +3291,20 @@ function _clearSyncTransientToast() {
   toast.classList.remove('visible');
 }
 let _syncChecklist = [];
+let _syncBannerRequested = false;
+let _syncBannerAuto = false;
+let _syncChecklistAt = 0;
+let _syncPillText = '';
+// The pill is the one place sync state lives. With work pending or in flight a
+// tap opens the checklist; otherwise it keeps opening connection history.
+function _connPillClick() {
+  const pending = offlineQueue.length || drafts.length || _syncPillText;
+  if (!pending) return showConnHistory();
+  _syncBannerRequested = true;
+  const banner = document.getElementById('sync-banner');
+  if (banner) banner.classList.add('active');
+  if (!_syncFlight) runSyncBanner();
+}
 // Delivery diagnostics contain identities/timing, never prompt text. The
 // replay may happen long after the original click's fast-peek window expired.
 function _outboxMessageProgress(q, phase, startedAt) {
@@ -3173,24 +3355,35 @@ async function _runSyncBanner(quiet = false) {
 
   // A retry updates its rows; it must not erase already-acknowledged files or
   // blocked changes from the visible reconnect receipt. Dismiss starts a new list.
-  if (banner.classList.contains('active')) {
+  // One reconnect can take several passes. The rows used to carry over only
+  // while the list was on screen; it no longer opens by itself, so carry them
+  // for a minute after the last update too (Dismiss still starts over).
+  if (banner.classList.contains('active') || (_syncChecklist.length && Date.now() - _syncChecklistAt < 60000)) {
     const currentKeys = new Set(items.map(item => item.key));
     items.unshift(..._syncChecklist.filter(item => !currentKeys.has(item.key)).map(item => ({...item, replay:false})));
   }
   _syncChecklist = items;
+  _syncChecklistAt = Date.now();
   skipped = items.filter(item => item.status === 'skipped').length;
   function renderBanner() {
     const done = items.filter(i => i.status === 'done').length;
     const failed = items.filter(i => i.status === 'failed').length;
     titleEl.textContent = 'Syncing ' + done + '/' + items.length + (failed ? ' (' + failed + ' failed)' : '') + (skipped ? ' (' + skipped + ' skipped)' : '');
+    _syncPillText = done < items.length ? 'Syncing ' + done + '/' + items.length : '';
+    updateConnectionStatus();
     itemsEl.innerHTML = items.map(i => {
-      const icon = i.status === 'done' ? '&#x2714;' : i.status === 'failed' ? '&#x2718;' : i.status === 'running' ? '&#x27A4;' : i.status === 'skipped' ? '&mdash;' : '&#x2022;';
-      return '<div data-sync-id="' + esc(i.key) + '" class="sync-item ' + i.status + '">' + icon + ' ' + esc(i.label) + '</div>';
+      const icon = i.status === 'done' ? '&#x2714;' : i.status === 'failed' ? '&#x2718;' : i.status === 'skipped' ? '&mdash;' : '';
+      return '<div data-sync-id="' + esc(i.key) + '" class="sync-item ' + i.status + '"><span class="sync-box" aria-hidden="true">' + icon + '</span>' + esc(i.label) + '</div>';
     }).join('');
   }
 
   renderBanner();
-  const show = !quiet || items.filter(i => !(i.type === 'queue' && _outboxUncertainMessage(i.item))).length >= 2;
+  // THE CHECKLIST NO LONGER POPS UP ON ITS OWN (Ethan, 2026-09-24: "this keeps
+  // popping up its fine but its in the way just keep it in the pending/live
+  // status at the top"). Progress shows in the connection pill ("Syncing 1/3");
+  // tapping the pill opens this list. `_syncBannerRequested` is that tap.
+  const show = _syncBannerRequested || (_syncBannerAuto && !peekSession);
+  _syncBannerAuto = false;
   if (show) {
     // The checklist replaces transient queue feedback, including a toast from
     // an offline write immediately before reconnect. Keep failure toasts intact.
@@ -3361,6 +3554,7 @@ async function _runSyncBanner(quiet = false) {
       if (!_syncFlight) {
         const wasUp = banner.classList.contains('active');
         banner.classList.remove('active');
+        _syncBannerRequested = false;
         if (wasUp) _syncBannerBeacon('cleared', _syncChecklist);
       }
     }, 2000);
@@ -3528,6 +3722,7 @@ async function forceRetry() {
   closeQueueModal();
   if (!offlineQueue.length && !drafts.length) return;
   await _mutateQueue(current => current.forEach(q => { q.state = 'pending'; q.reviewed_at = Date.now(); }));
+  _syncBannerAuto = true;
   if (online) { runSyncBanner(); } else { setOnline(true); }
 }
 
@@ -5636,13 +5831,14 @@ function _workerActionDefinitions(s) {
   const provider = sessionProvider(s);
   const model = sessionConfiguredModel(s);
   const effort = provider === 'claude' ? flagValue(s.flags || '', '--effort') : '';
+  const terminal = _workerRenderer(s.name) === 'terminal';
   return [
     { key: 'task-label', icon: '&#x270F;', label: 'Task label' + (s.task_override ? '' : ' (none)'),
       run: "editField('" + name + "','task','" + escJs(s.task_override || '') + "')" },
     { separator: true },
     !s.isolated ? { key: 'task-queue', icon: '&#x2637;', label: 'Task queue',
       run: "closeAllMenus();_openWorkQueue('" + name + "')" } : null,
-    { key: 'peek-terminal', icon: '&#x1F4BB;', label: 'Peek terminal',
+    { key: 'peek-terminal', icon: terminal ? '&#x1F4BB;' : '&#x1F4AC;', label: terminal ? 'Peek terminal' : 'Open chat',
       run: "closeAllMenus();openPeek('" + name + "')" },
     { key: 'read-latest', icon: '&#x1F50A;', label: 'Read latest message',
       run: "closeAllMenus();_readLatestMessage('" + name + "')" },
@@ -5688,7 +5884,7 @@ function _workerActionDefinitions(s) {
       run: "closeAllMenus();doRestart('" + name + "')" } : null,
     s.running ? { key: 'stop', icon: '&#x23F9;', label: 'Stop',
       run: "closeAllMenus();doStop('" + name + "')" } : null,
-    s.running ? { key: 'clear-scrollback', icon: '&#x239A;', label: 'Clear scrollback',
+    s.running && terminal ? { key: 'clear-scrollback', icon: '&#x239A;', label: 'Clear scrollback',
       run: "clearScrollback('" + name + "')" } : null,
     { key: 'duplicate', icon: '&#x2398;', label: 'Duplicate',
       run: "duplicateSession('" + name + "')" },
@@ -5702,8 +5898,8 @@ function _workerActionDefinitions(s) {
     { key: 'archive', icon: '&#x1F4E6;', label: 'Archive',
       run: "archiveSession('" + name + "')" },
     { separator: true },
-    { key: 'delete', icon: '&#x2716;', label: 'Delete', danger: true,
-      run: "deleteSession('" + name + "')" },
+    !s.project ? { key: 'delete', icon: '&#x2716;', label: 'Delete', danger: true,
+      run: "deleteSession('" + name + "')" } : null,
   ].filter(Boolean);
 }
 
@@ -5810,7 +6006,7 @@ function render() {
   renderActiveFilters();
   // Build tag filter bar
   const tagEl = document.getElementById('tag-filters');
-  const liveTags = new Set(sessions.filter(s => !s.archived && !_workerLifecycleInactive(s)).flatMap(s => s.tags || []));
+  const liveTags = new Set(sessions.filter(s => !s.project && !s.archived && !_workerLifecycleInactive(s)).flatMap(s => s.tags || []));
   // A hidden group keeps its pill even with no live workers, or it could never
   // be un-hidden. Pruning a vanished group waits for real data: a restored
   // view must not be wiped by the empty list that precedes the first fetch.
@@ -5835,6 +6031,13 @@ function render() {
       // Act on everything the list is showing right now (Ethan 2026-09-24:
       // "add a button to apply an action to all visible workers ... maybe on
       // the group pills row"). The count is filled in after the cards render.
+      // RESET THE GROUP VIEW (Ethan 2026-09-24: "add a reset thing on the group
+      // row so i can reset the view of groups"). Only shown when a group is
+      // selected or hidden, so the row costs nothing in the default view.
+      + ((activeTag || hiddenTags.size)
+          ? '<button type="button" class="tag-filter tag-reset-btn" onclick="resetGroupView()" '
+            + 'title="Show every group again">\u21ba Reset</button>'
+          : '')
       + '<button type="button" class="tag-filter bulk-visible-btn" id="bulk-visible-btn" '
       + 'onclick="openVisibleWorkerActions()" title="Apply an action to every worker shown below">All shown</button>';
     // After this render finishes building the cards, whichever return it takes.
@@ -5863,7 +6066,7 @@ function render() {
   const workersStale = !!(_sessionLoadError && sessions.length);
   el.classList.toggle('workers-stale', workersStale);
   const staleWorkerPrefix = '';
-  const _nonArchivedCount = sessions.filter(s => !s.archived && !_workerLifecycleInactive(s)).length;
+  const _nonArchivedCount = sessions.filter(s => !s.project && !s.archived && !_workerLifecycleInactive(s)).length;
   if (!_nonArchivedCount && !drafts.length) {
     if (_sessionLoadError) {
       el.innerHTML = ''; // Actionable detail is in the Sync error badge modal.
@@ -5888,9 +6091,10 @@ function render() {
         : '<div class="empty"><span class="loading-spinner"></span>Connecting to server…<br>' +
           '<a href="/api/_clear_sw" style="color:var(--dim);font-size:0.75rem;margin-top:8px;display:inline-block;">Stuck? Clear cache</a></div>';
     } else {
-      el.innerHTML = '<div class="empty">' + (sessions.some(s => s.lifecycle === 'paused' || s.lifecycle === 'review') ? 'No active workers. Resume a paused worker to continue.' : 'No workers yet.<br>Tap <strong>+</strong> to create one.') +
+      el.innerHTML = '<div class="empty">' + (sessions.some(s => s.project) ? 'Project workers are grouped below.' : sessions.some(s => s.lifecycle === 'paused' || s.lifecycle === 'review') ? 'No active workers. Resume a paused worker to continue.' : 'No workers yet.<br>Tap <strong>+</strong> to create one.') +
         (!online ? '<br><span style="color:var(--yellow)">You\'re offline — workers created now will sync when connected.</span>' : '') + '</div>';
     }
+    _renderProjectWorkersSection();
     _renderReviewSection();
     _renderPausedSection();
     _renderExpiredSection();
@@ -5917,8 +6121,7 @@ function render() {
   }).join('');
 
   // Filter by tag (exclude archived from main view)
-  let list = (activeTag ? sessions.filter(s => (s.tags || []).includes(activeTag)) : sessions).filter(s => !s.archived && !_workerLifecycleInactive(s));
-  if (hiddenTags.size) list = list.filter(s => _workerVisibleWithHiddenTags(s.tags || [], activeTag, hiddenTags));
+  let list = sessions.filter(s => !s.project && !s.archived && !_workerLifecycleInactive(s)).filter(_workerListFilterPass);
   // Filter by search query
   const q = searchQuery.toLowerCase().trim();
   let filtered = q ? list.filter(s =>
@@ -5929,11 +6132,10 @@ function render() {
     (logSearchMode && s.name in _logMatches)
   ) : list;
   // Filters modal: provider + model-type facets (multi-select, AND across facets)
-  if (filterProviders.size) filtered = filtered.filter(s => filterProviders.has(sessionProvider(s)));
-  if (filterModels.size) filtered = filtered.filter(s => filterModels.has(_modelClass(sessionConfiguredModel(s))));
   if (filterStatuses.size) filtered = filtered.filter(s => filterStatuses.has(_sessStatusKey(s)));
   if ((q || activeTag || hiddenTags.size || filterProviders.size || filterModels.size || filterStatuses.size) && !filtered.length) {
     el.innerHTML = '<div class="empty">No matching workers.</div>';
+    _renderProjectWorkersSection();
     _renderReviewSection();
     _renderPausedSection();
     _renderExpiredSection();
@@ -6067,7 +6269,8 @@ function render() {
           `<div class="card-log-hit" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}',hitIdx:${hi}})"><span class="log-hit-loc">${esc(s.name)}:${h.line}</span> <span class="log-hit-text">${esc(h.text.slice(0, 80))}</span></div>`
         ).join('') + (hits.length > 2 ? `<div class="card-log-hit" style="color:var(--dim);font-style:italic;" onclick="event.stopPropagation();openPeek('${s.name}',{query:'${sq}'})">+${hits.length - 2} more matches</div>` : '');
       })() : ''}
-      ${(isYolo || (provider && provider !== 'claude') || effort || s.backend === 'herdr' || model || (s.tags||[]).length || s.worktree_active || s.ephemeral) ? `<div class="badges">
+      ${(isYolo || (provider && provider !== 'claude') || effort || s.backend === 'herdr' || model || (s.tags||[]).length || s.worktree_active || s.ephemeral || (s.worker_type && s.worker_type !== 'coding')) ? `<div class="badges">
+        ${s.worker_type && s.worker_type !== 'coding' ? `<span class="badge worker-type ${esc(s.worker_type)}" title="${esc(_workerTypeInfo(s.worker_type).label)} worker: ${esc(_workerTypeInfo(s.worker_type).description || '')}">${esc(_workerTypeInfo(s.worker_type).label.toLowerCase())}</span>` : ''}
         ${s.backend === 'herdr' ? `<span class="badge herdr" title="Hosted on herdr">herdr</span>` : ''}
         ${provider && provider !== 'claude' ? `<span class="badge provider ${provider}" onclick="event.stopPropagation();editField('${s.name}','provider','${escJs(provider)}')" title="Change provider">${pLabel}</span>` : ''}
         ${isYolo ? '<span class="badge yolo">YOLO</span>' : ''}
@@ -6126,6 +6329,7 @@ function render() {
     el.innerHTML = draftCards + frozenList.map(_renderSessionCard).join('');
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
+    _renderProjectWorkersSection();
     _renderReviewSection();
     _renderPausedSection();
     _renderExpiredSection();
@@ -6143,6 +6347,7 @@ function render() {
     _checkWorkerStatusOrder();
     for (const [id, d] of Object.entries(savedInputs)) { const inp = document.getElementById(id); if (inp) { inp.value = d.value; autoGrow(inp); } }
     _restoreCardFocus(focusedId, savedInputs);
+    _renderProjectWorkersSection();
     _renderReviewSection();
     _renderPausedSection();
     _renderExpiredSection();
@@ -6223,6 +6428,7 @@ function render() {
   }
   _restoreCardFocus(focusedId, savedInputs);
 
+  _renderProjectWorkersSection();
   _renderReviewSection();
   _renderPausedSection();
   _renderExpiredSection();
@@ -7171,6 +7377,16 @@ function _savePeekTabPrefs() {
 function _applyPeekTabVisibility() {
   const bar = document.querySelector('.peek-tabs');
   if (!bar) return;
+  // The primary tab names the worker type's renderer (Terminal / Chat).
+  const _primaryRenderer = peekSession ? _workerRenderer(peekSession) : 'terminal';
+  const _primaryLbl = document.querySelector('#peek-tab-terminal .tab-lbl');
+  if (_primaryLbl) _primaryLbl.textContent = _primaryRenderer === 'chat' ? 'Chat' : 'Terminal';
+  // The window's chip bar is shared across workers; redraw it for this one.
+  const _peekChips = document.getElementById('peek-chips');
+  if (_peekChips) renderChips(_peekChips, '', true);
+  const _primaryIco = document.querySelector('#peek-tab-terminal .tab-ico');
+  if (_primaryIco) _primaryIco.textContent = _primaryRenderer === 'chat' ? '💬' : '⮞';
+  const _peekType = _workerTypeInfo((sessions.find(s => s.name === peekSession) || {}).worker_type);
   // Reorder AFTER terminal (which stays first), BEFORE the customize button.
   const custBtn = document.getElementById('peek-tab-customize');
   peekTabOrder.forEach(id => {
@@ -7180,11 +7396,14 @@ function _applyPeekTabVisibility() {
   PEEK_TABS.forEach(t => {
     const el = document.getElementById('peek-tab-' + t.id);
     if (el) {
-      const raw = sessions.find(s => s.name === peekSession)?.isolated;
       // Board is always shown, isolated workers included: it only views the
       // worker's cards, it adds nothing to the raw CLI (Ethan, 2026-09-24).
       const alwaysShown = PEEK_REQUIRED_TABS.has(t.id);
-      el.style.display = !alwaysShown && (peekHiddenTabs.has(t.id) || (raw && t.id === 'schedules')) ? 'none' : '';
+      // A type with no worktree has no Worktree tab to show.
+      const typeHides = t.id === 'git' && _peekType.worktree === 'unsupported';
+      // Schedules are shown for isolated workers too: a schedule is owner
+      // configuration and delivers into them (Ethan, 2026-09-26).
+      el.style.display = !alwaysShown && (peekHiddenTabs.has(t.id) || typeHides) ? 'none' : '';
     }
   });
 }
@@ -7307,36 +7526,44 @@ function _watchPeekTabAnchor(on) {
 function _placePeekTabCustomizer() {
   const menu = document.getElementById('peek-tab-customizer-menu');
   const btn = document.getElementById('peek-tab-customize');
-  if (menu && btn) {
-    {
-      const r = btn.getBoundingClientRect();
-      const vw = document.documentElement.clientWidth || window.innerWidth;
-      const vh = document.documentElement.clientHeight || window.innerHeight;
-      const PAD = 8;
-      const mw = menu.offsetWidth || 230;
-      // LEFT-ANCHORED under the button (Ethan, 2026-08-14: "fixed to the left
-      // dropdown ... always visible on the screen"), then clamped so the right
-      // edge can never leave the viewport. Both clamps use the MEASURED width.
-      // NEUTRALISE `right` FIRST. .tab-customizer-menu sets `right: 0` (app.css),
-      // and this menu carries that class as well as its id, so an inline `left`
-      // alone does not anchor it — with left AND right both set and width:auto the
-      // box is pinned to the right edge and stretched, which is why it kept landing
-      // on the far side of the screen from its button no matter what `left` said.
-      // Setting right:auto is what makes `left` authoritative.
-      menu.style.right = 'auto';
-      menu.style.width = 'auto';
-      let left = Math.min(r.left, vw - mw - PAD);
-      if (left < PAD) left = PAD;
-      menu.style.left = left + 'px';
-      // Vertical: keep it on screen too. Cap the height to what is actually below
-      // the button and let the list scroll, rather than letting 15 rows run off
-      // the bottom where the last ones are unreachable.
-      const top = r.bottom + 4;
-      menu.style.top = top + 'px';
-      menu.style.maxHeight = Math.max(120, vh - top - PAD) + 'px';
-      menu.style.overflowY = 'auto';
+  if (!menu || !btn) return;
+  // ZOOM (Ethan, 2026-09-26: "i click this it doesnt appear"). The desktop
+  // zoom setting puts CSS `zoom` on <html>. Rects come back in SCREEN pixels,
+  // but an inline left/top on this fixed menu is multiplied by the zoom when
+  // it renders. So at 120% a left of 1111 drew at 1333 in a 1280px window,
+  // fully off-screen (his tabcust-geo beacons: l=1333 and l=1444 at winW
+  // 1280). Everything below is computed in screen pixels and divided by the
+  // zoom only when written.
+  const z = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
+  const r = btn.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const PAD = 8;
+  // NEUTRALISE `right` FIRST: .tab-customizer-menu sets `right: 0`, and with
+  // both left and right set the box stretches to the right edge.
+  menu.style.right = 'auto';
+  menu.style.width = 'auto';
+  const mw = (menu.offsetWidth || 230) * z;
+  // RIGHT-ALIGNED under the button, the same way the worker-list customizer
+  // hangs from its ⊞, then clamped so neither edge leaves the viewport.
+  let left = Math.min(r.right - mw, vw - mw - PAD);
+  if (left < PAD) left = PAD;
+  const top = r.bottom + 2;
+  menu.style.left = (left / z) + 'px';
+  menu.style.top = (top / z) + 'px';
+  // Cap the height to what is below the button and let the list scroll, so
+  // the last rows are never past the fold.
+  menu.style.maxHeight = (Math.max(120, vh - top - PAD) / z) + 'px';
+  menu.style.overflowY = 'auto';
+  // Surface a miss rather than trusting the arithmetic: if the menu still lands
+  // off-screen, say so in the server log (client-debug beacon).
+  try {
+    const m = menu.getBoundingClientRect();
+    if (m.width && (m.right > vw + 1 || m.left < -1 || m.top > vh)) {
+      fetch(API + '/api/client-debug', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'tabcust-offscreen', ver: APP_VER, zoom: z, vw, vh,
+          menu: [Math.round(m.left), Math.round(m.top), Math.round(m.right), Math.round(m.bottom)] }) }).catch(() => {});
     }
-  }
+  } catch (e) {}
 }
 function _renderPeekTabCustomizer() {
   const menu = document.getElementById('peek-tab-customizer-menu');
@@ -7555,6 +7782,34 @@ function _applyEmbedView() {
   }
 })();
 
+function toggleProjectWorkers() {
+  projectWorkersExpanded = !projectWorkersExpanded;
+  _renderProjectWorkersSection();
+}
+function _renderProjectWorkersSection() {
+  const el=document.getElementById('project-workers-section');
+  if(!el) return;
+  const registered=new Set(sessions.map(s=>s.name));
+  const all=[...sessions.filter(s=>!!s.project),...[..._expiredWorkerInventory.values()].filter(w=>w.project && !registered.has(w.name))].filter(_workerListFilterPass);
+  if(!all.length) {el.innerHTML='';return;}
+  const shown=_workerGroupMembers('project').sort((a,b)=>(b.last_activity||0)-(a.last_activity||0));
+  const label=(shown.length!==all.length?shown.length+' of '+all.length:all.length)+' project workers';
+  let html=_workerGroupFooter('project',label,projectWorkersExpanded,'toggleProjectWorkers');
+  if(projectWorkersExpanded) {
+    html+='<div class="project-workers-body">';
+    shown.forEach(s=>{
+      const status=s.archived?'Archived':s.lifecycle==='review'?'Retained for review':s.lifecycle==='paused'?'Paused':s.lifecycle==='expired'?'Expired':s.running?(s.status==='active'?'Working':s.status||'Running'):'Stopped';
+      const model=s.active_model||s.profile?.model||sessionConfiguredModel(s)||'';
+      const title=s.task_name||s.preview||s.desc||'';
+      const action=s.lifecycle==='expired'&&!registered.has(s.name)?'<button class="btn" onclick="resumeWorker(\''+escJs(s.name)+'\')">Resume worker</button>':'<button class="btn" onclick="openPeek(\''+escJs(s.name)+'\')">Open worker</button>';
+      html+='<article class="project-worker-row"><div class="project-worker-row-main">'+_wselBox(s.name)+'<strong>'+esc(s.name)+'</strong><span class="project-status-chip '+esc(s.lifecycle||'active')+'">'+esc(status)+'</span><span class="project-muted">'+esc(s.project)+(model?' · '+esc(model):'')+'</span></div>'+(title?'<p>'+esc(_projectClip(title,120))+'</p>':'')+action+'</article>';
+    });
+    if(!shown.length) html+='<p class="project-empty">No project workers match this search.</p>';
+    html+='</div>';
+  }
+  if(el.innerHTML!==html) el.innerHTML=html;
+}
+
 function toggleReviewHeld() {
   reviewExpanded = !reviewExpanded;
   _renderReviewSection();
@@ -7563,7 +7818,7 @@ function toggleReviewHeld() {
 function _renderReviewSection() {
   const el = document.getElementById('review-section');
   if (!el) return;
-  const allReview = sessions.filter(s => s.lifecycle === 'review' && !s.archived);
+  const allReview = sessions.filter(s => s.lifecycle === 'review' && !s.archived && !s.project).filter(_workerListFilterPass);
   if (!allReview.length) { el.innerHTML = ''; return; }
   const q = searchQuery.toLowerCase().trim();
   const review = q ? allReview.filter(s =>
@@ -7576,8 +7831,7 @@ function _renderReviewSection() {
   const label = q && review.length !== allReview.length
     ? `${review.length} of ${allReview.length} retained for review`
     : `${allReview.length} retained for review`;
-  const chevron = `<span class="review-chevron${reviewExpanded ? ' open' : ''}">&#x25B6;</span>`;
-  let html = `<div class="review-footer" onclick="toggleReviewHeld()">${chevron} ${label}</div>`;
+  let html = _workerGroupFooter('review',label,reviewExpanded,'toggleReviewHeld');
   if (reviewExpanded) {
     html += '<div class="review-body">';
     (q ? review : allReview).forEach(s => {
@@ -7592,6 +7846,7 @@ function _renderReviewSection() {
       (s.tags || []).forEach(t => meta.push(`<span class="review-card-tag">#${esc(t)}</span>`));
       html += `<div class="review-card" data-session="${esc(s.name)}">
         <div class="review-card-top">
+          ${_wselBox(s.name)}
           <span class="review-card-name" onclick="openPeek('${esc(s.name)}')">${esc(s.name)}</span>
           ${model ? `<span class="review-card-chip model">${esc(model)}</span>` : ''}
           <span class="review-card-spacer"></span>
@@ -7617,7 +7872,7 @@ function togglePaused() {
 function _renderPausedSection() {
   const el = document.getElementById('paused-section');
   if (!el) return;
-  const allPaused = sessions.filter(s => s.lifecycle === 'paused' && !s.archived);
+  const allPaused = sessions.filter(s => s.lifecycle === 'paused' && !s.archived && !s.project).filter(_workerListFilterPass);
   if (!allPaused.length) { el.innerHTML = ''; return; }
   const q = searchQuery.toLowerCase().trim();
   const paused = q ? allPaused.filter(s =>
@@ -7630,8 +7885,7 @@ function _renderPausedSection() {
   const label = q && paused.length !== allPaused.length
     ? `${paused.length} of ${allPaused.length} paused`
     : `${allPaused.length} paused`;
-  const chevron = `<span class="paused-chevron${showExpanded ? ' open' : ''}">&#x25B6;</span>`;
-  let html = `<div class="paused-footer" onclick="togglePaused()">${chevron} ${label}</div>`;
+  let html = _workerGroupFooter('paused',label,showExpanded,'togglePaused');
   if (showExpanded) {
     html += '<div class="paused-body">';
     (q ? paused : allPaused).forEach(s => {
@@ -7646,6 +7900,7 @@ function _renderPausedSection() {
       (s.tags || []).forEach(t => meta.push(`<span class="paused-card-tag">#${esc(t)}</span>`));
       html += `<div class="paused-card" data-session="${esc(s.name)}">
         <div class="paused-card-top">
+          ${_wselBox(s.name)}
           <span class="paused-card-name" onclick="openPeek('${esc(s.name)}')">${esc(s.name)}</span>
           ${model ? `<span class="paused-card-chip model">${esc(model)}</span>` : ''}
           <span class="paused-card-spacer"></span>
@@ -7679,6 +7934,7 @@ function _refreshExpiredWorkerInventory() {
       if (!d || d.measured !== true || !Array.isArray(d.workers)) {
         _expiredWorkerInventoryError = 'unmeasured';
         console.warn('amux expired worker inventory unmeasured', {measured:false,n_considered:0,ver:APP_VER});
+        _renderProjectWorkersSection();
         _renderExpiredSection();
         return;
       }
@@ -7689,12 +7945,14 @@ function _refreshExpiredWorkerInventory() {
       _expiredWorkerInventory = next;
       _expiredWorkerInventoryAt = Date.now();
       _expiredWorkerInventoryError = null;
+      _renderProjectWorkersSection();
       _renderExpiredSection();
       console.info('amux expired worker inventory measured', {measured:true,n_considered:d.workers.length,expired:next.size,ver:APP_VER});
     })
     .catch(e => {
       _expiredWorkerInventoryError = e?.message || 'unavailable';
       console.warn('amux expired worker inventory unavailable', {measured:false,n_considered:0,reason:_expiredWorkerInventoryError,ver:APP_VER});
+      _renderProjectWorkersSection();
       _renderExpiredSection();
     })
     .finally(() => { _expiredWorkerInventoryLoading = false; });
@@ -7707,7 +7965,8 @@ function _renderExpiredSection() {
   const sessNames = new Set(sessions.map(s => s.name));
   const ephCards = boardItems.filter(c => {
     const worker = c.session || '';
-    return worker && !sessNames.has(worker) && _expiredWorkerInventory.has(worker);
+    return worker && !sessNames.has(worker) && _expiredWorkerInventory.has(worker) && !_expiredWorkerInventory.get(worker)?.project
+      && _workerListFilterPass({ name: worker, ..._expiredWorkerInventory.get(worker) });
   });
   if (!ephCards.length) { el.innerHTML = ''; return; }
   const byWorker = {};
@@ -7742,8 +8001,7 @@ function _renderExpiredSection() {
     ? `${filtered.length} of ${workers.length} expired`
     : `${workers.length} expired`;
   const stale = _expiredWorkerInventoryError ? ` <span class="paused-card-chip" title="${esc(_expiredWorkerInventoryError)}">stale inventory</span>` : '';
-  const chevron = `<span class="expired-chevron${expiredExpanded ? ' open' : ''}">&#x25B6;</span>`;
-  let html = `<div class="expired-footer" onclick="toggleExpired()">${chevron} ${label}${stale}</div>`;
+  let html = _workerGroupFooter('expired',label+stale,expiredExpanded,'toggleExpired');
   if (expiredExpanded) {
     const TERMINAL = _CLOSED_STATUSES;
     const STATUS_DOT = { doing: 'var(--accent)', todo: 'var(--dim)', backlog: 'var(--dim)', done: '#4ade80', verified: '#4ade80', discarded: '#888', cancelled: '#888' };
@@ -7757,6 +8015,7 @@ function _renderExpiredSection() {
       const pending = _workerLifecyclePending.get(w.name);
       html += `<div class="paused-card" data-session="${esc(w.name)}">
         <div class="paused-card-top">
+          ${_wselBox(w.name)}
           <span class="paused-card-name">${esc(workerTitle)}</span>
           <span class="paused-card-chip model" style="opacity:0.6">${doneCt}/${total} done</span>
           <span class="paused-card-spacer"></span>
@@ -7791,9 +8050,13 @@ function toggleArchived() {
 }
 
 function _renderArchivedSection() {
+  _renderArchivedSectionBody();
+  _renderWorkerSelBar();
+}
+function _renderArchivedSectionBody() {
   const el = document.getElementById('archived-section');
   if (!el) return;
-  const allArchived = sessions.filter(s => s.archived);
+  const allArchived = sessions.filter(s => s.archived && !s.project).filter(_workerListFilterPass);
   if (!allArchived.length) { el.innerHTML = ''; return; }
   const q = searchQuery.toLowerCase().trim();
   const archived = q ? allArchived.filter(s =>
@@ -7814,8 +8077,7 @@ function _renderArchivedSection() {
   const label = q && archived.length !== allArchived.length
     ? `${archived.length} of ${allArchived.length} archived`
     : `${allArchived.length} archived`;
-  const chevron = `<span class="archived-chevron${showExpanded ? ' open' : ''}">&#x25B6;</span>`;
-  let html = `<div class="archived-footer" onclick="toggleArchived()">${chevron} ${label}</div>`;
+  let html = _workerGroupFooter('archived',label,showExpanded,'toggleArchived');
   if (showExpanded) {
     html += '<div class="archived-body">';
     (q ? archived : allArchived).forEach(s => {
@@ -7840,13 +8102,14 @@ function _renderArchivedSection() {
       (s.tags || []).forEach(t => meta.push(`<span class="archived-card-tag">#${esc(t)}</span>`));
       html += `<div class="archived-card" data-session="${esc(s.name)}">
         <div class="archived-card-top">
+          ${_wselBox(s.name)}
           <span class="archived-card-name" onclick="openPeek('${esc(s.name)}')">${esc(s.name)}</span>
           ${model ? `<span class="archived-card-chip model">${esc(model)}</span>` : ''}
           ${provider ? `<span class="archived-card-chip provider-${esc(provider)}">${esc(provider)}</span>` : ''}
           <span class="archived-card-spacer"></span>
           <div class="archived-card-actions">
             <button class="archived-wake-btn" onclick="wakeSession('${esc(s.name)}')">Wake</button>
-            <button class="archived-del-btn" onclick="deleteSession('${esc(s.name)}')">&#x2715;</button>
+            ${s.project ? '' : `<button class="archived-del-btn" onclick="deleteSession('${esc(s.name)}')">&#x2715;</button>`}
           </div>
         </div>
         ${meta.length ? `<div class="archived-card-meta">${meta.join('<span style="opacity:0.4;">&middot;</span>')}</div>` : ''}
@@ -9653,9 +9916,15 @@ function _workerPrimaryConfigurationsHTML(name) {
     _workerConfigurationRow('task_label', 'Task label override', s.task_override || '', s.isolated ? 'An owner-visible label; it does not create or select a board task.' : 'Blank returns the card to its board/source-derived label.', edit('task', s.task_override || '')),
     _workerConfigurationRow('groups', 'Groups', (s.tags || []).join(', '), 'Controls membership, inherited configuration, and default message reach.', edit('tags', (s.tags || []).join(', '))),
   ];
+  const wtype = _workerTypeInfo(s.worker_type);
+  const typeButtons = _workerTypes.map(t => '<button class="btn' + (t.id === wtype.id ? ' primary' : '') + '"'
+    + ' style="font-size:0.68rem;min-height:32px;padding:4px 8px;" title="' + esc(t.description || '') + '"'
+    + (t.id === wtype.id ? ' aria-pressed="true"' : ' aria-pressed="false"')
+    + ' onclick="event.stopPropagation();_workerTypeSet(\'' + q + '\',\'' + escJs(t.id) + '\')">' + esc(t.label) + '</button>').join(' ');
   const runtime = [
+    _workerConfigurationRow('worker_type', 'Worker type', wtype.label, 'Selects how turns run and how output is shown. Board, messages, groups, schedules and memory are unchanged; a running worker restarts on the new type.', typeButtons),
     _workerConfigurationRow('directory', 'Working directory', s.worktree_active && s.worktree_path ? s.worktree_path + ' (worktree)' : (s.dir || ''), 'Changing it restarts a running worker in the new directory.', edit('dir', s.dir || '')),
-    _workerConfigurationRow('branch', 'Git branch', s.branch || '', 'Blank follows the detected branch; “none” explicitly uses the main checkout.', edit('branch', s.branch || '')),
+    wtype.worktree === 'unsupported' ? '' : _workerConfigurationRow('branch', 'Git branch', s.branch || '', 'Blank follows the detected branch; “none” explicitly uses the main checkout.', edit('branch', s.branch || '')),
     _workerConfigurationRow('provider', 'Model provider', providerLabel(provider), s.isolated ? 'Changes the CLI provider without injecting harness context.' : 'Provider swaps preserve durable board state and restart only when required.', edit('provider', provider)),
     _workerConfigurationRow('model', 'Model version', model || 'Provider default', s.isolated ? 'Uses the native CLI conversation; no board context is added on restart.' : 'A supported live switch keeps the conversation; restart fallback rehydrates from board state.', edit('model', model || '', provider)),
     _workerConfigurationRow('effort', 'Reasoning effort', effort || 'Provider default', provider === 'claude' ? 'Can be changed independently or together with the model.' : 'Configured by this provider’s CLI flags.', provider === 'claude' ? edit('effort', effort || '', provider) : ''),
@@ -9678,6 +9947,24 @@ function _workerPrimaryConfigurationsHTML(name) {
     + _workerConfigurationSection('permissions', 'Permissions & communication', s.isolated ? 'Native CLI tool permissions and isolation.' : 'Standing authority for tools, peers, and external email.', permissions)
     + _workerConfigurationSection('advanced', 'Display & advanced', 'Presentation and lower-level environment controls.', advanced)
     + '</div>';
+}
+
+async function _workerTypeSet(name, id) {
+  const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/config', {
+    method: 'PATCH', headers: _authHeaders({'Content-Type': 'application/json'}),
+    body: JSON.stringify({ worker_type: id }),
+  }).catch(() => null);
+  let d = {}; try { d = r ? await r.json() : {}; } catch (e) {}
+  if (!r || !r.ok) { showToast('Type not changed: ' + (d.error || (r ? 'error ' + r.status : 'server unreachable'))); return; }
+  showToast(d.message || ('Worker type set to ' + id));
+  await fetchSessions();
+  if (peekSession === name) {
+    _chatUnmount();
+    _applyPeekTabVisibility();
+    if (_peekTab === 'scope') _scopeLoad({ level: 'worker', name: name }, 'peek-scope-body');
+    lastPeekHTML = ''; _lastLiveHTML = '';
+    refreshPeek(false);
+  }
 }
 
 function _workerEmailPermissionControls(name, s) {
@@ -10162,6 +10449,12 @@ function setPeekTab(tab) {
   const scheds = document.getElementById('peek-schedules-panel');
   if (tab === 'schedules') { scheds.classList.add('active'); _peekLoadSchedules(); }
   else { scheds.classList.remove('active'); }
+  document.getElementById('peek-tab-shell')?.classList.toggle('active', tab === 'shell');
+  const shellP = document.getElementById('peek-shell-panel');
+  if (shellP) {
+    if (tab === 'shell') { shellP.classList.add('active'); _peekShellLoad(); }
+    else { shellP.classList.remove('active'); _peekShellStop(); }
+  }
   document.getElementById('peek-tab-logs')?.classList.toggle('active', tab === 'logs');
   const logsP = document.getElementById('peek-logs-panel');
   if (tab === 'logs') { logsP.classList.add('active'); _peekLogsLoad(); }
@@ -10264,6 +10557,7 @@ function _steeringRender() {
         <div style="font-size:0.85rem;color:${m.system ? 'var(--dim)' : 'var(--fg)'};white-space:pre-wrap;word-break:break-word;">${esc(m.text)}</div>
         ${m.blocked_reason ? `<p class="steering-held">Held: ${esc(m.blocked_reason)}. Input stays queued until an authorized working claim can receive it.</p>` : ''}
         <div style="font-size:0.75rem;color:var(--dim);margin-top:4px;">Queued ${ago}</div>
+        ${m.waiting_for ? `<div class="steer-waiting" style="font-size:0.75rem;color:var(--yellow,#d29922);margin-top:2px;">Waiting for ${esc(m.waiting_for)}</div>` : ''}
       </div>
       <div style="display:flex;gap:4px;flex-shrink:0;">
         ${m.guard === 'project-steering' ? '<span class="steering-next-turn" style="font-size:0.75rem;color:var(--dim);">Automatic next turn</span>' : `<button class="btn primary" ${dis} onclick="_steeringSendNow('${m.id}')">Send now</button>`}
@@ -11327,6 +11621,75 @@ function _peekRenderSchedules() {
     searchQuery: _peekSchedSearch,
   });
 }
+// ── Shell tab: this worker's shell schedules, live and past output ──
+// A shell schedule runs on the host, never in the worker (Ethan 2026-09-25:
+// "i need to be able to see it ... maybe there should be a shell tab assigned
+// to each worker"). The scheduler tees each run to a log; this tails it.
+let _shellTimer = null;
+const _shellView = {};   // schedule id -> { log, offset }
+function _peekShellStop() { clearTimeout(_shellTimer); _shellTimer = null; }
+async function _peekShellLoad() {
+  _peekShellStop();
+  const list = document.getElementById('peek-shell-list');
+  if (!list || !peekSession) return;
+  let d;
+  try { d = await (await fetch(API + '/api/schedules/shell?session=' + encodeURIComponent(peekSession), { headers: _authHeaders() })).json(); }
+  catch (e) { list.innerHTML = '<div class="peek-shell-empty">Could not load: ' + esc(e.message || e) + '</div>'; return; }
+  const scheds = d.schedules || [];
+  if (!scheds.length) { list.innerHTML = '<div class="peek-shell-empty">This worker has no shell schedules.</div>'; return; }
+  list.innerHTML = scheds.map(s => {
+    const last = s.last_run || {};
+    const st = s.running ? 'running' : (last.status || 'never run');
+    const opts = (s.logs || []).map((l, i) => '<option value="' + esc(l.name) + '">' + (i === 0 ? 'Latest · ' : '')
+      + new Date(l.started_ms).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) + '</option>').join('');
+    return '<div class="peek-shell-card" data-id="' + esc(s.id) + '">'
+      + '<div class="peek-shell-row"><b>' + esc(s.title || s.id) + '</b>'
+      + '<span class="peek-shell-status st-' + esc(String(st).replace(/[^a-z]/g, '')) + '">' + esc(st) + '</span></div>'
+      + '<div class="peek-shell-meta"><code>' + esc(s.schedule_expr || '') + '</code>' + (s.enabled ? '' : ' · disabled')
+      + ' · <code class="peek-shell-cmd">' + esc(s.command || '') + '</code></div>'
+      + '<div class="peek-shell-actions"><button class="btn primary" onclick="_peekShellRun(\'' + escJs(s.id) + '\')"' + (s.running ? ' disabled' : '') + '>Run now</button>'
+      + (opts ? '<select class="input" onchange="_peekShellPick(\'' + escJs(s.id) + '\', this.value)">' + opts + '</select>' : '') + '</div>'
+      + '<pre class="peek-shell-out" id="shell-out-' + esc(s.id) + '">' + (opts ? 'Loading…' : 'No output recorded yet. Runs from now on are captured here.') + '</pre></div>';
+  }).join('');
+  for (const s of scheds) {
+    _shellView[s.id] = { log: (s.logs && s.logs[0] && s.logs[0].name) || '', offset: 0, running: s.running };
+    if (_shellView[s.id].log) await _peekShellFetch(s.id, true);
+  }
+  _peekShellSchedule();
+}
+function _peekShellSchedule() {
+  _peekShellStop();
+  if (Object.values(_shellView).some(v => v.running)) _shellTimer = setTimeout(_peekShellTick, 1500);
+}
+async function _peekShellTick() {
+  for (const [id, v] of Object.entries(_shellView)) if (v.running) await _peekShellFetch(id, false);
+  if (Object.values(_shellView).some(v => v.running)) _peekShellSchedule();
+  else _peekShellLoad();   // a run just finished: refresh statuses and the log list
+}
+async function _peekShellFetch(id, reset) {
+  const v = _shellView[id]; const pre = document.getElementById('shell-out-' + id);
+  if (!v || !pre) return;
+  if (reset) { v.offset = 0; pre.textContent = ''; }
+  try {
+    const r = await fetch(API + '/api/schedules/' + encodeURIComponent(id) + '/output?log=' + encodeURIComponent(v.log) + '&offset=' + v.offset, { headers: _authHeaders() });
+    const d = await r.json();
+    const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30;
+    pre.textContent += d.text || '';
+    if (!pre.textContent) pre.textContent = '(no output)';
+    v.offset = d.next_offset || v.offset;
+    v.running = !!d.running;
+    if (atBottom || reset) pre.scrollTop = pre.scrollHeight;
+  } catch (e) { /* the next tick retries */ }
+}
+async function _peekShellPick(id, log) {
+  const v = _shellView[id]; if (!v) return;
+  v.log = log; v.running = false;
+  await _peekShellFetch(id, true);
+}
+async function _peekShellRun(id) {
+  await runScheduleNow(id);
+  setTimeout(_peekShellLoad, 600);
+}
 async function _peekLoadSchedules() {
   const list = document.getElementById('peek-schedules-list');
   if (!peekSession || !list) return;
@@ -11779,7 +12142,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1099';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1127';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -11939,7 +12302,8 @@ function _linkIsCheap() {
 // Priority: what you'd actually want offline, in order — sessions doing work
 // now, then ones you recently looked at, then the rest.
 function _prefetchOrder() {
-  const running = (sessions || []).filter(s => s.running);
+  // Only terminal-rendered workers have a peek frame worth saving offline.
+  const running = (sessions || []).filter(s => s.running && _workerRenderer(s.name) === 'terminal');
   const recent = new Set([peekSession, _lastPeekedSession].filter(Boolean));
   const rank = s => (s.status === 'active' || s.status === 'waiting' ? 0 : recent.has(s.name) ? 1 : 2);
   return running.sort((a, b) => rank(a) - rank(b) || (b.last_activity || 0) - (a.last_activity || 0));
@@ -12021,6 +12385,10 @@ function _offlineCacheInfo() {
 
 function _paintCachedPeek(cached) {
   if (!cached || (!cached.output && !cached.history)) return false;
+  // A saved TERMINAL frame. The chat renderer keeps its own history, and it
+  // never sets lastPeekHTML, so without this the 30ms open-time cache paint
+  // won the race often enough to replace a chat with its terminal snapshot.
+  if (peekSession && _workerRenderer(peekSession) !== 'terminal') return false;
   _peekHistoryRaw = cached.history || '';
   _peekHistoryHTML = cached.histHTML || (cached.history ? _peekHtml(cached.history) : '');
   _lastLiveHTML = cached.output ? _peekLiveHtml(cached.output) : '';
@@ -12031,8 +12399,215 @@ function _paintCachedPeek(cached) {
   if (st) st.textContent = 'Cached ' + (ago < 1 ? 'just now' : ago + 'm ago');
   return true;
 }
+// ── Worker types and the chat renderer (ACW-5/7) ──
+// A worker type picks an execution adapter and a primary OUTPUT RENDERER. The
+// peek overlay, every tab, the composer and the send path are shared by all
+// types; only the primary panel's body differs. 'terminal' is the existing
+// pipeline and stays untouched. The type list comes from GET /api/worker-types
+// so a new type needs a renderer entry here, not a new screen.
+let _workerTypes = [
+  {id:'coding', label:'Coding', renderer:'terminal', worktree:'optional', project_dir:'required', providers:[],
+   description:'Terminal coding agent in a repo or worktree.'},
+  {id:'chat', label:'Chat', renderer:'chat', worktree:'unsupported', project_dir:'optional', providers:['claude','codex'],
+   description:'Conversational agent with a persistent chat. No terminal or worktree.'},
+];
+fetch(API + '/api/worker-types').then(r => r.ok ? r.json() : null)
+  .then(d => { if (d && Array.isArray(d.types) && d.types.length) _workerTypes = d.types; })
+  .catch(() => {});
+function _workerTypeInfo(id) {
+  return _workerTypes.find(t => t.id === (id || 'coding')) || _workerTypes[0];
+}
+function _workerRenderer(name) {
+  const s = sessions.find(x => x.name === name);
+  return (s && s.renderer) || _workerTypeInfo(s && s.worker_type).renderer || 'terminal';
+}
+
+// Chat view state. One mounted view at a time, the one in the peek overlay.
+const _chat = { name: null, es: null, messages: [], streaming: null, loadedAt: 0, busy: false, queued: 0, gen: 0 };
+
+function _chatUnmount() {
+  if (_chat.es) { try { _chat.es.close(); } catch (e) {} }
+  _chat.es = null; _chat.name = null; _chat.messages = []; _chat.streaming = null; _chat.gen++;
+  const body = document.getElementById('peek-body');
+  if (body) body.classList.remove('peek-chat');
+}
+
+async function _chatLoad(name) {
+  const gen = _chat.gen;
+  let d;
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/chat?limit=200');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+  } catch (e) {
+    if (gen === _chat.gen && _chat.name === name) _chatRender('Could not load the chat: ' + e.message);
+    return;
+  }
+  if (gen !== _chat.gen || _chat.name !== name) return;
+  hidePeekLoading();
+  _chat.messages = d.messages || [];
+  _chat.busy = !!d.busy; _chat.queued = d.queued || 0;
+  _chat.streaming = d.streaming && d.streaming.turn_id ? { turn_id: d.streaming.turn_id, text: d.streaming.text || '' } : null;
+  _chat.loadedAt = Date.now();
+  _chatRender();
+}
+
+function _chatConnect(name) {
+  if (_chat.es) { try { _chat.es.close(); } catch (e) {} }
+  const es = new EventSource(_authUrl(API + '/api/sessions/' + encodeURIComponent(name) + '/chat/stream'));
+  _chat.es = es;
+  es.onmessage = (ev) => {
+    if (_chat.es !== es || _chat.name !== name) return;
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'user') {
+      if (!_chat.messages.some(x => x.turn_id === m.turn_id && x.role === 'user'))
+        _chat.messages.push({ role: 'user', text: m.text, turn_id: m.turn_id, origin: m.origin, ts: m.ts });
+      _chat.streaming = { turn_id: m.turn_id, text: '' };
+      _chat.busy = true;
+      _chat.queued = m.waiting || 0;
+    } else if (m.type === 'delta') {
+      if (!_chat.streaming || _chat.streaming.turn_id !== m.turn_id) _chat.streaming = { turn_id: m.turn_id, text: '' };
+      _chat.streaming.text += m.text || '';
+    } else if (m.type === 'tool') {
+      if (_chat.streaming) _chat.streaming.tool = m.name;
+    } else if (m.type === 'done') {
+      if (m.message) _chat.messages.push(Object.assign({ ts: Date.now() / 1000 }, m.message));
+      _chat.streaming = null;
+      _chat.busy = false;
+    } else if (m.type === 'queued') {
+      _chat.queued = m.waiting || 0;
+    } else if (m.type === 'stopped') {
+      _chat.streaming = null; _chat.busy = false; _chat.queued = 0;
+    } else if (m.type === 'lagged') {
+      _chatLoad(name);   // missed events: the event stream is the truth, refetch it
+      return;
+    } else {
+      return;   // hello / ping
+    }
+    _chatRender();
+  };
+  // EventSource reconnects by itself; a reconnect may have missed a 'done', so
+  // resync from the persisted history when it comes back.
+  es.onopen = () => { if (_chat.name === name && _chat.loadedAt) _chatLoad(name); };
+}
+
+function _chatMount(name) {
+  if (_chat.name === name && _chat.es) return;
+  _chatUnmount();
+  _chat.name = name;
+  const body = document.getElementById('peek-body');
+  if (body) { body.classList.add('peek-chat'); body.innerHTML = '<div class="peek-loading"><div class="peek-spin-lg"></div><span>Loading chat…</span></div>'; }
+  _chatConnect(name);
+  _chatLoad(name);
+}
+
+// The peek poller calls this in place of the terminal frame fetch. The stream
+// carries live updates; the poll only re-syncs a view that has gone quiet.
+function _chatRefresh(name) {
+  if (_chat.name !== name || !_chat.es) { _chatMount(name); return Promise.resolve(); }
+  if (Date.now() - _chat.loadedAt > 15000 && !_chat.streaming) return _chatLoad(name);
+  return Promise.resolve();
+}
+
+function _chatBubble(role, html, meta, cls) {
+  return '<div class="chat-msg chat-' + role + (cls ? ' ' + cls : '') + '">'
+    + '<div class="chat-bubble">' + html + '</div>'
+    + (meta ? '<div class="chat-meta">' + meta + '</div>' : '') + '</div>';
+}
+
+function _chatTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function _chatRender(errorText) {
+  const body = document.getElementById('peek-body');
+  if (!body || peekSession !== _chat.name) return;
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+  const s = sessions.find(x => x.name === _chat.name) || {};
+  let html = '';
+  if (errorText) html += '<div class="chat-empty">' + esc(errorText) + '</div>';
+  if (!_chat.messages.length && !_chat.streaming && !errorText) {
+    html += '<div class="chat-empty">' + (s.running
+      ? 'No messages yet. Say something below.'
+      : 'This chat worker is stopped. Sending a message starts it.') + '</div>';
+  }
+  for (const m of _chat.messages) {
+    if (m.role === 'user') {
+      const who = m.origin === 'automation' ? 'amux' : 'you';
+      // The send-time stamp stays in what the model received (the shared send
+      // contract); the bubble's meta line already shows the time.
+      const shown = _hasSendTimeStamp(m.text) ? (m.text || '').replace(/^\[[^\]]*\]\s/, '') : (m.text || '');
+      html += _chatBubble('user', esc(shown).replace(/\n/g, '<br>'), esc(who) + ' · ' + _chatTime(m.ts));
+    } else if (m.error) {
+      html += _chatBubble('assistant', '<span class="chat-error">' + esc(m.error) + '</span>'
+        + (m.text ? renderMarkdown(m.text) : ''), 'failed · ' + _chatTime(m.ts), 'is-error');
+    } else {
+      const bits = [_chatTime(m.ts)];
+      if (m.tools && m.tools.length) bits.push(m.tools.length + ' tool call' + (m.tools.length > 1 ? 's' : ''));
+      if (m.duration_ms) bits.push((m.duration_ms / 1000).toFixed(1) + 's');
+      html += _chatBubble('assistant', renderMarkdown(m.text || ''), esc(bits.filter(Boolean).join(' · ')));
+    }
+  }
+  if (_chat.streaming) {
+    // STREAMED TEXT IS HEALED BEFORE IT IS RENDERED (chat-demo, for Ethan,
+    // 2026-09-25). A reply mid-stream has an unclosed fence, a half-written
+    // link or a dangling ** that would flash as raw markup or swallow the rest
+    // of the bubble. remend (Streamdown's healing step) closes them for this
+    // frame only; the finished message renders from its own complete text.
+    const t = (typeof remend === 'function') ? remend(_chat.streaming.text) : _chat.streaming.text;
+    const tool = _chat.streaming.tool ? '<div class="chat-tool">using ' + esc(_chat.streaming.tool) + '…</div>' : '';
+    html += _chatBubble('assistant', (t ? renderMarkdown(t) : '<span class="chat-typing"><i></i><i></i><i></i></span>') + tool,
+      'responding…', 'is-streaming');
+  }
+  if (_chat.queued > 0) html += '<div class="chat-queued">' + _chat.queued + ' message' + (_chat.queued > 1 ? 's' : '') + ' queued</div>';
+  body.innerHTML = '<div class="chat-log">' + html + '</div>';
+  if (nearBottom || _chat.streaming) body.scrollTop = body.scrollHeight;
+}
+
+// Create modal: the type row, rendered from the registry.
+let _createWorkerType = 'coding';
+function _renderCreateTypeRow() {
+  const row = document.getElementById('create-type-row');
+  if (!row) return;
+  row.innerHTML = _workerTypes.map(t =>
+    '<button type="button" class="btn provider-btn' + (t.id === _createWorkerType ? ' selected' : '') + '"'
+    + ' data-worker-type="' + esc(t.id) + '" title="' + esc(t.description || '') + '"'
+    + ' onclick="_selectWorkerType(\'' + escJs(t.id) + '\')">' + esc(t.label) + '</button>').join('');
+  const hint = document.getElementById('create-type-hint');
+  if (hint) hint.textContent = _workerTypeInfo(_createWorkerType).description || '';
+}
+// Requirements come from the descriptor, so the form cannot offer something
+// the server will refuse (a worktree for a type that has none, a provider its
+// adapter cannot drive).
+function _selectWorkerType(id) {
+  _createWorkerType = id;
+  const t = _workerTypeInfo(id);
+  _renderCreateTypeRow();
+  const allowed = p => !t.providers || !t.providers.length || t.providers.includes(p);
+  ['claude', 'codex', 'gemini', 'ollama', 'muse'].forEach(p => {
+    const b = document.getElementById('create-provider-' + p);
+    if (b) { b.disabled = !allowed(p); b.style.opacity = allowed(p) ? '' : '0.4'; }
+  });
+  if (!allowed(_createProvider)) _selectProvider('claude');
+  else _selectProvider(_createProvider);   // re-applies the provider's field visibility
+  const noWorktree = t.worktree === 'unsupported';
+  if (noWorktree) {
+    document.getElementById('create-branch-enabled').checked = false;
+    document.getElementById('create-worktree-enabled').checked = false;
+    document.getElementById('create-branch-enabled').closest('.field-group').style.display = 'none';
+    document.getElementById('create-worktree-field').style.display = 'none';
+  }
+  const dirLabel = document.getElementById('create-dir-label');
+  if (dirLabel) dirLabel.innerHTML = 'Working directory' + (t.project_dir === 'required' ? '' : ' <span class="field-optional">(optional)</span>');
+  const prompt = document.getElementById('create-prompt');
+  if (prompt) prompt.placeholder = t.renderer === 'chat' ? 'First message (optional)' : 'What should Claude work on first?';
+}
+
 function openPeek(name, opts) {
   _peekAgentsReset();
+  if (_chat.name && _chat.name !== name) _chatUnmount();
   _bindPeekScrollAffordance();
   requestAnimationFrame(_peekScrollAffordance);
   // AMUX-5025. Fired once per open, two frames in, so the overlay has been laid
@@ -12354,6 +12929,7 @@ function copyPeekContent() {
 }
 
 function closePeek() {
+  _chatUnmount();
   _peekFollowBottom = false;
   _peekStopBottomWatch();
   _peekAgentsReset();
@@ -12968,6 +13544,81 @@ function stripAnsi(text) {
     .replace(/^─{10,}\n?/gm, '');
 }
 
+// Links in worker output: URLs, bare domains on real TLDs, absolute and ./ ~/
+// paths, and repo-relative paths (a/b/c.md, crates/x/y.rs:12). Returns sorted,
+// non-overlapping {start,end,type,value} over the PLAIN text.
+const _LINK_TLDS = 'com|org|net|io|ai|app|dev|co|so|us|me|xyz|cloud|tech|site|page|info|biz|tv|gg|ly|build|tools|systems';
+function _detectTextLinks(plain) {
+  const out = [];
+  const add = (start, end, type, value) => {
+    if (out.some(x => start < x.end && end > x.start)) return;
+    out.push({ start, end, type, value });
+  };
+  const trim = v => v.replace(/[.,;:!?)\]}'"`]+$/, '');
+  // Rules below were each earned by a false link in tubescience-parity's real
+  // output (click test, 2026-09-24): Mozilla/5.0, Chrome/153.0.8010.54,
+  // git/2.39.0 (a version is not an extension), 70s/json.loads( (a call is not
+  // a file), Chrome.app / asyncio.run / s.tech (not domains), 127.0.0.1:$PORT\.
+  const fileEnd = String.raw`\.(?=[A-Za-z0-9]{0,7}[A-Za-z])[A-Za-z0-9]{1,8}`;   // an extension with a letter in it
+  const notCall = p => plain[p] !== '(';
+  let m;
+  const url = /https?:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?(?:[\/?#][^\s<>\]\)'"`,;\\$-]*)?/g;
+  while ((m = url.exec(plain))) {
+    const v = trim(m[0]);
+    if (/[:${]/.test(plain[m.index + m[0].length] || '')) continue;   // a template like 127.0.0.1:$PORT
+    if (/\.[a-z]|localhost|\d+\.\d+\.\d+\.\d+/i.test(v.slice(8))) add(m.index, m.index + v.length, 'url', v);
+  }
+  // `@` before a path is Claude Code's file-mention marker, not part of the path.
+  const abs = new RegExp(String.raw`(^|[\s(\x60'"=:\[@])((?:\/|\.\.?\/|~\/)[\w.\/@+-]*\w` + fileEnd + String.raw`(?::\d+(?::\d+)?)?)(?![\w\/])`, 'g');
+  while ((m = abs.exec(plain))) { const st = m.index + m[1].length, en = st + m[2].length; if (notCall(en)) add(st, en, 'file', m[2]); }
+  // A relative path means something only against the worker's directory; with
+  // none known it stays plain text rather than a link that does nothing.
+  const cwdKnown = typeof peekSessionDir === 'string' && !!peekSessionDir;
+  const rel = new RegExp(String.raw`(^|[\s(\x60'"=\[@])((?:(?:\.\.\.|…|[\w+-][\w.@+-]*)\/)+[\w.@+…-]*\w` + fileEnd + String.raw`(?::\d+(?::\d+)?)?)(?![\w\/])`, 'g');
+  while (cwdKnown && (m = rel.exec(plain))) {
+    const st = m.index + m[1].length, en = st + m[2].length;
+    if (!notCall(en)) continue;
+    // A hard wrap is not a path boundary: at a line start, if the previous
+    // line's last token starts a path and has no extension, this is its tail.
+    if (st === 0 || plain[st - 1] === '\n') {
+      const prev = plain.slice(plain.lastIndexOf('\n', st - 2) + 1, Math.max(0, st - 1));
+      const tok = prev.trim().split(/[\s(\[>"'`,;=]+/).pop() || '';
+      if (/^\.?\//.test(tok) && !/\.[A-Za-z0-9]{1,8}$/.test(tok)) continue;
+    }
+    add(st, en, 'file', m[2]);
+  }
+  // Bare domains: lowercase only; a one-label host (x.com) only on the common
+  // TLDs, anything else needs two labels (flawless-footage.ts.app).
+  const dom = new RegExp('(^|[^\\w@/.:-])((?:[a-z0-9-]+\\.)+(?:' + _LINK_TLDS + ')(?:/[^\\s<>"\'`)\\]]*)?)(?![\\w.-]*\\w)', 'g');
+  while ((m = dom.exec(plain))) {
+    const st = m.index + m[1].length, v = trim(m[2]);
+    const host = v.split('/')[0], labels = host.split('.');
+    const common = /^(com|org|net|io|ai|dev)$/.test(labels[labels.length - 1]);
+    if (!common && labels.length < 3) continue;
+    if (st === 0 || plain[st - 1] === '\n') {
+      const prev = plain.slice(plain.lastIndexOf('\n', st - 2) + 1, Math.max(0, st - 1));
+      if (/https?:\/\/\S*$/.test(prev)) continue;   // the tail of a wrapped URL
+    }
+    add(st, st + v.length, 'url', 'https://' + v);
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+function _linkWrap(L, htmlText) {
+  const ea = s => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  if (L.type === 'url')
+    return '<a href="' + ea(L.value) + '" target="_blank" rel="noopener noreferrer">' + htmlText + '</a>';
+  const cls = /\.md(?::\d+)*$/i.test(L.value) ? 'md-link' : 'file-link';
+  const title = typeof _resolveOutputPath === 'function' ? ' title="Open: ' + ea(_resolveOutputPath(L.value.replace(/(?::\d+){1,2}$/, ''))) + '"' : '';
+  return '<span class="' + cls + '" data-path="' + ea(L.value) + '"' + title + ' onclick="_openLinkedPath(this,event)">' + htmlText + '</span>';
+}
+// Open a path from worker output through the one resolver every output link
+// uses (_openPathFromOutput: server-side resolve against the worker's cwd).
+function _openLinkedPath(el, ev) {
+  if (window.getSelection && String(window.getSelection()) !== '') return;
+  ev.preventDefault(); ev.stopPropagation();
+  const p = (el.dataset.path || '').replace(/(?::\d+){1,2}$/, '');
+  if (p) _openPathFromOutput(p);
+}
 function ansiToHtml(text) {
   // Convert ANSI SGR color codes to HTML spans. Also HTML-escapes and linkifies text.
   const C16 = ['#1c1c1c','#cc0000','#4e9a06','#c4a000','#3465a4','#75507b','#06989a','#d3d7cf',
@@ -13023,22 +13674,25 @@ function ansiToHtml(text) {
     if(!s.length)return ''; spanOpen=true; return `<span style="${s.join(';')}">`;
   };
   const eh=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // LINKS ARE FOUND ON THE PLAIN TEXT, THEN MAPPED ONTO THE COLOURED SPANS.
+  // Detecting per SGR chunk broke as soon as text was syntax-coloured
+  // (6cc350e5): a URL or path split across colour codes was in no single chunk,
+  // so nothing linked (tubescience-parity, 2026-09-24). A link that crosses a
+  // colour boundary is emitted as adjacent anchors to the same target.
+  const _plain=t.split(/(\x1b\[[0-9;]*m)/).filter(x=>!(x.startsWith('\x1b[')&&x.endsWith('m'))).join('');
+  const _links=_detectTextLinks(_plain);
+  let _pos=0,_li=0;
   const linkChunk=raw=>{
-    const urlRe=/https?:\/\/[^\s<>\]\)'"`,;]+/g;
-    const fileRe=/(?:^|[\s(])((\/[\w./-]+(?:\.\w+)(?::[\d]+)?)|(\.\/[\w./-]+(?:\.\w+)(?::[\d]+)?))/gm;
-    const mx=[]; let m;
-    while((m=urlRe.exec(raw))!==null){const u=m[0].replace(/[.,;:!?)]+$/,'');mx.push({start:m.index,end:m.index+u.length,type:'url',value:u});}
-    while((m=fileRe.exec(raw))!==null){const p=m[1],ps=m.index+m[0].indexOf(p),pe=ps+p.length;if(!mx.some(x=>ps<x.end&&pe>x.start))mx.push({start:ps,end:pe,type:'file',value:p});}
-    mx.sort((a,b)=>a.start-b.start);
-    let out='',last=0;
-    for(const x of mx){
-      if(x.start>last)out+=eh(raw.slice(last,x.start));
-      if(x.type==='url'){out+=`<a href="${eh(x.value)}" target="_blank" rel="noopener noreferrer">${eh(x.value)}</a>`;}
-      else{const rp=x.value.replace(/:[\d]+$/,'');const cls=/\.md$/i.test(rp)?'md-link':'file-link';out+=`<span class="${cls}" onclick="if(window.getSelection().toString())return;event.preventDefault();event.stopPropagation();openFilePreview('${eh(rp)}')">${eh(x.value)}</span>`;}
-      last=x.end;
+    let o='',i=0;
+    while(i<raw.length){
+      const g=_pos+i;
+      while(_li<_links.length&&_links[_li].end<=g)_li++;
+      const L=_links[_li];
+      if(L&&L.start<=g){const e=Math.min(raw.length,L.end-_pos);o+=_linkWrap(L,eh(raw.slice(i,e)));i=e;}
+      else{const e=L?Math.min(raw.length,L.start-_pos):raw.length;o+=eh(raw.slice(i,e));i=e;}
     }
-    if(last<raw.length)out+=eh(raw.slice(last));
-    return rewriteLocalhostUrls(out);
+    _pos+=raw.length;
+    return o;
   };
   const parts=t.split(/(\x1b\[[0-9;]*m)/);
   let out='';
@@ -13072,11 +13726,13 @@ function ansiToHtml(text) {
       }
       out+=openSpan();
     } else if(p){
-      out += p.split('\n').map((line, index) =>
-        (index ? closeSpan() + '\n' + openSpan() : '') + linkChunk(line)).join('');
+      out += p.split('\n').map((line, index) => {
+        if (index) _pos += 1;   // the newline is one plain character
+        return (index ? closeSpan() + '\n' + openSpan() : '') + linkChunk(line);
+      }).join('');
     }
   }
-  return _osc8Resolve(out+closeSpan(), _osc8);
+  return _osc8Resolve(rewriteLocalhostUrls(out+closeSpan()), _osc8);
 }
 
 // Turn the parked OSC-8 sentinels into real anchors (AMUX-2636).
@@ -13265,6 +13921,9 @@ function _linkifyPaths(safeHtml) {
     // re-emitted as plain text, so the link carries the real path.
     const RE = /(^|[\s(\[>"'`,;=])(@?)((?:\.?\/)?(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})(:\d+)?(?![^<]*>)/gm;
     return String(safeHtml).replace(RE, (m, pre, at, path, line, offset, whole) => {
+      // Already a link: ansiToHtml now links paths on the plain text (so a path
+      // split by syntax colours still links). Do not wrap it a second time.
+      if (/<(?:a\s|span class="(?:file|md)-link")[^>]*>[^<]*$/.test(String(whole).slice(0, offset + pre.length))) return m;
       // A HARD WRAP IS NOT A PATH BOUNDARY (Ethan, 2026-09-09: "these links
       // dont work"). tmux breaks a long line at the pane width mid-token, so
       // `/private/tmp/claude-501/…/_lt.txt` arrives as `/private/tmp/c` +
@@ -14055,6 +14714,8 @@ function refreshPeek(liveOnly) {
 async function _refreshPeekFrame(liveOnly, request) {
   if (_peekAgents.selected) return _peekAgentRefresh();
   const name = peekSession;
+  // The primary panel is the worker type's renderer; only 'terminal' reads frames.
+  if (name && _workerRenderer(name) === 'chat') return _chatRefresh(name);
   const identity = _peekIdentity(name);
   if (!name) return;
   if (peekSelecting) return;
@@ -15765,6 +16426,8 @@ async function peekQuickSend(text) {
 // markdown tables to fit this screen (cells wrap; nothing is cut). Measured
 // from the rendered font, not guessed from the viewport.
 let _peekColsCache = { w: 0, cols: 100 };
+// Re-measure when the window changes size, so wide blocks follow the screen.
+window.addEventListener('resize', () => { _peekColsCache = { w: 0, cols: _peekColsCache.cols }; try { _peekVisibleCols(); } catch (e) {} });
 function _peekVisibleCols() {
   const body = document.getElementById('peek-body');
   const w = body ? body.clientWidth : 0;
@@ -15780,6 +16443,8 @@ function _peekVisibleCols() {
   const inner = w - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
   const cols = ch > 0 ? Math.max(24, Math.min(400, Math.floor(inner / ch))) : 100;
   _peekColsCache = { w, cols };
+  // Tables and code blocks may use the whole body width (app.css, #pk-hist .peek-box).
+  body.style.setProperty('--peek-body-w', Math.floor(inner) + 'px');
   return cols;
 }
 async function peekQuickKeys(keys) {
@@ -15794,6 +16459,9 @@ async function peekQuickKeys(keys) {
 // lanes used to skip straight to a bare Enter, so their suggestion could never
 // be sent (2026-09-24). With nothing to submit, fall back to the literal key.
 async function _submitSuggestion(name, isPeek, fallbackKeys) {
+  // A suggestion and an Enter key live in a terminal composer. A worker whose
+  // renderer is not a terminal has neither, so an empty send is a no-op.
+  if (_workerRenderer(name) !== 'terminal') return;
   fallbackKeys = fallbackKeys || 'Enter';
   showSendingIndicator();
   try {
@@ -16521,10 +17189,10 @@ async function _approvalsRefresh() {
       // existed and made you hunt for what it said — on the one surface whose
       // entire job is letting a human judge the content before it sends.
       html += '<details open style="margin:4px 0;text-align:left;">'
-        + '<summary style="cursor:pointer;display:flex;align-items:center;gap:10px;min-height:34px;">'
-        + '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
-        + '<b>' + esc(p.session || '?') + '</b> &rarr; ' + esc(pv.to || '?')
-        + ' &middot; ' + esc(pv.subject || '(reply)') + '</span>'
+        + '<summary style="cursor:pointer;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;min-height:34px;">'
+        + '<span style="flex:1 1 160px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
+        + '<b>' + esc(p.session || '?') + '</b> &middot; '
+        + (pv.endpoint === 'reply' ? (pv.reply_all ? 'reply all' : 'reply') : 'new email') + '</span>'
         + '<span style="opacity:0.7;font-size:0.76rem;">expires in ' + mins + 'm</span>'
         + '<button onclick="event.preventDefault();_apprApprove(\'' + esc(p.id) + '\',this)" '
         + 'style="background:#16a34a;color:#fff;border:none;border-radius:6px;'
@@ -16549,10 +17217,15 @@ async function _approvalsRefresh() {
         + 'border-radius:6px;padding:8px 14px;font-size:0.8rem;cursor:pointer;'
         + 'min-height:34px;min-width:44px;">Discard</button>'
         + '</summary>'
+        // FULL ADDRESSES AND THE SUBJECT, REPLIES INCLUDED (Ethan, 2026-09-25:
+        // "include their full email and the subject (if its reply etc)"). The
+        // one-line summary cut long addresses with an ellipsis and a reply read
+        // only "(reply)", while the server already records the resolved thread
+        // recipients and subject.
+        + _apprHeaders(pv)
         + '<div id="appr-body-' + esc(p.id) + '" '
         + 'style="white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.25);'
         + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:320px;overflow:auto;">'
-        + (pv.cc ? 'cc: ' + esc(pv.cc) + '\n' : '')
         + esc(pv.body || '') + '</div></details>';
     }
     html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">'
@@ -16561,6 +17234,16 @@ async function _approvalsRefresh() {
     el.innerHTML = html;
     el.style.display = 'block';
   } catch (e) {}
+}
+function _apprHeaders(pv) {
+  const row = (k, v) => v ? '<div style="display:flex;gap:8px;"><span style="opacity:0.7;min-width:56px;">' + k
+    + '</span><span style="flex:1;min-width:0;word-break:break-all;">' + esc(v) + '</span></div>' : '';
+  const subject = pv.subject || (pv.endpoint === 'reply' ? '(thread subject unavailable)' : '(no subject)');
+  return '<div class="appr-headers" style="font-size:0.8rem;line-height:1.5;margin:6px 0 2px;">'
+    + row('From', pv.from) + row('To', pv.to || '?') + row('Cc', pv.cc)
+    + row('Subject', subject)
+    + (pv.endpoint === 'reply' ? row('Replying', pv.reply_all ? 'to everyone on the thread' : 'to the sender') : '')
+    + '</div>';
 }
 // Says what is waiting WITHOUT flattening two different asks into one noun. An
 // email draft and a permission grant need different decisions from the reader.
@@ -16626,7 +17309,7 @@ function _apprEdit(id, btn) {
   const host = document.getElementById('appr-body-' + id);
   if (!host) return;
   if (host.dataset.editing === '1') { _apprEditCancel(id); return; }
-  const text = host.innerText.replace(/^cc: .*\n/, '');
+  const text = host.innerText;   // cc now lives in the header block, not the body
   host.dataset.editing = '1';
   host.dataset.original = text;
   _apprEditing.add(id);
@@ -16741,11 +17424,16 @@ function _chipAction(chip, sessionName, isPeek) {
 
 function renderChips(container, sessionName, isPeek) {
   const chips = _getChips();
+  // Keystroke chips drive a terminal; a worker whose renderer is not a
+  // terminal (chat) has nothing for them to press. Indexes stay the originals.
+  const who = sessionName || (isPeek ? peekSession : '');
+  const noKeys = !!who && _workerRenderer(who) !== 'terminal';
   let html = '';
   chips.forEach((chip, i) => {
+    if (noKeys && chip.action === 'keys') return;
     const cls = chip.danger ? 'chip danger' : 'chip';
     const drag = _chipEditing ? 'draggable="true"' : '';
-    html += '<div class="' + cls + '" ' + drag + ' data-chip-idx="' + i + '"'
+    html += '<div class="' + cls + '" ' + drag + ' data-chip-idx="' + i + '" data-chip-action="' + esc(chip.action || '') + '"'
       + ' onclick="_chipAction(_getChips()[' + i + '],\'' + esc(sessionName || '') + '\',' + !!isPeek + ')">'
       + (_chipEditing ? '<span class="chip-drag-handle">\u2630</span>' : '')
       + esc(chip.label)
@@ -18477,9 +19165,18 @@ function _msgCardChip(cardId, message, linkedCard) {
   const stC = st => st === 'verified' ? 'var(--green)' : st === 'done' ? '#3fb950'
     : st === 'doing' ? '#d29922' : st === 'review' ? '#bc8cff'
     : st === 'discarded' ? 'var(--dim)' : 'var(--accent)';
-  const st = c ? (c.status || 'todo') : '';
+  // AN EPIC'S OWN STATUS IS NOT ITS PROGRESS (Ethan, 2026-09-25: a root read
+  // "backlog" beside children that were done and doing). The root closes only
+  // when every child is terminal, so until then show where its children are.
+  const kids = c && c.type === 'epic' && Array.isArray(boardItems)
+    ? boardItems.filter(x => x.epic === cardId && !x.deleted && !x.archived) : [];
+  const kidsDone = kids.filter(x => ['done', 'verified', 'discarded'].includes(x.status)).length;
+  const kidsMoving = kids.some(x => ['doing', 'review'].includes(x.status));
+  let st = c ? (c.status || 'todo') : '';
+  if (kids.length && !['done', 'verified', 'discarded'].includes(st)) st = kidsDone === kids.length ? 'done' : (kidsMoving || kidsDone) ? 'doing' : st;
   const displaySt = c && c.deleted ? 'deleted'
     : c && c.archived ? 'archived'
+    : kids.length ? kidsDone + ' of ' + kids.length + ' done'
     : st;
   const undec = c && ((c.log || '').indexOf('capture: worker prompt') !== -1) && st === 'todo';
   const lastCommit = c ? (((c.log || '').match(/commit ([0-9a-f]{7,12}) \u2014 [^\n]*/g) || []).pop() || '') : '';
@@ -19962,6 +20659,11 @@ function _nextTagState(tag, active, hidden) {
 function _workerVisibleWithHiddenTags(tags, active, hidden) {
   if (active && tags.includes(active)) return true;
   return !tags.some(t => hidden.has(t));
+}
+function resetGroupView() {
+  activeTag = '';
+  hiddenTags = new Set();
+  render();   // render() persists the list view
 }
 function toggleTagFilter(tag) {
   const next = _nextTagState(tag, activeTag, hiddenTags);
@@ -23254,11 +23956,99 @@ function _mdaiHistNav(delta) {
   _mdaiHistIdx = n; _mdaiRender();
 }
 
-// Ellipsis menu on the MDAI viewer: download / copy / read aloud the currently
-// shown rendered version (Ethan, AMUX-3320). Read-aloud reuses _ttsSpeak.
+// Ellipsis menu on the MDAI viewer: copy / export / read aloud the currently
+// shown version (Ethan, AMUX-3320). Read-aloud reuses _ttsSpeak.
+//
+// "Copy" puts the RENDERED output on the clipboard as text/html with the markdown
+// as text/plain, so pasting into Docs, Mail or Notion keeps headings, lists and
+// tables while a terminal or editor still gets markdown. The export items write
+// the same rendered HTML as a standalone page (Ethan, 2026-09-26: "copy/export
+// the rendered mdai contents").
 function _mdaiCurrentText() {
   const cur = _mdaiHist[_mdaiHistIdx] || null;
   return (cur && cur.output) ? cur.output : '';
+}
+// The rendered HTML of the shown version: the on-screen output when it is there,
+// else the same renderMarkdown call _mdaiRender makes.
+function _mdaiCurrentHtml() {
+  const shown = document.querySelector('#mdai-body .mdai-output');
+  const text = _mdaiCurrentText();
+  if (!text) return '';
+  if (shown && shown.innerHTML.trim()) return shown.innerHTML;
+  return renderMarkdown(text, _mdaiCur ? _mdaiCur.abs : '');
+}
+function _mdaiBaseName() {
+  const title = (document.getElementById('mdai-title') || {}).textContent || 'mdai';
+  return title.replace(/\.mdai$/i, '') || 'mdai';
+}
+// A self-contained page: print-friendly light styles, no dashboard CSS needed.
+function _mdaiStandaloneHtml() {
+  const cur = _mdaiHist[_mdaiHistIdx] || null;
+  const when = (cur && cur.ts) ? new Date(cur.ts * (cur.ts < 1e12 ? 1000 : 1)).toLocaleString() : '';
+  const name = _mdaiBaseName();
+  return '<!doctype html><html><head><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    + '<title>' + esc(name) + '</title><style>'
+    + 'body{font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1f2328;max-width:820px;margin:32px auto;padding:0 20px;}'
+    + 'h1,h2,h3,h4{line-height:1.25;margin:1.4em 0 .5em}h1{font-size:1.7em}h2{font-size:1.35em}h3{font-size:1.12em}'
+    + 'table{border-collapse:collapse;margin:12px 0}th,td{border:1px solid #d0d7de;padding:6px 10px;text-align:left;vertical-align:top}th{background:#f6f8fa}'
+    + 'code{font-family:"SF Mono",Menlo,monospace;font-size:.88em;background:#f6f8fa;padding:1px 4px;border-radius:4px}'
+    + 'pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto}pre code{background:none;padding:0}'
+    + 'blockquote{border-left:3px solid #d0d7de;margin:0;padding:0 12px;color:#57606a}a{color:#0969da}img{max-width:100%}'
+    + '.mdai-export-meta{color:#57606a;font-size:12px;border-bottom:1px solid #d0d7de;padding-bottom:8px;margin-bottom:16px}'
+    + '@media print{body{margin:0;max-width:none}}'
+    + '</style></head><body>'
+    + '<div class="mdai-export-meta">' + esc(name) + '.mdai' + (when ? ' &middot; ' + esc(when) : '') + (cur && cur.model ? ' &middot; ' + esc(cur.model) : '') + '</div>'
+    + _mdaiCurrentHtml()
+    + '</body></html>';
+}
+function _mdaiCopyRendered() {
+  const text = _mdaiCurrentText();
+  if (!text) { showToast('Nothing to copy — run the node first'); return; }
+  const html = _mdaiCurrentHtml();
+  // ClipboardItem must be built inside the click gesture (Safari), so no await first.
+  if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+    const item = new ClipboardItem({
+      'text/html': new Blob([html], { type: 'text/html' }),
+      'text/plain': new Blob([text], { type: 'text/plain' })
+    });
+    navigator.clipboard.write([item]).then(() => showToast('Copied (formatted)'),
+      () => navigator.clipboard.writeText(text).then(() => showToast('Copied as markdown'), () => showToast('Copy failed')));
+    return;
+  }
+  navigator.clipboard.writeText(text).then(() => showToast('Copied as markdown'), () => showToast('Copy failed'));
+}
+function _mdaiSaveBlob(content, type, name) {
+  const blob = new Blob([content], { type });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  showToast('Downloaded ' + name);
+}
+// Print in a hidden iframe so the browser's "Save as PDF" gets the clean page,
+// not the dashboard. An iframe avoids the popup blocker window.open would hit.
+function _mdaiPrint() {
+  if (!_mdaiCurrentText()) { showToast('Nothing to export — run the node first'); return; }
+  const f = document.createElement('iframe');
+  f.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;';
+  document.body.appendChild(f);
+  const d = f.contentWindow.document;
+  d.open(); d.write(_mdaiStandaloneHtml()); d.close();
+  setTimeout(() => {
+    try { f.contentWindow.focus(); f.contentWindow.print(); } catch (e) { showToast('Print failed'); }
+    setTimeout(() => f.remove(), 60000);
+  }, 250);
+}
+// iOS/Android share sheet with the rendered page as a file (Files, Mail, AirDrop).
+async function _mdaiShare() {
+  if (!_mdaiCurrentText()) { showToast('Nothing to share — run the node first'); return; }
+  const file = new File([_mdaiStandaloneHtml()], _mdaiBaseName() + '.html', { type: 'text/html' });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: _mdaiBaseName() });
+    else await navigator.share({ title: _mdaiBaseName(), text: _mdaiCurrentText() });
+  } catch (e) { if (!e || e.name !== 'AbortError') showToast('Share failed'); }
 }
 function _mdaiMenu(btn) {
   document.querySelectorAll('.explore-menu-popup').forEach(el => el.remove());
@@ -23272,15 +24062,23 @@ function _mdaiMenu(btn) {
     b.onclick = () => { popup.remove(); fn(); };
     popup.appendChild(b);
   };
-  item('Download', () => _mdaiDownload(text));
-  item('Copy', () => {
+  item('Copy', _mdaiCopyRendered);
+  item('Copy as markdown', () => {
     if (!text) { showToast('Nothing to copy — run the node first'); return; }
     navigator.clipboard.writeText(text).then(() => showToast('Copied'), () => showToast('Copy failed'));
   });
+  item('Download .md', () => _mdaiDownload(text));
+  item('Download .html', () => {
+    if (!text) { showToast('Nothing to download — run the node first'); return; }
+    _mdaiSaveBlob(_mdaiStandaloneHtml(), 'text/html', _mdaiBaseName() + '.html');
+  });
+  item('Print / Save as PDF', _mdaiPrint);
+  if (navigator.share) item('Share…', _mdaiShare);
   item('Read aloud', () => {
     if (!text) { showToast('Nothing to read — run the node first'); return; }
     _ttsSpeak(text);
   });
+  item('Open raw .mdai file', _mdaiOpenRaw);
   document.body.appendChild(popup);
   const r = btn.getBoundingClientRect();
   popup.style.position = 'fixed';
@@ -23299,15 +24097,7 @@ function _mdaiMenu(btn) {
 }
 function _mdaiDownload(text) {
   if (!text) { showToast('Nothing to download — run the node first'); return; }
-  const title = (document.getElementById('mdai-title') || {}).textContent || 'mdai';
-  const name = title.replace(/\.mdai$/i, '') + '.md';
-  const blob = new Blob([text], { type: 'text/markdown' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  showToast('Downloaded ' + name);
+  _mdaiSaveBlob(text, 'text/markdown', _mdaiBaseName() + '.md');
 }
 // Write the current parsed state back to disk (used by every structured edit).
 // Uses the upload endpoint (see _mdaiRootRel) because PUT /api/file rejects .mdai.
@@ -24310,8 +25100,9 @@ function _selectProvider(p) {
   if (_museBtn) _museBtn.classList.toggle('selected', p === 'muse');
   // Hide branch/template/session-name options for non-Claude providers since they use different mechanics
   const isClaude = p === 'claude';
-  document.getElementById('create-branch-enabled').closest('.field-group').style.display = isClaude ? '' : 'none';
-  document.getElementById('create-worktree-field').style.display = isClaude && _createDirIsGit ? '' : 'none';
+  const _typeHasWorktree = _workerTypeInfo(_createWorkerType).worktree !== 'unsupported';
+  document.getElementById('create-branch-enabled').closest('.field-group').style.display = isClaude && _typeHasWorktree ? '' : 'none';
+  document.getElementById('create-worktree-field').style.display = isClaude && _createDirIsGit && _typeHasWorktree ? '' : 'none';
   document.getElementById('create-template-field').style.display = isClaude ? '' : 'none';
   // Every provider uses the same model surface. Blank delegates to that CLI's
   // own default; custom keeps tomorrow's model usable before this catalog is
@@ -24342,6 +25133,7 @@ function _createGroupsFrom(raw) {
 }
 function openCreate() {
   _createProvider = 'claude';
+  _createWorkerType = 'coding';
   document.getElementById('create-provider-claude').classList.add('selected');
   document.getElementById('create-provider-codex').classList.remove('selected');
   document.getElementById('create-provider-gemini').classList.remove('selected');
@@ -24391,6 +25183,7 @@ function openCreate() {
   document.getElementById('tmpl-section-chev').style.transform = '';
   document.getElementById('tmpl-selected-badge').style.display = 'none';
   document.getElementById('tmpl-selected-wrap').style.display = 'none';
+  _selectWorkerType('coding');
   document.getElementById('create-overlay').classList.add('active');
   // Check git for default dir
   const defaultDir = document.getElementById('create-dir').value;
@@ -24666,6 +25459,9 @@ async function submitCreate() {
   const _groupsVal = (document.getElementById('create-groups') || {}).value || '';
   const _tags = _groupsVal.split(',').map(g => g.trim()).filter(Boolean);
   if (_tags.length) createBody.tags = _tags;
+  // Absent = coding, exactly what older clients send.
+  if (_createWorkerType !== 'coding') createBody.worker_type = _createWorkerType;
+  const _createType = _workerTypeInfo(_createWorkerType);
   if (_createProvider !== 'claude') createBody.provider = _createProvider;
   const _modelSel = document.getElementById('create-model');
   const _modelCustom = document.getElementById('create-model-custom');
@@ -24724,14 +25520,17 @@ async function submitCreate() {
   if (r && r.ok) {
     if (dir) _addRecentDir(dir);
     // Apply template if selected (creates dirs + writes CLAUDE.md before session starts)
-    if (_selectedTemplate && dir) {
+    if (_selectedTemplate && dir && _createType.renderer === 'terminal') {
       await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/apply-template', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ template_id: _selectedTemplate.id, dir }),
       }).catch(() => {});
     }
-    // Save branch preference: custom name, auto (default), or none
-    if (branch && dir) {
+    // Save branch preference: custom name, auto (default), or none. A type
+    // with no worktree has no branch to manage.
+    if (_createType.worktree === 'unsupported') {
+      // nothing to configure
+    } else if (branch && dir) {
       // Custom branch name — create it and save to config. With a worktree the
       // branch is created INSIDE the worktree at start; checking it out here
       // would switch the main (possibly shared) checkout's branch.
@@ -28586,10 +29385,21 @@ function renderScheduler(opts) {
         // row now carries WHICH path the command took and what Claude Code
         // said about the submission, and burying that in the DB would be the
         // same failure as not recording it (ethos rule 4).
-        const bits = [r.status, new Date(r.ran_at * 1000).toLocaleTimeString()];
-        if (r.delivery && r.delivery !== r.status) bits.push('via ' + r.delivery);
-        if (r.submission) bits.push(r.submission);
-        if (r.note) bits.push(String(r.note).split('\n')[0].slice(0, 120));
+        // A RUNNING SHELL RUN IS ON THIS MACHINE, NOT IN THE WORKER (Ethan,
+        // 2026-09-25: "says this but the worker is idle"). "running · via shell
+        // · started on host; result pending" beside an idle worker read as a
+        // stuck job. Say where it runs and for how long.
+        let bits;
+        if (r.status === 'running') {
+          bits = ['running on this machine for ' + _fmtDur(Date.now() - r.ran_at * 1000),
+                  'started ' + new Date(r.ran_at * 1000).toLocaleTimeString()];
+          if (r.delivery === 'shell') bits.push('a shell command: the worker is not involved and stays idle');
+        } else {
+          bits = [r.status, new Date(r.ran_at * 1000).toLocaleTimeString()];
+          if (r.delivery && r.delivery !== r.status) bits.push('via ' + r.delivery);
+          if (r.submission) bits.push(r.submission);
+          if (r.note) bits.push(String(r.note).split('\n')[0].slice(0, 120));
+        }
         return `<span class="sched-run-dot ${cls}" title="${esc(bits.join(' · '))}"></span>`;
       }).join('');
       const sessStatus = sessMap[s.session] || 'idle';
@@ -29353,6 +30163,16 @@ function renderMarkdown(raw, basePath) {
         const tgt = (!isAnchor && /^https?:/i.test(href || '')) ? ' target="_blank" rel="noopener"' : '';
         const t = title ? ' title="' + esc(title) + '"' : '';
         return '<a href="' + esc(href || '#') + '"' + tgt + t + '>' + text + '</a>';
+      };
+      // Media inline, scaled to the container: an image link to a video file
+      // plays in place instead of showing a broken image.
+      renderer.image = function({ href, title, text }) {
+        const h = esc(href || ''), t = title ? ' title="' + esc(title) + '"' : '';
+        if (/\.(mp4|webm|mov|m4v)(\?|#|$)/i.test(href || ''))
+          return '<video controls preload="metadata" src="' + h + '"' + t + '></video>';
+        if (/\.(mp3|m4a|wav|ogg)(\?|#|$)/i.test(href || ''))
+          return '<audio controls preload="metadata" src="' + h + '"' + t + '></audio>';
+        return '<img src="' + h + '" alt="' + esc(text || '') + '"' + t + ' loading="lazy">';
       };
       let html = marked.parse(raw, { gfm: true, breaks: false, renderer });
       html = html.replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, '</table></div>');
@@ -36688,7 +37508,49 @@ function _offlineSettingsHTML() {
 // AMUX-2975: settings is grouped into 5 tabs (account/workers/notifications/
 // integrations/device). Switch the visible panel + active button, remember the
 // last tab, and reset the menu scroll so a new panel opens at the top.
+// ── Vault (vault.rs): cards workers use without reading, each with a limit ──
+async function _vaultLoad() {
+  const el = document.getElementById('vault-items');
+  if (!el) return;
+  try {
+    const r = await fetch(API + '/api/vault', { headers: _authHeaders() });
+    const d = await r.json();
+    const items = d.items || [];
+    if (!items.length) { el.innerHTML = '<p class="connection-help">No items yet.</p>'; return; }
+    el.innerHTML = items.map(i => {
+      const pending = i.status !== 'active';
+      return '<div class="vault-item" data-id="' + esc(i.id) + '">'
+        + '<div class="vault-item-head"><b>' + esc(i.name) + '</b> · ' + esc(i.brand) + ' ending ' + esc(i.last4) + ' · exp ' + esc(i.exp)
+        + (pending ? ' · <span class="vault-pending">added by ' + esc(i.created_by || 'a worker') + ', not active</span>' : '') + '</div>'
+        + '<label class="connection-control">Approval needed above $'
+        + '<input type="number" min="0" step="1" class="search-input vault-limit" value="' + esc(String(i.rules?.max_usd_without_approval ?? 100)) + '"></label>'
+        + '<div class="vault-actions">'
+        + (pending ? '<button class="btn primary" onclick="_vaultSave(\'' + escJs(i.id) + '\', true)">Activate</button>' : '')
+        + '<button class="btn" onclick="_vaultSave(\'' + escJs(i.id) + '\', false)">Save limit</button>'
+        + '<button class="btn danger" onclick="_vaultRemove(\'' + escJs(i.id) + '\')">Remove</button></div></div>';
+    }).join('');
+  } catch (e) { el.textContent = 'Vault unavailable: ' + (e.message || e); }
+}
+async function _vaultSave(id, activate) {
+  const row = document.querySelector('.vault-item[data-id="' + CSS.escape(id) + '"]');
+  const limit = Number(row?.querySelector('.vault-limit')?.value);
+  if (!Number.isFinite(limit) || limit < 0) { showToast('Enter a limit of 0 or more'); return; }
+  const body = { rules: { max_usd_without_approval: limit } };
+  if (activate) body.activate = true;
+  const r = await fetch(API + '/api/vault/' + encodeURIComponent(id), { method: 'PATCH',
+    headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  showToast(r.ok ? (activate ? 'Activated' : 'Limit saved') : ('Vault: ' + (d.error || r.status)));
+  _vaultLoad();
+}
+async function _vaultRemove(id) {
+  if (!await showConfirm('Remove this card from the vault? Workers will no longer be able to use it.', 'Remove', true)) return;
+  const r = await fetch(API + '/api/vault/' + encodeURIComponent(id), { method: 'DELETE', headers: _authHeaders() });
+  showToast(r.ok ? 'Removed' : 'Remove failed');
+  _vaultLoad();
+}
 function _settingsTab(name) {
+  if (name === 'integrations') setTimeout(_vaultLoad, 0);
   const menu = document.getElementById('settings-menu');
   if (!menu) return;
   menu.querySelectorAll('.settings-tab-btn').forEach(b =>
@@ -45411,15 +46273,31 @@ function _projectInventoryState(project) {
   if(summary.acceptance_state==='accepted') return {label:'Accepted',cls:'done'};
   if(['failed','operational_failure','rejected'].includes(summary.acceptance_state)) return {label:'Verification failed',cls:'review'};
   if(summary.acceptance_state==='not_configured' && Number(summary.active_tasks||0)===0 && Number(summary.task_count||0)>0) return {label:'Review setup',cls:'review'};
+  const live=_projectLiveWorkerState(summary.working_workers);
+  if(live) return live;
   if(Number(summary.active_tasks||0)>0 && Number(summary.waiting_tasks||0)===Number(summary.active_tasks||0) && Number(summary.running_executions||0)===0) return {label:'Execution held',cls:'review'};
+  if(Number(summary.running_executions||0)===0 && Number(summary.queued_repairs||0)>0) return {label:'Repair queued',cls:'ready'};
+  if(Number(summary.running_executions||0)===0 && Number(summary.active_tasks||0)>0) return {label:'Ready to dispatch',cls:'ready'};
   if(Number(summary.running_executions||0)>0 || Number(summary.active_tasks||0)>0) return {label:'Driving',cls:'active'};
   if(Number(summary.task_count||0)>0) return {label:'Verifying outcome',cls:'active'};
   return {label:'Ready',cls:'ready'};
 }
+function _projectLiveWorkerState(names) {
+  if(!Array.isArray(names) || !names.length) return null;
+  if((typeof _sessionLoadError!=='undefined' && _sessionLoadError) || (typeof online!=='undefined' && !online)) return {label:'Worker state unavailable',cls:'review'};
+  const observed=names.map(name=>(typeof sessions==='undefined'?[]:sessions).find(s=>s.name===name));
+  if(observed.some(s=>s?.running && ['active','working'].includes(s.status))) return null;
+  if(observed.some(s=>s?.status==='waiting')) return {label:'Worker needs input',cls:'review'};
+  if(observed.some(s=>s?.status==='rate_limited')) return {label:'Worker rate limited',cls:'review'};
+  if(observed.some(s=>s?.paused || s?.lifecycle==='paused')) return {label:'Worker paused',cls:'review'};
+  if(observed.some(s=>s?.running===false || s?.status==='stopped')) return {label:'Worker stopped',cls:'review'};
+  if(observed.some(s=>s?.status==='idle')) return {label:'Worker idle',cls:'review'};
+  return {label:'Checking worker',cls:'review'};
+}
 function _projectRenderInventory(projects) {
   const el=document.getElementById('project-list'); if(!el) return;
   const rows=[{name:'',newProject:true}].concat(projects || []);
-  const sig=JSON.stringify([_projectsName,rows.map(p=>[p.name,p.newProject,!!p.policy?.paused,p.policy?.enabled,p.policy?.repository,p.policy?.executor?.provider,p.policy?.executor?.model,p.policy?.executor?.effort,p.policy?.worktree,p.summary])]);
+  const sig=JSON.stringify([_projectsName,rows.map(p=>[p.name,p.newProject,!!p.policy?.paused,p.policy?.enabled,p.policy?.repository,p.policy?.executor?.provider,p.policy?.executor?.model,p.policy?.executor?.effort,p.policy?.worktree,p.summary,_projectLiveWorkerState(p.summary?.working_workers)])]);
   if(el.dataset.sig===sig) return;
   el.dataset.sig=sig;
   el.innerHTML='<div class="project-list-title">Projects</div>'+rows.map(p=>{
@@ -45430,7 +46308,7 @@ function _projectRenderInventory(projects) {
     const checkoutPath=(workspace.available===true ? workspace.path : '') || policy.repository || '';
     const executor=[policy.executor?.provider,policy.executor?.model,policy.executor?.effort].filter(Boolean).join(' · ');
     const choose=`_projectChoose('${escJs(p.name)}')`;
-    const mode=(summary.acceptance_state==='accepted' && workspace.available===false?'Published to main · worktree removed':policy.worktree===false?'Shared checkout':'One project worktree')+(executor?' · '+executor:'');
+    const mode=(summary.acceptance_state==='accepted' && workspace.available===false?'Published to origin/main · worktree removed':policy.worktree===false?'Shared checkout':'One project worktree')+(executor?' · '+executor:'');
     return `<div class="project-list-card ${p.name===_projectsName?'selected':''}" role="button" tabindex="0" onclick="${choose}" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();${choose}}"><span class="project-list-row"><strong>${esc(p.name)}</strong><em class="project-pill ${esc(st.cls)}">${esc(st.label)}</em></span><span class="project-card-path">${checkoutPath?_projectCheckoutPathButton(checkoutPath):'<span>No repository configured</span>'}</span><span>${esc(mode)}</span></div>`;
   }).join('');
 }
@@ -45439,8 +46317,9 @@ function _projectCurrentTab() {
   const tab=_projectStorage('tab_'+(_projectsName||'')) || 'overview';
   return _projectTabs.some(([key])=>key===tab) ? tab : 'overview';
 }
-function _projectTabsHtml() {
-  return '<nav class="project-tabs" aria-label="Project sections">'+_projectTabs.map(([key,label])=>`<button type="button" class="project-tab" data-project-tab="${esc(key)}" onclick="_projectSetTab('${escJs(key)}')">${esc(label)}</button>`).join('')+'</nav>';
+function _projectTabsHtml(project) {
+  const lead=project?.policy?.mode==='lead';
+  return '<nav class="project-tabs" aria-label="Project sections">'+_projectTabs.filter(([key])=>!lead||key!=='dependencies').map(([key,label])=>`<button type="button" class="project-tab" data-project-tab="${esc(key)}" onclick="_projectSetTab('${escJs(key)}')">${esc(lead&&key==='tasks'?'Plan':label)}</button>`).join('')+'</nav>';
 }
 function _projectSetTab(tab) {
   _projectStorage('tab_'+(_projectsName||''),tab);
@@ -45456,9 +46335,9 @@ function _projectApplyTab() {
   });
 }
 function _projectDetailTemplate(project) {
-  return _projectTabsHtml()+
+  return _projectTabsHtml(project)+
     '<section id="project-panel-overview" class="project-tab-panel" data-project-panel="overview">'+
-      '<section class="project-command-center"><div class="project-status"><div><span class="project-eyebrow">Current state</span><strong id="project-state"></strong></div><button class="btn" id="project-pause" onclick="_projectPause()">Pause</button></div><div class="project-metrics" aria-label="Project health"><div><strong id="project-metric-outcomes">—</strong><span id="project-metric-outcomes-label">Outcomes verified</span></div><div><strong id="project-metric-tasks">—</strong><span>Unfinished tasks</span></div><div><strong id="project-metric-workers">—</strong><span>Workers assigned</span></div><div><strong id="project-metric-usage">—</strong><span>Observed usage</span></div></div><section class="project-summary" aria-label="Project progress and acceptance"><div id="project-progress" class="project-progress" role="status"></div><div id="project-acceptance" class="project-acceptance"></div></section><label class="project-composer-label" for="project-command">Add or refine the desired outcome</label><textarea id="project-command" rows="3" placeholder="Describe the result and how a human can verify the produced artifact" oninput="_projectDraft()"></textarea><div class="project-send"><button class="btn primary" id="project-send" onclick="_projectSend()">Submit outcome</button><span id="project-receipt" role="status"></span></div><div id="project-commands"></div></section>'+
+      '<section class="project-command-center"><div class="project-status"><div><span class="project-eyebrow">Current state</span><strong id="project-state"></strong></div><button class="btn" id="project-pause" onclick="_projectPause()">Pause</button></div><div class="project-metrics" aria-label="Project progress"><div><strong id="project-metric-outcomes">—</strong><span id="project-metric-outcomes-label">Outcomes verified</span></div><div><strong id="project-metric-tasks">—</strong><span id="project-metric-tasks-label">Unfinished tasks</span></div></div><section class="project-summary" aria-label="Project progress and acceptance"><div id="project-progress" class="project-progress" role="status"></div><div id="project-acceptance" class="project-acceptance"></div></section><div id="project-commands"></div><details class="project-update" data-open-key="update"><summary>Add or refine the outcome</summary><p>Describe the result you want and how you would recognize it as complete.</p><label class="project-composer-label" for="project-command">Your request</label><textarea id="project-command" rows="3" placeholder="Describe the result and how a human can verify the produced artifact" oninput="_projectDraft()"></textarea><div class="project-send"><button class="btn primary" id="project-send" onclick="_projectSend()">Submit outcome</button><span id="project-receipt" role="status"></span></div></details></section>'+
       '<div id="project-overview" class="project-overview-grid"></div>'+
     '</section>'+
     '<section id="project-panel-tasks" class="project-tab-panel" data-project-panel="tasks" hidden><div class="project-workspace"><div id="project-cards" class="project-columns" aria-label="Project tasks"></div><aside id="project-inspector" class="project-inspector" tabindex="-1" aria-label="Task inspector"></aside></div></section>'+
@@ -45488,7 +46367,7 @@ function _projectAssets(data) {
   if(reviewAssets.length) {
     reviewAssets.forEach((entry,index)=>{
       const task=(data.cards||[]).find(card=>card.id===entry.task);
-      add({acceptance:true,entry,index,asset:entry.asset,card:{id:entry.task||'project',title:task?.title || (entry.task?'Task candidate evidence':'Project acceptance')}});
+      add({acceptance:true,entry,index,asset:entry.asset,card:{id:entry.task||'project',title:task?.title || (entry.task==='project-outcome'?'Produced project files':entry.task?'Task candidate evidence':'Project acceptance')}});
     });
     return assets;
   }
@@ -45562,12 +46441,12 @@ function _projectOutcomeVerdict(data) {
     tone='failed';title='Outcome not verified';
     summary=failed>0 ? failed+' automated check'+(failed===1?' has':'s have')+' failed. The project must repair and rerun them before approval.' : 'The outcome was rejected or its verification did not complete successfully.';
   } else if(!acc.candidate && held.length) {
-    tone='failed';title='Work is held before verification';
-    const reason=held[0]?.execution_plan?.waiting_label||'A task is waiting';
-    summary=reason+'. No candidate has been accepted for whole-project verification.'+(budget && spent>=budget?' The observed token budget is also exhausted; Amux will use token-free recovery where possible and will not start another paid worker turn.':'');
+    tone=active>held.length?'running':'review';
+    title=active>held.length?'Work continues; a task is held':'Task work is held';
+    summary=held.length+' task'+(held.length===1?' is':'s are')+' held before whole-project verification. The task board shows the exact reason and repair status.'+(budget && spent>=budget?' The observed token budget is exhausted; Amux will not start another paid worker turn.':'');
   } else if(criteria.length && (active>0 || pending>0 || state)) {
     tone='running';title=acc.candidate?'Verification still in progress':'Work in progress; verification has not started';
-    summary=acc.candidate?'The project is verified only after every configured check passes and the retained evidence is reviewed.':'No whole-project candidate exists yet. Task work and reports are not lifecycle proof.';
+    summary=acc.candidate?'The project is verified only after every configured check passes and the retained evidence is reviewed.':'No whole-project candidate exists yet. The lead’s progress report is not proof of completion.';
   } else if(cards.length && active===0) {
     tone='pending';title='Tasks finished, outcome not independently verified';
     summary='Task completion alone does not prove the requested outcome. Configure and run whole-project acceptance before approving it.';
@@ -45577,22 +46456,11 @@ function _projectOutcomeVerdict(data) {
 
 function _projectOutcomeCard(data) {
   const v=_projectOutcomeVerdict(data);
-  const stateLabel={passed:'Passed',review:'Needs your review',failed:'Failed',running:'In progress',pending:'Not proven'}[v.tone]||'Not proven';
-  const rows=v.criteria.map(c=>{
-    const state=String(c?.result?.state||'pending').toLowerCase();
-    const cls=state==='passed'||state==='approved'?'passed':['failed','operational_failure','rejected'].includes(state)?'failed':'pending';
-    const runtime=c?.verifier?.type==='execution';
-    const subject=c?.result?.receipt?.subject?.id;
-    const stages=Array.isArray(c?.result?.receipt?.stages)?c.result.receipt.stages.filter(s=>s?.state==='passed').length:0;
-    const measurements=Array.isArray(c?.result?.measurements)?c.result.measurements.length:0;
-    const dockerAttested=!!c?.result?.docker_attestation;
-    const label=cls==='passed'?(runtime?'Fresh execution verified · '+measurements+' raw checks'+(stages?' · '+stages+' stages':'')+(dockerAttested?' · Docker image attested':''):'Passed'):cls==='failed'?'Failed':c?.verifier?.type==='human'?'Needs human review':runtime?'Waiting for fresh execution':'Pending';
-    return '<li class="'+cls+'"><span aria-hidden="true"></span><div><strong>'+esc(c.requirement||c.id||'Acceptance check')+'</strong><small>'+esc(label)+(subject?' · '+esc(subject):'')+'</small></div></li>';
-  }).join('');
-  const assets=Array.isArray(data?.acceptance?.review_assets)?data.acceptance.review_assets:[];
-  const review=assets.length?'<button class="btn" onclick="_projectSetTab(\'evidence\')">Review '+assets.length+' retained artifact'+(assets.length===1?'':'s')+'</button>':'';
-  const checklist=rows?'<ol class="project-outcome-checklist" aria-label="Outcome verification checks">'+rows+'</ol>':'<p class="project-outcome-warning">No whole-project acceptance checks are configured. Worker claims and task statuses cannot prove the outcome.</p>';
-  return '<section class="project-outcome project-outcome-'+v.tone+'" aria-label="Project outcome verdict"><div class="project-outcome-heading"><div><span class="project-eyebrow">Human-verifiable outcome</span><h3>'+esc(v.title)+'</h3></div><strong class="project-outcome-badge">'+esc(stateLabel)+'</strong></div><p>'+esc(v.summary)+'</p>'+checklist+(review?'<div class="project-outcome-actions">'+review+'</div>':'')+'</section>';
+  const stateLabel=v.state==='awaiting_human'?'Needs your review':{passed:'Passed',review:'Held',failed:'Failed',running:'In progress',pending:'Not proven'}[v.tone]||'Not proven';
+  const assets=_projectAssets(data);
+  const checks=v.criteria.length?'<p class="project-outcome-counts">'+(v.automated.length?v.passed+' of '+v.automated.length+' automated checks passed':'No automated checks configured')+(v.failed?' · '+v.failed+' failed':'')+(v.human.length?' · '+v.human.length+' human review check'+(v.human.length===1?'':'s'):'')+'</p>':'<p class="project-outcome-warning">No whole-project acceptance checks are configured. Task completion alone cannot prove the outcome.</p>';
+  const action=v.state==='awaiting_human'?'Review evidence and decide':v.state==='accepted'?'Inspect approved evidence':'See checks and evidence';
+  return '<section class="project-outcome project-outcome-'+v.tone+'" aria-label="Project outcome verdict"><div class="project-outcome-heading"><div><span class="project-eyebrow">Requested outcome</span><h3>'+esc(v.title)+'</h3></div><strong class="project-outcome-badge">'+esc(stateLabel)+'</strong></div><p>'+esc(v.summary)+'</p>'+checks+'<div class="project-outcome-actions"><button class="btn'+(v.state==='awaiting_human'?' primary':'')+'" onclick="_projectSetTab(\'evidence\')">'+action+(assets.length?' · '+assets.length+' artifacts':'')+'</button></div></section>';
 }
 
 function _projectRenderOverview(data) {
@@ -45619,34 +46487,52 @@ function _projectRenderOverview(data) {
       : current ? 'active' : done ? 'done' : 'pending';
     return `<div class="project-timeline-step ${done?'done':''}"><span></span><strong>${esc(phase[0].toUpperCase()+phase.slice(1))}</strong><small>${esc(label)}</small></div>`;
   }).join('');
-  const taskRows=cards.slice().sort((a,b)=>{
+  const ordered=cards.slice().sort((a,b)=>{
     const phaseOrder={working:0,waiting:1,verifying:2,ready:3,intake:4,backlog:5,verified:6,closed:7};
     const ar=phaseOrder[a.phase] ?? 50, br=phaseOrder[b.phase] ?? 50;
     return ar===br ? _projectCardUpdated(b)-_projectCardUpdated(a) : ar-br;
-  }).map(c=>{
+  });
+  const taskRows=ordered.slice(0,4).map(c=>{
     const st=_projectTaskDisplay(c);
-    return `<tr><td>${esc(c.id)}</td><td>${esc(_projectClip(c.title,54))}</td><td><span class="project-status-chip ${esc(st.cls)}" title="${esc(st.detail || st.label)}">${esc(st.label)}</span>${st.detail?` <small class="project-muted">${esc(_projectClip(st.detail,90))}</small>`:''}</td><td>${esc(_projectShortDate(_projectCardUpdated(c)))}</td></tr>`;
+    return `<tr><td><button class="project-link" onclick="_projectSetTab('tasks');setTimeout(()=>_projectSelectTask('${escJs(c.id)}'),0)">${esc(c.id)}</button></td><td>${esc(_projectClip(c.title,54))}</td><td><span class="project-status-chip ${esc(st.cls)}" title="${esc(st.detail || st.label)}">${esc(st.label)}</span></td></tr>`;
   }).join('');
-  const runs=cards.filter(c=>c.execution_plan?.execution?.stage || c.execution_plan?.execution?.report).slice().sort((a,b)=>_projectCardUpdated(b)-_projectCardUpdated(a)).slice(0,5).map(c=>{const st=_projectTaskDisplay(c);return `<li><span class="project-run-dot ${c.phase==='verified'?'ok':''}"></span><button class="project-link" onclick="_projectSetTab('tasks');setTimeout(()=>_projectSelectTask('${escJs(c.id)}'),0)">${esc(c.id)}</button><span>${esc(_projectClip(st.label,40))}</span><small>${esc(_projectShortDate(_projectCardUpdated(c)))}</small></li>`}).join('');
-  const deps=cards.filter(c=>(c.depends_on||[]).length || c.execution_plan?.waiting_label || c.execution_plan?.waiting_reason).slice(0,4).map(c=>`<li><button class="project-link" onclick="_projectSetTab('dependencies')">${esc(c.id)}</button><span>${esc(_projectClip(c.execution_plan?.waiting_label || ((c.depends_on||[]).length+' explicit dependencies'),80))}</span></li>`).join('');
-  const evidenceSummary=['md','json','txt','png','webm'].map(ext=>[ext,assets.filter(a=>(a.asset?.source?.path||a.asset?.path||'').endsWith('.'+ext)).length]).filter(x=>x[1]).map(([ext,n])=>`<li><span>${esc(ext.toUpperCase())} artifacts</span><strong>${n}</strong></li>`).join('') || '<li><span>No retained artifacts yet</span><strong>0</strong></li>';
+  const holds=cards.filter(c=>c.phase==='waiting' && c.execution_plan?.waiting_reason && !/^(executor_capacity|project_paused|project_disabled|required_output:)/.test(c.execution_plan.waiting_reason));
+  const working=ordered.find(c=>_projectTaskDisplay(c).cls==='working');
+  const focus=awaitingReview?'<strong>Your review is the next step</strong><p>Automated checks have completed. Inspect the evidence before you decide whether to publish.</p><button class="btn primary" onclick="_projectSetTab(\'evidence\')">Review evidence</button>'
+    : projectAccepted?'<strong>Approved and published</strong><p>The candidate was accepted. Its evidence and worker history remain available.</p>'
+    : working?'<strong>Working now: '+esc(working.id)+' · '+esc(_projectClip(working.title,90))+'</strong><p>Amux is continuing this task. '+(holds.length?holds.length+' other task'+(holds.length===1?' is':'s are')+' held.':'No action is needed right now.')+'</p><button class="project-link" onclick="_projectSetTab(\'tasks\');setTimeout(()=>_projectSelectTask(\''+escJs(working.id)+'\'),0)">Open current task →</button>'
+    : holds.length?'<strong>'+holds.length+' task'+(holds.length===1?' is':'s are')+' held</strong><p>Open the task to see the cause and repair status. Amux will continue other runnable work.</p><button class="project-link" onclick="_projectSetTab(\'tasks\');setTimeout(()=>_projectSelectTask(\''+escJs(holds[0].id)+'\'),0)">Open '+esc(holds[0].id)+' →</button>'
+    : '<strong>Amux is preparing the next step</strong><p>Task and verification details will appear as the project progresses.</p>';
   const primaryWorkspace=_projectPrimaryWorkspace(data);
   const repo=policy.repository||'';
   const checkoutPath=primaryWorkspace?.path || repo;
-  const checkoutLabel=primaryWorkspace?.path ? _projectDisplayPath(primaryWorkspace.path) : (projectAccepted && policy.worktree?'Published in main · '+_projectDisplayPath(repo):policy.worktree===false?'Shared checkout':'One project worktree');
+  const checkoutLabel=primaryWorkspace?.path ? _projectDisplayPath(primaryWorkspace.path) : (projectAccepted && policy.worktree?'Published in origin/main · '+_projectDisplayPath(repo):policy.worktree===false?'Shared checkout':'One project worktree');
   const context=`<dl class="project-context"><dt>Repository</dt><dd>${repo?_projectCheckoutPathButton(repo,_projectDisplayPath(repo)):'Not configured'}</dd><dt>Checkout</dt><dd>${checkoutPath?_projectCheckoutPathButton(checkoutPath,checkoutLabel):esc(policy.worktree===false?'Shared checkout':'One project worktree')}</dd><dt>Planner</dt><dd>${esc([policy.coordinator?.provider,policy.coordinator?.model,policy.coordinator?.effort].filter(Boolean).join(' · ')||'—')}</dd><dt>Executor</dt><dd>${esc([policy.executor?.provider,policy.executor?.model,policy.executor?.effort].filter(Boolean).join(' · ')||'—')}</dd><dt>Host tools</dt><dd>${policy.executor_full_host_access?'Full access for local tools':'Sandboxed'}</dd><dt>Gate</dt><dd>${esc(policy.verify_command||'Not configured')}</dd></dl>`;
-  const html=_projectOutcomeCard(data)+`<section class="project-overview-card wide"><h3>Project timeline</h3><div class="project-timeline">${timeline}</div></section><section class="project-overview-card"><h3>Project context</h3>${context}</section><section class="project-overview-card wide"><div class="project-card-heading"><h3>Tasks</h3><button class="project-link" onclick="_projectSetTab('tasks')">View kanban →</button></div><table class="project-task-table"><thead><tr><th>ID</th><th>Title</th><th>Status</th><th>Updated</th></tr></thead><tbody>${taskRows||'<tr><td colspan="4">No tasks yet</td></tr>'}</tbody></table></section><section class="project-overview-card"><div class="project-card-heading"><h3>Recent runs</h3><button class="project-link" onclick="_projectSetTab('tasks')">View all →</button></div><ul class="project-run-list">${runs||'<li><span>No runs yet</span></li>'}</ul></section><section class="project-overview-card"><div class="project-card-heading"><h3>Dependencies</h3><button class="project-link" onclick="_projectSetTab('dependencies')">View all →</button></div><ul class="project-run-list">${deps||'<li><span>No active dependency holds</span></li>'}</ul></section><section class="project-overview-card"><div class="project-card-heading"><h3>Evidence summary</h3><button class="project-link" onclick="_projectSetTab('evidence')">View all →</button></div><ul class="project-evidence-summary">${evidenceSummary}</ul></section><section class="project-overview-card"><h3>Review note</h3><p>${esc(acc.reason ? acc.reason.replaceAll('_',' ') : (acc.state ? 'Acceptance state: '+acc.state : 'Whole-project acceptance has not run yet.'))}</p></section>`;
+  const more=_projectDisclosure('project_context','Timeline and technical setup',`<div class="project-timeline">${timeline}</div>${context}`);
+  const html=_projectOutcomeCard(data)+`<section class="project-overview-card project-next" aria-label="Next step">${focus}</section><section class="project-overview-card project-task-preview"><div class="project-card-heading"><h3>Tasks <span class="project-muted">${cards.length}</span></h3><button class="project-link" onclick="_projectSetTab('tasks')">View all tasks →</button></div><table class="project-task-table"><thead><tr><th>ID</th><th>Title</th><th>Status</th></tr></thead><tbody>${taskRows||'<tr><td colspan="3">No tasks yet</td></tr>'}</tbody></table>${cards.length>4?'<p class="project-muted">Showing 4 of '+cards.length+' tasks.</p>':''}</section><section class="project-overview-card project-evidence-preview"><div class="project-card-heading"><h3>Proof to inspect</h3><button class="project-link" onclick="_projectSetTab('evidence')">View evidence →</button></div><p>${assets.length} retained artifact${assets.length===1?'':'s'}. Whole-project checks and review decisions are in Evidence.</p></section>${more}`;
   if(el.dataset.sig!==html){el.dataset.sig=html;el.innerHTML=html;}
 }
 function _projectRenderEvidencePanel(data) {
   const el=document.getElementById('project-evidence-panel'); if(!el) return;
   const assets=_projectAssets(data);
-  const rows=assets.map(a=>{
-    const path=a.asset?.source?.path || a.asset?.path || '';
-    const click=a.acceptance?`_projectAcceptanceRetainedAsset(${a.index})`:`_projectAssetPreview('${escJs(a.card.id)}',${a.index})`;
-    return `<article class="project-overview-card"><h3>${esc(a.card.id)} · ${esc(_projectClip(a.card.title||'Evidence',80))}</h3><p>${esc(path||'Retained evidence')}</p>${path?`<button class="btn" onclick="${click}">Open artifact</button>`:''}</article>`;
-  }).join('') || '<p class="project-empty" role="status">No retained artifacts yet. Completed project tasks must report Markdown, JSON, PNG or WebM assets.</p>';
-  if(el.dataset.sig!==rows){el.dataset.sig=rows;el.innerHTML=rows;}
+  const groups=new Map();
+  assets.forEach(a=>{
+    const id=a.card.id||'project';
+    if(!groups.has(id)) groups.set(id,[]);
+    groups.get(id).push(a);
+  });
+  const rows=[...groups].map(([id,items])=>{
+    const links=items.map(a=>{
+      const path=a.asset?.source?.path || a.asset?.path || '';
+      const click=a.acceptance?`_projectAcceptanceRetainedAsset(${a.index})`:`_projectAssetPreview('${escJs(a.card.id)}',${a.index})`;
+      return path?`<li><button class="project-link" onclick="${click}">${esc(path)}</button></li>`:'';
+    }).join('');
+    return _projectDisclosure('evidence_'+id,id+' · '+items.length+' artifact'+(items.length===1?'':'s')+' · '+_projectClip(items[0]?.card.title||'Evidence',70),'<ul class="project-asset-list">'+links+'</ul>');
+  }).join('') || '<p class="project-empty" role="status">No retained files yet. The lead should produce reviewable evidence before requesting approval.</p>';
+  const lead=data.project?.policy?.mode==='lead';
+  const intro=lead?'Review the produced files and the independent checks before approving the whole outcome.':'Check the complete outcome before approving it. Task files are supporting evidence; only whole-project checks establish that the requested result works.';
+  const html='<section class="project-evidence-intro"><h3>Proof and review</h3><p>'+intro+'</p>'+_projectAcceptanceHtml(data.acceptance||{})+'</section><div class="project-evidence-groups"><h3>Retained files · '+assets.length+'</h3>'+rows+'</div>';
+  if(el.dataset.sig!==html){el.dataset.sig=html;el.innerHTML=html;}
 }
 function _projectRenderDependencyPanel(data) {
   const el=document.getElementById('project-dependencies-panel'); if(!el) return;
@@ -45691,9 +46577,12 @@ async function _projectResumeWorker(name) {
   await resumeWorker(name);
   setTimeout(()=>openPeek(name),250);
 }
-function _projectWorkerAction(worker,runtime) {
+function _projectWorkerAction(worker,runtime,lead=false) {
   const name=worker?.name||'';
   if(!name) return '';
+  if(lead && runtime.lifecycle==='expired') return worker?.history_log
+    ? `<button class="btn" onclick="openFilePreview('${escJs(worker.history_log)}')">Review worker log</button>`
+    : '<span class="project-muted">Worker log unavailable; review the project plan and evidence.</span>';
   if(runtime.lifecycle==='expired' || worker?.resumable) return `<button class="btn" onclick="_projectResumeWorker('${escJs(name)}')">Resume and open</button>`;
   if(runtime.preparing) return '<span class="project-muted">Worker and checkout are being prepared automatically.</span>';
   if(runtime.lifecycle==='missing') return '<span class="project-muted">No worker env remains; retained task evidence is still listed.</span>';
@@ -45712,7 +46601,11 @@ function _projectWorkerAction(worker,runtime) {
 }
 function _projectRenderWorkersPanel(data) {
   const el=document.getElementById('project-workers-panel'); if(!el) return;
-  const workers=_projectWorkers(data).slice().sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
+  const lead=data.project?.policy?.mode==='lead';
+  const workers=_projectWorkers(data).slice().sort((a,b)=>{
+    const rank=w=>{const r=_projectWorkerRuntime(w);return r.running?0:r.lifecycle==='review'?1:r.lifecycle==='paused'?2:r.lifecycle==='expired'?4:3;};
+    return rank(a)-rank(b) || String(a.name||'').localeCompare(String(b.name||''));
+  });
   const closeout=_projectCloseoutBanner(data,false);
   const rows=workers.map(worker=>{
     const runtime=_projectWorkerRuntime(worker);
@@ -45722,9 +46615,11 @@ function _projectRenderWorkersPanel(data) {
     const checkout=worker.workspace_available===true ? workspace.path : '';
     const tasks=(worker.tasks||[]).slice().sort((a,b)=>Number(b.updated||0)-Number(a.updated||0)).map(t=>`<li><button class="project-link" onclick="_projectSetTab('tasks');setTimeout(()=>_projectSelectTask('${escJs(t.id)}'),0)">${esc(t.id)}</button><span>${esc(_projectClip(t.title||'',72))}</span><small>${esc(t.display_label||t.phase||t.status||'')}${t.stage?' · '+esc(t.stage):''}</small></li>`).join('');
     const checkoutHtml=checkout?_projectCheckoutPathButton(checkout):integration?.status==='integrated'?'Removed after publish · '+_projectCheckoutPathButton(workspace.repo||env.dir,'Open repository'):runtime.preparing?'Preparing checkout':'Checkout unavailable';
-    const facts='<dl class="project-context"><dt>Lifecycle</dt><dd><span class="project-status-chip '+esc(runtime.lifecycle)+'">'+esc(runtime.label)+'</span></dd><dt>Tasks</dt><dd>'+esc(String(worker.verified_tasks||0))+' verified · '+esc(String(worker.active_tasks||0))+' active · '+esc(String(worker.task_count||0))+' total</dd><dt>Model</dt><dd>'+esc(model||'Not recorded')+'</dd><dt>Checkout</dt><dd>'+checkoutHtml+'</dd><dt>Branch</dt><dd>'+esc(workspace.branch||(runtime.preparing?'Not assigned yet':'Not recorded'))+'</dd><dt>Integration</dt><dd>'+esc(integration?.status || 'No integration receipt')+(integration?.head?' · '+esc(String(integration.head).slice(0,12)):'')+'</dd></dl>';
-    return '<article class="project-overview-card project-worker-card"><div class="project-card-heading"><h3>'+esc(worker.name||'worker')+'</h3>'+_projectWorkerAction(worker,runtime)+'</div>'+facts+'<div class="project-card-heading"><h3>Tasks</h3><span class="project-muted">'+esc(String(worker.retained_assets||0))+' retained assets</span></div><ul class="project-run-list">'+(tasks||'<li><span>No project tasks recorded for this worker</span></li>')+'</ul></article>';
-  }).join('') || '<p class="project-empty" role="status">No workers have been assigned to this project yet. Workers appear here after project tasks are claimed, and remain listed after pause, archive or expiration.</p>';
+    const facts='<dl class="project-context"><dt>Lifecycle</dt><dd><span class="project-status-chip '+esc(runtime.lifecycle)+'">'+esc(runtime.label)+'</span></dd>'+(lead?'': '<dt>Tasks</dt><dd>'+esc(String(worker.verified_tasks||0))+' verified · '+esc(String(worker.active_tasks||0))+' active · '+esc(String(worker.task_count||0))+' total</dd>')+'<dt>Model</dt><dd>'+esc(model||'Not recorded')+'</dd><dt>Checkout</dt><dd>'+checkoutHtml+'</dd><dt>Branch</dt><dd>'+esc(workspace.branch||(runtime.preparing?'Not assigned yet':'Not recorded'))+'</dd><dt>Integration</dt><dd>'+esc(integration?.status || 'No integration receipt')+(integration?.head?' · '+esc(String(integration.head).slice(0,12)):'')+'</dd></dl>';
+    const details=_projectDisclosure('worker_'+worker.name,lead?'Checkout and model':'Checkout, model and task history',facts+(lead?'':'<ul class="project-run-list">'+(tasks||'<li><span>No project tasks recorded for this worker</span></li>')+'</ul>'));
+    const summary=lead?'Lead worker · '+esc(String((data.acceptance?.review_assets||[]).length))+' review files':esc(String(worker.verified_tasks||0))+' verified · '+esc(String(worker.active_tasks||0))+' active · '+esc(String(worker.retained_assets||0))+' files';
+    return '<article class="project-overview-card project-worker-card"><div class="project-card-heading"><h3>'+esc(worker.name||'worker')+'</h3><span class="project-status-chip '+esc(runtime.lifecycle)+'">'+esc(runtime.label)+'</span></div><p>'+summary+'</p><div class="project-worker-actions">'+_projectWorkerAction(worker,runtime,lead)+'</div>'+details+'</article>';
+  }).join('') || '<p class="project-empty" role="status">'+(lead?'The project lead is being prepared.':'No workers have been assigned to this project yet.')+'</p>';
   const html=closeout+rows;
   if(el.dataset.sig!==html){el.dataset.sig=html;el.innerHTML=html;}
 }
@@ -45739,7 +46634,7 @@ async function _projectsLoad() {
   const current=()=>token===_projectsToken && activeView==='projects';
   const root=document.getElementById('projects-view');
   if(!document.getElementById('project-selector')) {
-    root.innerHTML='<div class="project-heading project-hero"><div><h2>Projects</h2><p>Turn a requested outcome into accountable tasks, a verified candidate, human review and one approved publish.</p></div><label class="project-select-control">Project <select id="project-selector" onchange="_projectChoose(this.value)"></select></label><button class="btn primary" onclick="_projectChoose(\'\')">+ New project</button></div><div id="project-error-box" class="project-error-box"><p id="project-error" role="alert"></p><button class="btn" id="project-error-retry" hidden onclick="_projectRetryNow()">Retry now</button></div><div class="project-shell"><aside id="project-list" class="project-list" aria-label="Projects"></aside><main id="project-detail" class="project-detail"></main></div>';
+    root.innerHTML='<div class="project-heading project-hero"><div><h2>Projects</h2><p>Give one lead worker an outcome. Review its verified result before publishing.</p></div><label class="project-select-control">Project <select id="project-selector" onchange="_projectChoose(this.value)"></select></label><button class="btn primary" onclick="_projectChoose(\'\')">+ New project</button></div><div id="project-error-box" class="project-error-box"><p id="project-error" role="alert"></p><button class="btn" id="project-error-retry" hidden onclick="_projectRetryNow()">Retry now</button></div><div class="project-shell"><aside id="project-list" class="project-list" aria-label="Projects"></aside><main id="project-detail" class="project-detail"></main></div>';
     _projectsName=_projectStorage('selected');
   }
   try {
@@ -45748,9 +46643,11 @@ async function _projectsLoad() {
     const select=document.getElementById('project-selector');
     const options='<option value="">New project</option>'+inventory.projects.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
     if(select.innerHTML!==options) select.innerHTML=options;select.value=_projectsName;
+    await fetchSessions();
+    if(!current()) return;
     _projectRenderInventory(inventory.projects);
     if(!_projectsName) {
-      if(!document.getElementById('project-config')) document.getElementById('project-detail').innerHTML=(inventory.projects.length?'':'<p class="project-empty" role="status">No projects yet. Create one to describe an outcome and follow its tasks and evidence.</p>')+_projectConfig(null)
+      if(!document.getElementById('project-config')) document.getElementById('project-detail').innerHTML=(inventory.projects.length?'':'<p class="project-empty" role="status">No projects yet. Create one to describe an outcome and review its verified result.</p>')+_projectConfig(null)
       if(document.getElementById('project-config') && !document.getElementById('project-config').dataset.restored) {document.getElementById('project-config').dataset.restored='1';_projectSettingsRestore();}
     } else {
       const expected=_projectsName;const data=await _projectRequest('/'+encodeURIComponent(expected),'GET',undefined,abort.signal);
@@ -45761,12 +46658,12 @@ async function _projectsLoad() {
       // task still rendered an older `registered, running` snapshot until a
       // page reload. The shared sessions fetch is conditional (ETag/304) and
       // coalesced, so make the join current before rendering it.
-      await fetchSessions();
       if(!current() || expected!==_projectsName) return;
       if(!_projectsData) {
         document.getElementById('project-detail').innerHTML=_projectDetailTemplate(data.project);
         document.getElementById('project-command').value=_projectStorage('draft_'+expected);
         _projectBindUi();
+        if(document.getElementById('project-command').value.trim()) document.querySelector('.project-update').open=true;
       }
       _projectsData=data;_projectRender(data);
     }
@@ -45798,7 +46695,8 @@ function _projectEffortOptions(value) {
   return ['', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(v=>'<option value="'+esc(v)+'" '+(v===(value||'')?'selected':'')+'>'+(v?esc(v):'Provider default')+'</option>').join('');
 }
 function _projectConfig(project) {
-  const p=project?.policy || {repository:'',worktree:true,coordinator:{provider:'codex',model:'gpt-6-luna',effort:'low'},executor:{provider:'codex',model:'gpt-6-luna',effort:'low'},executor_full_host_access:false,verify_command:'',max_executors:1,max_attempts:2,acceptance:{criteria:[{id:'human-review',requirement:'A person reviewed the produced artifacts against the requested outcome',verifier:{type:'human',id:'artifact-review',instructions:'Open the retained reports, screenshots, videos and task evidence below. Approve only when the integrated result matches the requested outcome.'}}]}};
+  const p=project?.policy || {repository:'',mode:'lead',worktree:true,coordinator:{provider:'codex',model:'gpt-6-luna',effort:'low'},executor:{provider:'codex',model:'gpt-6-luna',effort:'low'},executor_full_host_access:false,verify_command:'git diff --check',max_executors:1,max_attempts:2,acceptance:{criteria:[{id:'candidate-check',requirement:'The committed project candidate passes the baseline repository check',verifier:{type:'command',id:'candidate-check',command:'git diff --check'}},{id:'human-review',requirement:'A person reviewed the produced artifacts against the requested outcome',verifier:{type:'human',id:'artifact-review',instructions:'Open the retained reports, screenshots, videos and project evidence below. Approve only when the integrated result matches the requested outcome.'}}]}};
+  const lead=p.mode==='lead';
   // A new project's Repository starts with the SAME default the create-worker
   // form's Working directory field uses (Ethan 2026-09-23) instead of an
   // empty required field: the last-browsed directory, or /root in cloud mode.
@@ -45815,7 +46713,7 @@ function _projectConfig(project) {
   const draftBlock=project?'':(
     '<div class="project-draft-box">'+
       '<label>Describe what you want, and this fills in the fields below<textarea id="project-draft-input" rows="3" placeholder="e.g. Add a /health endpoint that checks the DB connection and returns 503 if it is down, with a test that hits it"></textarea></label>'+
-      hint('Fills in the project name, verification command and acceptance requirement from your description — review everything below before creating. Uses your planning model and repository-scoped spec references. Proposed whole-project verifier scripts become deliverables; review their scope before creating.')+
+      hint('Fills in the project name, verification command and acceptance requirement from your description. Review them before creating.')+
       '<button class="btn" type="button" id="project-draft-btn" onclick="_projectDraftFields()">Fill in the fields</button> <span id="project-draft-state" role="status"></span>'+
     '</div>'
   );
@@ -45824,23 +46722,22 @@ function _projectConfig(project) {
     '<div class="project-form-grid">'+
     '<label>Project name<input id="project-name" required pattern="[a-z0-9][a-z0-9_\\-]{0,47}" value="'+esc(project?.name || '')+'" '+(project?'readonly':'')+'></label>'+
     '<label>Repository<span class="ac-wrap" style="display:block"><input id="project-repository" required placeholder="/absolute/path/to/repository" autocomplete="off" autocorrect="off" spellcheck="false" value="'+esc(p.repository)+'" oninput="repoAcFetch(this.value)" onfocus="repoAcFetch(this.value)" onkeydown="repoAcKeydown(event)"><span id="project-repo-ac-list" class="ac-list"></span></span>'+hint('The absolute path to the git checkout this project works in.')+'</label>'+
-    '<label>Executor provider<select id="project-provider" onchange="_projectModelOptions(\'executor\',this.value)">'+['claude','codex','gemini','ollama'].map(v=>'<option '+(v===p.executor.provider?'selected':'')+'>'+v+'</option>').join('')+'</select>'+hint('Which AI does the work on each task.')+'</label>'+
-    '<label>Executor model<input id="project-executor" list="project-executor-models" required value="'+esc(p.executor.model)+'"><datalist id="project-executor-models">'+_projectModelSuggestions(p.executor.provider)+'</datalist></label>'+
-    '<label>Verification command<input id="project-verify" required placeholder="./verify.sh" value="'+esc(p.verify_command)+'"></label>'+hint('Baseline check after each task, in addition to its own acceptance checks. Whole-project runtime proof is defined below.')+
+    '<label>'+(lead?'Lead worker':'Executor')+' provider<select id="project-provider" onchange="_projectModelOptions(\'executor\',this.value)">'+['claude','codex','gemini','ollama'].map(v=>'<option '+(v===p.executor.provider?'selected':'')+'>'+v+'</option>').join('')+'</select>'+hint(lead?'One persistent worker owns this project until verification or a real human decision.':'Which AI does the work on each task.')+'</label>'+
+    '<label>'+(lead?'Lead worker':'Executor')+' model<input id="project-executor" list="project-executor-models" required value="'+esc(p.executor.model)+'"><datalist id="project-executor-models">'+_projectModelSuggestions(p.executor.provider)+'</datalist></label>'+
+    '<label>Verification command<input id="project-verify" required placeholder="./verify.sh" value="'+esc(p.verify_command)+'"></label>'+hint(lead?'Repository check for the committed candidate. The independent outcome checks below decide whether it is ready for review.':'Baseline check after each task, in addition to its own acceptance checks. Whole-project runtime proof is defined below.')+
     '</div>'+
-    '<label>Whole-project acceptance contract (JSON)<textarea id="project-contract" rows="8" data-default="'+esc(p.acceptance?JSON.stringify(p.acceptance,null,2):'')+'" placeholder="{&quot;criteria&quot;:[{&quot;id&quot;:&quot;e2e&quot;,&quot;requirement&quot;:&quot;The end-to-end lifecycle passes&quot;,&quot;verifier&quot;:{&quot;type&quot;:&quot;execution&quot;,&quot;id&quot;:&quot;e2e-suite&quot;,&quot;command&quot;:&quot;./scripts/e2e.sh&quot;,&quot;receipt&quot;:&quot;artifacts/execution.json&quot;,&quot;required_stages&quot;:[&quot;build&quot;,&quot;lifecycle&quot;],&quot;assertions&quot;:[{&quot;stage&quot;:&quot;build&quot;,&quot;artifact&quot;:&quot;artifacts/raw.json&quot;,&quot;pointer&quot;:&quot;/build/passed&quot;,&quot;operator&quot;:&quot;equals&quot;,&quot;expected&quot;:&quot;true&quot;},{&quot;stage&quot;:&quot;lifecycle&quot;,&quot;artifact&quot;:&quot;artifacts/raw.json&quot;,&quot;pointer&quot;:&quot;/objects&quot;,&quot;operator&quot;:&quot;at_least&quot;,&quot;expected&quot;:&quot;100&quot;}]},&quot;evidence&quot;:[&quot;artifacts/execution.json&quot;,&quot;artifacts/raw.json&quot;]}]}">'+esc(p.acceptance?JSON.stringify(p.acceptance,null,2):'')+'</textarea></label>'+hint('What a task must prove to count as done. This runs independently on the composed, unpublished candidate: a runtime/e2e claim needs a fresh execution receipt, a raw measurement per stage, and retained evidence. Human approval publishes that exact candidate to <code>origin/main</code>.')+
+    '<label>Whole-project acceptance contract (JSON)<textarea id="project-contract" rows="8" data-default="'+esc(p.acceptance?JSON.stringify(p.acceptance,null,2):'')+'" placeholder="{&quot;criteria&quot;:[{&quot;id&quot;:&quot;e2e&quot;,&quot;requirement&quot;:&quot;The end-to-end lifecycle passes&quot;,&quot;verifier&quot;:{&quot;type&quot;:&quot;execution&quot;,&quot;id&quot;:&quot;e2e-suite&quot;,&quot;command&quot;:&quot;./scripts/e2e.sh&quot;,&quot;receipt&quot;:&quot;artifacts/execution.json&quot;,&quot;required_stages&quot;:[&quot;build&quot;,&quot;lifecycle&quot;],&quot;assertions&quot;:[{&quot;stage&quot;:&quot;build&quot;,&quot;artifact&quot;:&quot;artifacts/raw.json&quot;,&quot;pointer&quot;:&quot;/build/passed&quot;,&quot;operator&quot;:&quot;equals&quot;,&quot;expected&quot;:&quot;true&quot;},{&quot;stage&quot;:&quot;lifecycle&quot;,&quot;artifact&quot;:&quot;artifacts/raw.json&quot;,&quot;pointer&quot;:&quot;/objects&quot;,&quot;operator&quot;:&quot;at_least&quot;,&quot;expected&quot;:&quot;100&quot;}]},&quot;evidence&quot;:[&quot;artifacts/execution.json&quot;,&quot;artifacts/raw.json&quot;]}]}">'+esc(p.acceptance?JSON.stringify(p.acceptance,null,2):'')+'</textarea></label>'+hint('The exact checks Amux runs on the unpublished candidate. A runtime/e2e claim needs fresh measured evidence. Human approval publishes only the reviewed candidate to <code>origin/main</code>.')+
     '<details class="project-settings"><summary>Advanced settings</summary><div class="project-form-grid">'+
-    '<label>Project checkout<select id="project-worktree" onchange="_projectCheckoutChanged()"><option value="1" '+(worktree?'selected':'')+'>One project worktree (default)</option><option value="0" '+(!worktree?'selected':'')+'>Shared project checkout (single executor)</option></select></label>'+hint('All project workers share one branch and checkout under the repository’s .worktrees folder. Tasks execute one at a time to prevent conflicting edits.')+
-    '<label>Planning model provider<select id="project-coordinator-provider" onchange="_projectModelOptions(\'coordinator\',this.value)">'+['claude','codex'].map(v=>'<option '+(v===p.coordinator.provider?'selected':'')+'>'+v+'</option>').join('')+'</select>'+hint('The AI that decomposes your request into tasks, before any executor runs.')+'</label>'+
-    '<label>Planning model<input id="project-coordinator" list="project-coordinator-models" required value="'+esc(p.coordinator.model)+'"><datalist id="project-coordinator-models">'+_projectModelSuggestions(p.coordinator.provider)+'</datalist></label>'+
-    '<label>Planning effort<select id="project-coordinator-effort">'+_projectEffortOptions(coordinatorEffort)+'</select></label>'+
+    '<label>Project checkout<select id="project-worktree" onchange="_projectCheckoutChanged()"><option value="1" '+(worktree?'selected':'')+'>One project worktree (default)</option><option value="0" '+(!worktree?'selected':'')+'>Shared project checkout (single executor)</option></select></label>'+hint(lead?'The lead owns one branch and checkout under the repository’s .worktrees folder.':'Project workers share one branch and checkout under the repository’s .worktrees folder.')+
+    (lead?'<input id="project-coordinator-provider" type="hidden" value="'+esc(p.coordinator.provider)+'">':'<label>Planning model provider<select id="project-coordinator-provider" onchange="_projectModelOptions(\'coordinator\',this.value)">'+['claude','codex'].map(v=>'<option '+(v===p.coordinator.provider?'selected':'')+'>'+v+'</option>').join('')+'</select>'+hint('The AI that decomposes your request into tasks, before any executor runs.')+'</label>')+
+    (lead?'<input id="project-coordinator" type="hidden" value="'+esc(p.coordinator.model)+'"><input id="project-coordinator-effort" type="hidden" value="'+esc(coordinatorEffort)+'">':'<label>Planning model<input id="project-coordinator" list="project-coordinator-models" required value="'+esc(p.coordinator.model)+'"><datalist id="project-coordinator-models">'+_projectModelSuggestions(p.coordinator.provider)+'</datalist></label><label>Planning effort<select id="project-coordinator-effort">'+_projectEffortOptions(coordinatorEffort)+'</select></label>')+
     '<label>Executor effort<select id="project-executor-effort">'+_projectEffortOptions(executorEffort)+'</select></label>'+
     '<label>Codex executor host tools<select id="project-executor-host-access"><option value="0" '+(!p.executor_full_host_access?'selected':'')+'>Sandboxed (default)</option><option value="1" '+(p.executor_full_host_access?'selected':'')+'>Full host access (for local Docker)</option></select></label>'+hint('Codex is sandboxed by default: no access to your host\'s Docker, devices or network beyond the checkout. Choose Full host access only if a task must control local Docker or another host resource directly.')+
     '<input id="project-capacity" type="hidden" value="1">'+
     '<label>Timeout per verification command (seconds)<input id="project-verification-timeout" type="number" required min="1" max="3600" step="1" value="'+esc(String(p.verification_timeout_secs ?? 600))+'"></label>'+
-    '<label>Attempts per task<input id="project-attempts" type="number" min="1" max="5" value="'+esc(String(p.max_attempts))+'"></label>'+hint('How many times a task retries against the verification command before it is flagged for human review.')+
+    (lead?'<input id="project-attempts" type="hidden" value="'+esc(String(p.max_attempts))+'">':'<label>Attempts per task<input id="project-attempts" type="number" min="1" max="5" value="'+esc(String(p.max_attempts))+'"></label>'+hint('How many times a task retries against the verification command before it is flagged for human review.'))+
     '<label>Observed token stop limit<input id="project-token-budget" type="number" min="1" value="'+esc(String(p.token_budget || ''))+'"></label>'+
-    '<label>Estimated dollar stop limit<input id="project-cost-budget" type="number" min="0.01" step="0.01" value="'+esc(String(p.cost_budget_usd || ''))+'"></label>'+hint('amux stops a task and flags it for review once its observed usage crosses either limit — a running provider can exceed them before that check lands. Leave blank for no limit.')+
+    '<label>Estimated dollar stop limit<input id="project-cost-budget" type="number" min="0.01" step="0.01" value="'+esc(String(p.cost_budget_usd || ''))+'"></label>'+hint('Amux pauses the lead and flags the project for review once observed usage crosses either limit. A running turn can exceed the limit before the check lands. Leave blank for no limit.')+
     '</div></details>'+
     '<button class="btn primary" type="submit">'+(project?'Save settings':'Create project')+'</button> <button class="btn" type="button" id="project-settings-cancel" onclick="_projectSettingsCancel()">Cancel</button> <span id="project-settings-state" role="status"></span></form>';
 }
@@ -45854,7 +46751,10 @@ async function _projectDraftFields() {
   if (btn) btn.disabled=true;
   if (state) state.textContent='Thinking…';
   try {
-    const r=await fetch(API+'/api/projects/draft',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},_authHeaders()),body:JSON.stringify({description,repository:document.getElementById('project-repository').value.trim(),coordinator:{provider:document.getElementById('project-coordinator-provider').value,model:document.getElementById('project-coordinator').value.trim(),effort:document.getElementById('project-coordinator-effort').value||undefined}}),signal:AbortSignal.timeout(510000)});
+    const provider=document.getElementById('project-provider').value;
+    const draftProvider=['codex','claude'].includes(provider)?provider:document.getElementById('project-coordinator-provider').value;
+    const draftModel=draftProvider===provider?document.getElementById('project-executor').value.trim():document.getElementById('project-coordinator').value.trim();
+    const r=await fetch(API+'/api/projects/draft',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},_authHeaders()),body:JSON.stringify({description,repository:document.getElementById('project-repository').value.trim(),coordinator:{provider:draftProvider,model:draftModel,effort:document.getElementById('project-executor-effort').value||undefined}}),signal:AbortSignal.timeout(510000)});
     const d=await r.json();
     if (!r.ok || !d.measured) { if(state) state.textContent=d.why_unmeasured||d.error||'Could not draft from that description'; return; }
     const nameEl=document.getElementById('project-name');
@@ -45913,7 +46813,7 @@ async function _projectSave() {
   const executor={provider:value('provider'),model:value('executor')};
   if(value('coordinator-effort')) coordinator.effort=value('coordinator-effort');
   if(value('executor-effort')) executor.effort=value('executor-effort');
-  const policy={repository:value('repository'),worktree,coordinator,executor,executor_full_host_access:value('executor-host-access')==='1',verify_command:value('verify'),verification_timeout_secs:Number(value('verification-timeout')),max_executors:1,max_attempts:Number(value('attempts')),token_budget:value('token-budget')?Number(value('token-budget')):null,cost_budget_usd:value('cost-budget')?Number(value('cost-budget')):null,acceptance,enabled:true,paused:current?.policy.paused || false};
+  const policy={repository:value('repository'),mode:current?.policy.mode||'lead',worktree,coordinator,executor,executor_full_host_access:value('executor-host-access')==='1',verify_command:value('verify'),verification_timeout_secs:Number(value('verification-timeout')),max_executors:1,max_attempts:Number(value('attempts')),token_budget:value('token-budget')?Number(value('token-budget')):null,cost_budget_usd:value('cost-budget')?Number(value('cost-budget')):null,acceptance,enabled:true,paused:current?.policy.paused || false};
   const description=current?'':(document.getElementById('project-draft-input')?.value||'').trim();
   const pendingKey='create_'+name;
   let initial;
@@ -46018,12 +46918,61 @@ function _projectEmptyTasksHtml(data) {
   const intake=_projectIntakeState(data);
   return '<p class="project-empty" role="status">'+esc(intake?.message || 'No tasks yet. Submit an outcome and the planning model will break it into tasks.')+(intake?' <button type="button" class="btn" onclick="_projectSetTab(\'overview\')">View request</button>':'')+'</p>';
 }
+function _projectRenderLead(data) {
+  const p=data.project, lead=data.lead||{}, plan=Array.isArray(lead.plan)?lead.plan:[], acc=data.acceptance||{};
+  const worker=_projectWorkers(data)[0];
+  const finalizing=acc.state==='accepted' && !!worker?.workspace_available;
+  const state=finalizing?'Published · finishing cleanup':acc.state==='accepted'?'Approved and published':acc.state==='awaiting_human'?'Ready for your review':p.policy.paused?'Paused':
+    ({needs_input:'Needs your input',needs_approval:'Needs your approval',blocked_external:'Waiting on an external system',ready_for_verification:'Checking the result',working:'Working on the project'})[lead.state]||'Preparing lead worker';
+  document.getElementById('project-state').textContent=state;
+  document.getElementById('project-pause').textContent=p.policy.paused?'Resume':'Pause';
+  document.getElementById('project-pause').hidden=acc.state==='accepted';
+  document.getElementById('project-pause').disabled=p.policy.paused&&!data.pause_settled;
+  const done=plan.filter(s=>s.state==='done').length;
+  document.getElementById('project-metric-outcomes').textContent=done+' / '+plan.length;
+  document.getElementById('project-metric-outcomes-label').textContent='Plan steps';
+  document.getElementById('project-metric-tasks').textContent=String(plan.filter(s=>s.state==='working').length);
+  document.getElementById('project-metric-tasks-label').textContent='Steps in progress';
+  const accepted=acc.state==='accepted',review=acc.state==='awaiting_human';
+  document.querySelector('#project-panel-overview .project-update').hidden=accepted;
+  document.getElementById('project-progress').textContent=accepted?'The outcome passed independent checks, was approved, and was published. Review files and worker history remain available.':lead.note||'The lead worker will report its current plan here. Independent checks and human review decide when the outcome is delivered.';
+  document.getElementById('project-acceptance').innerHTML=accepted?_projectCloseoutBanner(data,true):review?'<p class="project-wait">Automated checks passed. Review the evidence before publishing.</p>':'';
+  const pending=(data.commands||[]).filter(c=>c.pending);
+  document.getElementById('project-commands').innerHTML=pending.map(c=>'<div class="project-intake"><strong>Request '+Number(c.id)+' · Queued for lead</strong><p>'+esc(_projectClip(c.text,400))+'</p></div>').join('');
+  document.getElementById('project-usage').textContent=(data.usage?.measured?Number(data.usage.tokens||0).toLocaleString()+' observed tokens':'Token usage not yet measured')+' · One lead worker · No AMUX task leases';
+  const checkout=worker?.workspace_available?worker.workspace?.path:null;
+  const workspace=checkout?_projectCheckoutPathButton(checkout):accepted?'Project worktree removed after publication':'Checkout preparing';
+  const next=review?'Review the evidence and decide':finalizing?'Published to origin/main; finishing worker and worktree cleanup':accepted?'Published to origin/main; worker history and evidence retained':state;
+  document.getElementById('project-overview').innerHTML=_projectOutcomeCard(data)+
+    '<section class="project-overview-card project-next"><h3>'+(accepted?'Result':'Next step')+'</h3><p>'+esc(next)+'</p>'+(!accepted&&lead.note?'<p>'+esc(lead.note)+'</p>':'')+
+    (worker?.lifecycle==='expired'&&worker.history_log?'<button class="btn" onclick="openFilePreview(\''+escJs(worker.history_log)+'\')">Review worker log</button>':worker&&worker.lifecycle!=='expired'?'<button class="btn" onclick="openPeek(\''+escJs(worker.name)+'\')">Open lead worker</button>':'')+'</section>'+
+    '<section class="project-overview-card"><h3>Current plan</h3><p>'+done+' of '+plan.length+' steps reported complete. The lead may revise these as it learns; only whole-project checks establish success.</p><button class="project-link" onclick="_projectSetTab(\'tasks\')">View plan →</button></section>'+
+    '<section class="project-overview-card"><h3>Workspace</h3><p>'+workspace+'</p><p>One checkout and one lead worker for this project.</p></section>'+
+    _projectDisclosure('lead_history','Plan and progress history',((data.lead_history||[]).map(e=>'<article class="project-run-list"><strong>'+esc(String(e.progress?.state||'Update').replaceAll('_',' '))+'</strong><p>'+esc(_projectClip(e.progress?.note||'',400))+'</p><small>'+esc(new Date(Number(e.ts||0)*1000).toLocaleString())+'</small></article>').join('')||'<p>No progress reported yet.</p>'));
+  const columns=[['working','Working'],['pending','Next'],['done','Done'],['skipped','Changed plan']];
+  document.getElementById('project-cards').innerHTML=columns.map(([key,label])=>{
+    const steps=plan.filter(s=>s.state===key);
+    return '<section class="project-column" role="group" aria-label="'+label+' plan steps"><h3>'+label+' <span>'+steps.length+'</span></h3><div class="project-column-cards">'+
+      (steps.map(s=>'<article class="project-card"><strong>'+esc(s.title)+'</strong></article>').join('')||'<p class="project-muted">Nothing here</p>')+'</div></section>';
+  }).join('');
+  document.getElementById('project-inspector').innerHTML='<p class="project-muted">The plan is a live view of the lead worker’s thinking. The outcome contract and evidence are in Evidence.</p>';
+  _projectRenderWorkersPanel(data);
+  _projectRenderEvidencePanel(data);
+  _projectApplyTab();
+}
 function _projectRender(data) {
+  if(data.project?.policy?.mode==='lead') { _projectRenderLead(data); return; }
+  document.getElementById('project-pause').hidden=false;
+  document.querySelector('#project-panel-overview .project-update').hidden=false;
   const p=data.project,u=data.usage;
   const retirement=data.acceptance?.executor_retirement;
   const openCards=data.cards.filter(c=>!['verified','closed'].includes(c.phase));
   const allHeld=openCards.length>0 && openCards.every(c=>c.phase==='waiting');
-  document.getElementById('project-state').textContent=data.acceptance?.state==='accepted'?'Published to main · accepted':p.policy.paused?(data.pause_settled?'Paused':'Pausing — stopping executors'):retirement?.state==='review_not_configured'?'Review gate needs configuration — completed executors retained':data.acceptance?.state==='awaiting_human'?'Awaiting human artifact review — completed executors retained without running':!p.policy.enabled?'Disabled':allHeld?'Execution held — inspect task reason':(!openCards.length && _projectIntakeState(data)?.label)||'Driving project outcomes';
+  const live=_projectLiveWorkerState(openCards.filter(c=>c.execution_plan?.execution?.stage==='working').map(c=>c.execution_plan.execution.worker).filter(Boolean));
+  const queuedRepair=openCards.some(c=>c.execution_plan?.execution?.stage==='repair' && c.execution_plan?.action==='claim');
+  const running=openCards.some(c=>['reserved','working','reported','verifying'].includes(c.execution_plan?.execution?.stage));
+  const activeState=live?.label || (queuedRepair?'Repair queued — preparing worker':!running && openCards.length?'Preparing the next task':(!openCards.length && _projectIntakeState(data)?.label)||'Working on the project');
+  document.getElementById('project-state').textContent=data.acceptance?.state==='accepted'?'Approved and published':p.policy.paused?(data.pause_settled?'Paused':'Pausing — stopping workers'):retirement?.state==='review_not_configured'?'Review setup needed':data.acceptance?.state==='awaiting_human'?'Ready for your review':!p.policy.enabled?'Disabled':allHeld?'Task work is held':activeState;
   document.getElementById('project-pause').textContent=p.policy.paused?'Resume':'Pause';
   document.getElementById('project-pause').disabled=p.policy.paused && !data.pause_settled;
   const setText=(id,text)=>{const el=document.getElementById(id);if(el && el.textContent!==text) el.textContent=text;};
@@ -46031,19 +46980,18 @@ function _projectRender(data) {
   if(progress) {delete progress.dataset.stale;}
   const verifiedTasks=data.cards.filter(c=>c.phase==='verified').length,closedTasks=data.cards.filter(c=>c.phase==='closed').length;
   const activeTasks=data.cards.filter(c=>!['verified','closed'].includes(c.phase)).length;
-  const assignedWorkers=new Set(_projectWorkers(data).map(w=>w.name).filter(Boolean));
   const pendingCommands=data.commands.filter(c=>c.pending).length;
   const hasIntakeOutcomes=Number(u.requested_outcomes)>0;
   setText('project-metric-outcomes',hasIntakeOutcomes?u.verified_outcomes+' / '+u.requested_outcomes:verifiedTasks+' / '+data.cards.length);
   setText('project-metric-outcomes-label',hasIntakeOutcomes?'Outcomes verified':'Tasks verified');
   setText('project-metric-tasks',String(activeTasks));
-  setText('project-metric-workers',assignedWorkers.size+' assigned');
-  setText('project-metric-usage',u.measured?u.tokens.toLocaleString()+' tokens':'not measured');
-  setText('project-progress',(hasIntakeOutcomes?u.verified_outcomes+' / '+u.requested_outcomes+' structured outcomes verified · ':'')+verifiedTasks+' of '+data.cards.length+' tasks verified'+(closedTasks?' · '+closedTasks+' closed (not verified)':'')+' · '+pendingCommands+' requests awaiting intake');
+  // Worker history and token accounting belong in Workers and Settings, not
+  // in the first-glance outcome summary.
+  setText('project-progress',(hasIntakeOutcomes?u.verified_outcomes+' of '+u.requested_outcomes+' requested outcomes verified · ':'')+verifiedTasks+' of '+data.cards.length+' tasks checked'+(closedTasks?' · '+closedTasks+' closed without verification':'')+(pendingCommands?' · '+pendingCommands+' request'+(pendingCommands===1?'':'s')+' still being prepared':''));
   const acc=data.acceptance,accEl=document.getElementById('project-acceptance');
   const accHtml=acc && typeof acc.state==='string'
-    ? _projectAcceptanceHtml(acc)
-    : 'Project acceptance: <strong>Not configured</strong> <span class="project-muted">Task verification below is per task and historical. It is not an independent check of the whole project.</span>';
+    ? (acc.state==='accepted'?_projectCloseoutBanner(data,true):acc.state==='awaiting_human'?'<p class="project-wait">Ready for your evidence review. Completed workers are stopped until you decide.</p>':'')
+    : '<span class="project-muted">Whole-project checks are not configured yet.</span>';
   if(accEl && accEl.dataset.sig!==accHtml) {accEl.dataset.sig=accHtml;accEl.innerHTML=accHtml;}
   setText('project-usage',u.verified_outcomes+' / '+u.requested_outcomes+' structured outcomes verified · '+u.execution_attempts+' execution attempts · '+u.intake_calls+' intake calls · '+(u.measured?u.tokens.toLocaleString()+' observed tokens':'Token usage not yet observed')+' · Coverage: '+u.intake_calls_measured+'/'+u.intake_calls+' intake calls; '+u.execution_turns_measured+' execution turns measured · '+(u.cost_measured && Number.isFinite(u.estimated_cost_usd)?'$'+u.estimated_cost_usd.toFixed(4)+' estimated cost':'Cost unknown'+(u.cost_reason?' ('+u.cost_reason+')':''))+' · '+(u.execution_cost_turns_measured || 0)+'/'+(u.execution_turns_measured || 0)+' execution turns priced · '+(u.executor_unattributed_turns_measured || 0)+' executor turns outside attempt windows ('+(u.executor_unattributed_tokens || 0)+' tokens)');
   const commands=document.getElementById('project-commands');
@@ -46109,16 +47057,14 @@ function _projectAcceptanceHtml(acc) {
       ? '<button class="btn primary" onclick="_projectAcceptanceDecision(\''+escJs(c.id)+'\',\'approve\')">Approve</button> <button class="btn" onclick="_projectAcceptanceDecision(\''+escJs(c.id)+'\',\'reject\')">Reject</button>' : '';
     return '<li><strong>'+esc(c.requirement)+'</strong> · '+esc(state)+receiptSummary+(result.receipt_error?'<p class="project-wait">Execution proof rejected: '+esc(result.receipt_error)+'</p>':'')+(links?'<div>'+links+'</div>':'')+(result.output?'<details><summary>Verifier output</summary><pre>'+esc(_projectClip(result.output,4000))+'</pre></details>':'')+review+'</li>';
   }).join('');
-  const produced=Array.isArray(acc.review_assets)?acc.review_assets:[];
-  const artifacts=produced.map((x,i)=>x?.asset?.source?.path?'<button class="btn project-report-asset" onclick="_projectAcceptanceRetainedAsset('+i+')">'+esc(x.task+' · '+x.asset.source.path)+'</button>':'').join(' ');
   const rerun=['failed','operational_failure'].includes(acc.state)?'<button class="btn" onclick="_projectAcceptanceRerun()">Rerun whole-project acceptance</button>':'';
   const hold=acc.state==='awaiting_human'?'<p class="project-wait">Completed executors are stopped. Their worker records, terminals and the project worktree remain available until this review is approved.</p>':'';
   const retirement=acc.executor_retirement;
   const retirementNotice=retirement && retirement.allowed===false && retirement.state==='review_not_configured'?'<p class="project-wait">Executor expiration is held: '+esc(retirement.reason)+'.</p>':'';
-  const closeout=acc.state==='accepted'?_projectCloseoutBanner(_projectsData,true):'';
   const ownerMessages=Array.isArray(acc.pending_owner_messages)?acc.pending_owner_messages:[];
   const pendingNotes=ownerMessages.length?'<div class="project-review-assets project-owner-notes"><strong>'+ownerMessages.length+' worker message'+(ownerMessages.length===1?' was':'s were')+' queued but not delivered</strong><p>Review these instructions against the evidence. Approval retains them in worker history as undelivered; it does not claim the worker acted on them.</p><ul>'+ownerMessages.map(m=>'<li><strong>'+esc(m.task||m.worker||'Worker')+'</strong>: '+esc(m.text||'')+'</li>').join('')+'</ul></div>':'';
-  return '<div>Project acceptance: <strong>'+esc(acc.state)+'</strong>'+(acc.candidate?' · candidate '+_projectSha(acc.candidate):'')+(acc.main?' · based on main '+_projectSha(acc.main):'')+'</div>'+hold+retirementNotice+(acc.reason?'<p class="project-muted">'+esc(acc.reason.replaceAll('_',' '))+'</p>':'')+(artifacts?'<div class="project-review-assets"><strong>Produced artifacts to review</strong><div>'+artifacts+'</div></div>':'')+pendingNotes+(rows?'<details open><summary>Whole-project criteria ('+criteria.length+')</summary><ol class="project-criteria">'+rows+'</ol></details>':'')+rerun+closeout;
+  const checks=rows?_projectDisclosure('acceptance_checks','Review '+criteria.length+' outcome check'+(criteria.length===1?'':'s'),'<ol class="project-criteria">'+rows+'</ol>'):'<p class="project-outcome-warning">No whole-project checks are configured.</p>';
+  return '<div>Acceptance: <strong>'+esc(acc.state||'not configured')+'</strong>'+(acc.candidate?' · candidate '+_projectSha(acc.candidate):'')+(acc.main?' · based on main '+_projectSha(acc.main):'')+'</div>'+hold+retirementNotice+(acc.reason?'<p class="project-muted">'+esc(acc.reason.replaceAll('_',' '))+'</p>':'')+pendingNotes+checks+rerun;
 }
 function _projectCloseoutBanner(data,compact=false) {
   if(data?.acceptance?.state!=='accepted') return '';
@@ -46129,7 +47075,7 @@ function _projectCloseoutBanner(data,compact=false) {
   const note=retained>0
     ? retained+' retained worker'+(retained===1?'':'s')+' can be finalized. Expired worker records stay in this project for retrospective review.'
     : (expired>0 ? expired+' worker'+(expired===1?' is':'s are')+' expired and '+(expired===1?'remains':'remain')+' reviewable here.' : 'No retained project workers need closeout.');
-  return '<div class="project-closeout '+(compact?'compact':'')+'"><div><strong>Finalize project</strong><p>'+esc(note)+'</p></div><button class="btn primary" id="project-closeout" onclick="_projectCloseout()">'+esc(label)+'</button></div>';
+  return '<div class="project-closeout '+(compact?'compact':'')+'"><div><strong>'+(retained>0?'Finish project cleanup':'Project complete')+'</strong><p>'+esc(note)+'</p></div>'+(retained>0?'<button class="btn primary" id="project-closeout" onclick="_projectCloseout()">'+esc(label)+'</button>':'')+'</div>';
 }
 async function _projectAcceptanceDecision(criterion,decision) {
   const acc=_projectsData?.acceptance;if(!acc?.fingerprint)return;
@@ -46218,6 +47164,9 @@ function _projectSha(sha) {
 function _projectSection(key,title,open,body) {
   const stored=_projectOpenState.get(key);
   return '<details class="project-section" data-open-key="'+esc(key)+'"'+((stored===undefined?open:stored)?' open':'')+'><summary>'+esc(title)+'</summary>'+body+'</details>';
+}
+function _projectDisclosure(key,title,body,open=false) {
+  return _projectSection(_projectsName+':'+key,title,open,body);
 }
 function _projectInspectorRender(data) {
   const box=document.getElementById('project-inspector');if(!box) return;

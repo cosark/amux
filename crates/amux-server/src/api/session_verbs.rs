@@ -104,6 +104,58 @@ pub(crate) fn home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux"))
 }
+/// Shell prelude for a HEADLESS provider turn (worker types whose adapter
+/// runs turns outside a terminal, ACW-4). Same environment a tmux launch
+/// gives a lane: profile, global -> group -> worker scope env layers, the
+/// harness routing vars (suppressed for an isolated worker), and the Claude
+/// OAuth/API-key rule. One definition of "a worker's environment", so scope
+/// settings and connectors reach every worker type identically.
+pub(crate) fn headless_turn_prelude(name: &str, provider: &str, work_dir: &str) -> String {
+    let cfg = parse_env(name);
+    let isolated = env_flag_on(cfg.get("CC_ISOLATED"));
+    let mut rc = String::new();
+    if provider == "claude" {
+        rc.push_str("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; ");
+        let has_oauth = std::fs::read_to_string(
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude.json"),
+        )
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .is_some_and(|v| !v["oauthAccount"].is_null() && v["oauthAccount"] != json!({}));
+        if has_oauth {
+            rc.push_str("unset ANTHROPIC_API_KEY; ");
+        }
+    }
+    let home_dir = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    rc.push_str(&startup_profile_command(&home_dir, work_dir));
+    for f in scope_env_layers(&home(), name) {
+        rc.push_str(&format!(
+            "set -a; source {} 2>/dev/null; set +a; ",
+            sh_quote(&f.to_string_lossy())
+        ));
+    }
+    let local_cli_dir = home().join("bin");
+    if local_cli_dir.join("amux").is_file() {
+        rc.push_str(&format!(
+            "export PATH={}:\"$PATH\"; ",
+            sh_quote(&local_cli_dir.to_string_lossy())
+        ));
+    }
+    if !isolated {
+        let scheme = if std::env::args().any(|a| a == "--no-tls") {
+            "http"
+        } else {
+            "https"
+        };
+        let endpoint = format!("{scheme}://localhost:{}", crate::config::canonical_port());
+        for (key, value) in worker_harness_env(name, &home(), &endpoint) {
+            rc.push_str(&format!("export {key}={}; ", sh_quote(&value)));
+        }
+    }
+    rc.push_str(&format!("cd {}; ", sh_quote(work_dir)));
+    rc
+}
+
 /// The CLI reads CC_HOME/AMUX_API while hooks read AMUX_HOME/AMUX_URL.
 /// Keep all consumers attached to the server that launched this worker.
 fn worker_harness_env(name: &str, root: &Path, endpoint: &str) -> Vec<(String, String)> {
@@ -759,7 +811,7 @@ fn expanduser(p: &str) -> PathBuf {
 // Meta I/O (py:12229-12251).
 // ---------------------------------------------------------------------------
 
-fn load_meta(name: &str) -> Map<String, Value> {
+pub(crate) fn load_meta(name: &str) -> Map<String, Value> {
     std::fs::read_to_string(meta_path(name))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
@@ -767,12 +819,25 @@ fn load_meta(name: &str) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn save_meta(name: &str, meta: &Map<String, Value>) {
+pub(crate) fn save_meta(name: &str, meta: &Map<String, Value>) {
     let _ = std::fs::create_dir_all(sessions_dir());
-    let _ = std::fs::write(meta_path(name), Value::Object(meta.clone()).to_string());
+    // Write-then-rename. A plain write truncates first, and `load_meta` maps
+    // an unparsable (half-written) file to an EMPTY map, so a concurrent
+    // update_meta could read nothing and save only its own keys, wiping the
+    // rest (conversation id included). rename(2) is atomic on one filesystem.
+    let path = meta_path(name);
+    let tmp = path.with_extension(format!("json.{}.tmp", ulid::Ulid::new()));
+    let body = Value::Object(meta.clone()).to_string();
+    if std::fs::write(&tmp, &body).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    tracing::warn!(session = %name, measured = true, n_considered = 1,
+        verdict = "meta_atomic_write_fallback", "atomic meta write failed; writing in place");
+    let _ = std::fs::write(&path, body);
 }
 
-fn update_meta(name: &str, updates: &[(&str, Value)]) {
+pub(crate) fn update_meta(name: &str, updates: &[(&str, Value)]) {
     let mut meta = load_meta(name);
     for (k, v) in updates {
         meta.insert((*k).to_string(), v.clone());
@@ -780,7 +845,7 @@ fn update_meta(name: &str, updates: &[(&str, Value)]) {
     save_meta(name, &meta);
 }
 
-fn meta_str(meta: &Map<String, Value>, key: &str) -> String {
+pub(crate) fn meta_str(meta: &Map<String, Value>, key: &str) -> String {
     meta.get(key)
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -851,7 +916,7 @@ pub(crate) async fn composer_stuck_lanes() -> Vec<(String, i64)> {
 /// on the first boot after the Python->Rust cutover (see below), because no
 /// pre-cutover `*.meta.json` carries `rate_limited_since` and the sweep indexes
 /// it on every lane.
-fn meta_i64(meta: &Map<String, Value>, key: &str) -> i64 {
+pub(crate) fn meta_i64(meta: &Map<String, Value>, key: &str) -> i64 {
     meta.get(key).and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
@@ -1591,17 +1656,110 @@ pub(crate) struct ClaudeLimitObservation {
     pub reset_at: i64,
 }
 
+/// Is a CONFIRMED limit the weekly one? Only called once the sweep has already
+/// observed a limit, so this classifies a known limit and never detects one.
+///
+/// Either signal is enough. A reset more than six hours out cannot be the
+/// five-hour session limit, and needs no text at all. Otherwise the provider's
+/// own sentence ("You've hit your weekly limit") in the last 40 lines of the
+/// pane; the newest "hit your ... limit" line wins, so an earlier session-limit
+/// line above a weekly one (or the reverse) reads as the current kind.
+pub(crate) fn is_weekly_limit(pane: &str, reset_at: i64, now: i64) -> bool {
+    if reset_at > now + 6 * 3600 {
+        return true;
+    }
+    let clean = strip_ansi(pane).to_lowercase().replace('\u{2019}', "'");
+    let lines: Vec<_> = clean.lines().collect();
+    lines[lines.len().saturating_sub(40)..]
+        .iter()
+        .rev()
+        .find_map(|l| {
+            if l.contains("you've hit your weekly limit") {
+                Some(true)
+            } else if l.contains("you've hit your session limit") {
+                Some(false)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false)
+}
+
+/// The provider's own record of a limit: the conversation ended on Claude
+/// Code's synthetic 429 (`error: "rate_limit"`, `isApiErrorMessage`,
+/// `quotaLimits.status: "rejected"`). Returns the reset epoch (0 when absent).
+///
+/// WHY (Ethan, 2026-09-24: mvs-infra hit "You've hit your session limit" and
+/// read `idle`, so "continue all limited" skipped it). The screen check only
+/// sees the last 8 lines, and a "Remote Control disconnected" notice printed
+/// under the limit message pushed it out of that window. The transcript says
+/// it structurally, whatever else the pane prints. A later user message (the
+/// owner's "continue") or any other assistant turn ends it.
+/// The last real record is any other API error Claude Code ended a turn on
+/// ("API Error: The response stopped arriving", 529 Overloaded, ...): an
+/// assistant record with `isApiErrorMessage`. Returns its `error` kind.
+///
+/// WHY (Ethan, 2026-09-24: amux-chat-worker ended a turn on "The response
+/// stopped arriving" and read `idle`). The screen check only knows
+/// "API Error: 5xx" and only looks at the last 8 lines; this message has no
+/// status code. Usage limits are `transcript_rate_limit`'s, not this.
+pub(crate) fn transcript_api_error(records: &[Value]) -> Option<String> {
+    let last = last_turn_record(records)?;
+    let is_error = last.get("type").and_then(Value::as_str) == Some("assistant")
+        && last.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false)
+        && last.get("error").and_then(Value::as_str) != Some("rate_limit");
+    is_error.then(|| last.get("error").and_then(Value::as_str).unwrap_or("api_error").to_string())
+}
+
+fn last_turn_record(records: &[Value]) -> Option<&Value> {
+    records.iter().rev().find(|r| {
+        matches!(r.get("type").and_then(Value::as_str), Some("user" | "assistant"))
+            && !r.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
+            && !r.get("isMeta").and_then(Value::as_bool).unwrap_or(false)
+    })
+}
+
+pub(crate) fn transcript_rate_limit(records: &[Value]) -> Option<i64> {
+    let last = records.iter().rev().find(|r| {
+        matches!(r.get("type").and_then(Value::as_str), Some("user" | "assistant"))
+            && !r.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
+            && !r.get("isMeta").and_then(Value::as_bool).unwrap_or(false)
+    })?;
+    let limited = last.get("type").and_then(Value::as_str) == Some("assistant")
+        && last.get("error").and_then(Value::as_str) == Some("rate_limit")
+        && last.pointer("/quotaLimits/status").and_then(Value::as_str) == Some("rejected");
+    limited.then(|| last.pointer("/quotaLimits/resetsAt").and_then(Value::as_i64).unwrap_or(0))
+}
+
+/// Screen-only observation; production passes the transcript through
+/// `observe_claude_limit_with`.
+#[cfg(test)]
 pub(crate) fn observe_claude_limit(
     pane: &str,
     recorded_reset: i64,
     now: chrono::DateTime<chrono::Local>,
+) -> Option<ClaudeLimitObservation> {
+    observe_claude_limit_with(pane, recorded_reset, now, None)
+}
+
+/// `observe_claude_limit` plus the transcript's structured limit record.
+pub(crate) fn observe_claude_limit_with(
+    pane: &str,
+    recorded_reset: i64,
+    now: chrono::DateTime<chrono::Local>,
+    transcript_reset: Option<i64>,
 ) -> Option<ClaudeLimitObservation> {
     let menu = is_rate_limit_menu(pane);
     let auto_resume = crate::backend::adapter::claude_auto_resume_banner(pane);
     let lines: Vec<_> = pane.lines().collect();
     let footer = lines[lines.len().saturating_sub(8)..].join("\n");
     if !menu && auto_resume.is_none() && !is_rate_limited_credit_banner(&footer) {
-        return None;
+        let reset = transcript_reset?;
+        return Some(ClaudeLimitObservation {
+            menu: false,
+            kind: "transcript",
+            reset_at: effective_rate_limit_reset(recorded_reset, reset, now.timestamp()),
+        });
     }
     let kind = if menu {
         "menu"
@@ -1611,8 +1769,11 @@ pub(crate) fn observe_claude_limit(
         "credit-banner"
     };
     let reset_at = if menu || auto_resume.is_some() {
-        let parsed =
-            parse_rate_limit_reset_at(auto_resume.as_deref().unwrap_or(&footer), now).unwrap_or(0);
+        // The transcript's structured `resetsAt` backs up the screen: a banner
+        // wording this parser has not met yet still gets a reset time.
+        let parsed = parse_rate_limit_reset_at(auto_resume.as_deref().unwrap_or(&footer), now)
+            .or(transcript_reset.filter(|t| *t > 0))
+            .unwrap_or(0);
         effective_rate_limit_reset(recorded_reset, parsed, now.timestamp())
     } else {
         0
@@ -1716,11 +1877,30 @@ pub(crate) fn parse_rate_limit_reset_at(
     // both and they agree. Most specific FIRST, and each candidate is parsed
     // rather than merely located: "resets at 8pm" matches the bare "resets "
     // too, leaving "at 8pm", which must lose to the marker that leaves "8pm".
-    let (h24, minute) = ["continuing automatically at ", "resets at ", "resets "]
-        .iter()
-        .filter_map(|m| clean.find(m).map(|i| &clean[i + m.len()..]))
-        .find_map(parse_clock12)?;
-    let (h, minute) = (h24, minute);
+    //
+    // A WEEKLY limit names a date as well: "resets Oct 2 at 3am", and the menu
+    // option "continue automatically at Oct 2 at 3am". Reading only a bare clock
+    // there returned None, so a weekly-limited lane kept `rate_limited_until = 0`
+    // and every bulk "continue" control, which selects on a future reset, left
+    // it out without a word (2026-09-26, gs-3-bucket-objects).
+    let (date, h, minute) = [
+        "continuing automatically at ",
+        "continue automatically at ",
+        "resets at ",
+        "resets ",
+    ]
+    .iter()
+    .filter_map(|m| clean.find(m).map(|i| &clean[i + m.len()..]))
+    .find_map(|rest| {
+        if let Some((h, m)) = parse_clock12(rest) {
+            return Some((None, h, m));
+        }
+        let (month, day, rest) = parse_month_day(rest)?;
+        let rest = rest.trim_start_matches(',').trim_start();
+        let rest = rest.strip_prefix("at ").unwrap_or(rest);
+        let (h, m) = parse_clock12(rest)?;
+        Some((Some((month, day)), h, m))
+    })?;
 
     let today = now.date_naive();
     let at = |d: chrono::NaiveDate| -> Option<i64> {
@@ -1740,11 +1920,44 @@ pub(crate) fn parse_rate_limit_reset_at(
             ),
         }
     };
+    if let Some((month, day)) = date {
+        // A named date is this year's unless that is more than a day gone, in
+        // which case it is next year's ("resets Jan 2" read on Dec 30).
+        use chrono::Datelike;
+        let this_year = chrono::NaiveDate::from_ymd_opt(today.year(), month, day)?;
+        let d = if this_year < today.pred_opt()? {
+            chrono::NaiveDate::from_ymd_opt(today.year() + 1, month, day)?
+        } else {
+            this_year
+        };
+        return at(d);
+    }
     let ts = at(today)?;
     if ts < now.timestamp() - 120 {
         return at(today.succ_opt()?);
     }
     Some(ts)
+}
+
+/// `oct 2` / `october 2` at the head of `s` (already lowercased), as
+/// (month, day, rest).
+fn parse_month_day(s: &str) -> Option<(u32, u32, &str)> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let word_end = s.find(|c: char| !c.is_ascii_alphabetic())?;
+    let word = &s[..word_end];
+    if word.len() < 3 {
+        return None;
+    }
+    let month = MONTHS.iter().position(|m| word.starts_with(m))? as u32 + 1;
+    let rest = s[word_end..].trim_start_matches('.').trim_start();
+    let digits_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if digits_end == 0 || digits_end > 2 {
+        return None;
+    }
+    let day: u32 = rest[..digits_end].parse().ok()?;
+    Some((month, day, rest[digits_end..].trim_start()))
 }
 
 /// The policy for what amux does with a rate-limit menu (ethos D2).
@@ -1802,6 +2015,64 @@ fn project_hook_review_key(cfg: &EnvFile, raw: &str) -> Option<&'static str> {
     });
     if selected { return Some("Enter"); }
     clean.lines().map(str::trim).any(|line| line == choice).then_some("3")
+}
+
+// A Codex resume after project checkout consolidation can ask which of two
+// directories to use. The registered project checkout is an Amux-owned choice,
+// not a new authorization or a question for the owner. Never choose a path
+// from the pane alone: it must equal the durable project checkout record.
+fn project_checkout_directory_key(cfg: &EnvFile, raw: &str, checkout: &Path) -> Option<&'static str> {
+    if cfg.get("CC_PROVIDER") != Some("codex")
+        || cfg.get("CC_PROJECT").is_none_or(str::is_empty)
+        || ["CC_ISOLATED", "CC_PAUSED", "CC_ARCHIVED", "CC_PROJECT_PAUSED"]
+            .iter().any(|key| env_flag_on(cfg.get(key)))
+    { return None; }
+    let clean = strip_ansi(raw);
+    if crate::backend::adapter::provider_picker_reason(&clean, "codex") != Some("user_input") {
+        return None;
+    }
+    let lines: Vec<_> = clean.lines().map(str::trim).filter(|line| !line.is_empty()).rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+    if lines.last().copied() != Some("Press enter to continue") { return None; }
+    let option = |number: usize| -> Option<(&str, bool)> {
+        let prefix = format!("{number}. ");
+        lines.iter().rev().find_map(|line| {
+            let selected = line.starts_with('›') || line.starts_with('❯');
+            let text = if selected { line[3..].trim() } else { line };
+            text.strip_prefix(&prefix).map(|value| (value, selected))
+        })
+    };
+    let (old, _) = option(1)?;
+    let (current, selected) = option(2)?;
+    if !old.starts_with("Use session directory (")
+        || !current.starts_with("Use current directory (")
+        || option(3)?.0 != "Always use session directory"
+        || option(4)?.0 != "Always use current directory"
+    { return None; }
+    let chosen = current.strip_prefix("Use current directory (")?.strip_suffix(')')?;
+    if Path::new(chosen) != checkout { return None; }
+    Some(if selected { "Enter" } else { "2" })
+}
+
+fn project_checkout_repair_claim_ready(plans: &[crate::project_execution::planner::CardPlan], worker: &str) -> bool {
+    plans.iter().any(|p| p.action == "claim" && p.execution.stage == "repair"
+        && p.execution.worker == worker && !p.execution.suspended)
+}
+
+fn project_repair_claim_ready(state: &AppState, project: &str, worker: &str) -> bool {
+    state.store.read().ok().is_some_and(|c| {
+        let Ok(Some(p)) = crate::project_execution::store::get(&c, project) else { return false; };
+        p.policy.enabled && !p.policy.paused && crate::project_execution::planner::plan(&c, &p)
+            .ok().is_some_and(|plans| project_checkout_repair_claim_ready(&plans, worker))
+    })
+}
+
+fn project_codex_conversation_retry_ready(cfg: &EnvFile, pane: &str, last_retry: i64, now: i64) -> bool {
+    cfg.get("CC_PROVIDER") == Some("codex")
+        && cfg.get("CC_PROJECT").is_some_and(|p| !p.is_empty())
+        && !["CC_ISOLATED", "CC_PAUSED", "CC_PROJECT_PAUSED", "CC_ARCHIVED", "CC_REVIEW_HELD"]
+            .iter().any(|key| env_flag_on(cfg.get(key)))
+        && codex_conversation_open_elsewhere(pane)
+        && (last_retry == 0 || now - last_retry >= 300)
 }
 
 pub(crate) fn is_resume_mode_prompt(raw: &str) -> bool {
@@ -4402,7 +4673,7 @@ fn split_flags(s: &str) -> Result<Vec<String>, String> {
 }
 
 /// POSIX single-quote escaping (shlex.quote parity).
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes().all(|b| {
             b.is_ascii_alphanumeric()
@@ -7541,14 +7812,15 @@ async fn steer_enqueue_precond_with_id(
     // REFUSES rather than silently dropping: a producer that thinks it
     // delivered is how a board card gets claimed for a lane nobody is driving.
     let project_managed = !session_is_isolated(name) && parse_env(name).get("CC_PROJECT").is_some();
-    let guard = if guard.is_empty() && project_managed {
+    let lead_worker = project_managed && parse_env(name).get("CC_PROJECT_LEAD") == Some("1");
+    let guard = if guard.is_empty() && project_managed && !lead_worker {
         "project-steering"
     } else {
         guard
     };
     if project_managed
         && !guard.is_empty()
-        && !matches!(guard, "project-execution" | "project-steering")
+        && !matches!(guard, "project-execution" | "project-steering" | "project-lead")
     {
         tracing::info!(
             session = name,
@@ -7561,7 +7833,12 @@ async fn steer_enqueue_precond_with_id(
         return Err("project controller owns executor prompts");
     }
     let automation = !guard.is_empty() && !(guard == "project-steering" && sender.is_empty());
-    if automation && session_is_isolated(name) {
+    // SCHEDULES REACH ISOLATED WORKERS (Ethan, 2026-09-26: "isolated workers
+    // can still have schedulers they should"). A schedule is standing
+    // configuration of that worker, not amux steering it, so it is exempt
+    // here; board nudges, callbacks and peer relays still are not.
+    let isolated_schedule = is_schedule_guard(guard) && session_is_isolated(name);
+    if automation && !isolated_schedule && session_is_isolated(name) {
         return Err(
             "target is an isolated (raw-agent) worker: amux automation is not \
                     delivered into it. The owner's own send still works.",
@@ -8292,6 +8569,11 @@ async fn pane_has_live_child(name: &str) -> Option<bool> {
 }
 
 pub(crate) async fn is_running(name: &str) -> bool {
+    if let crate::api::worker_exec::Dispatch::Handled(r) =
+        crate::api::worker_exec::adapter_for_session(name).running(name)
+    {
+        return r;
+    }
     let cfg = parse_env(name);
     // A completed project executor may deliberately retain its tmux pane so a
     // person can inspect the exact terminal that produced the acceptance
@@ -9097,6 +9379,21 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
                 tracing::info!(measured=true,n_considered=1,verdict="codex_plain_footer_recognized",
                     "unstyled Codex footer beside a dim empty prompt is chrome, not a pending draft");
             }
+        }
+        // A PANEL CAN HIDE THE COMPOSER, and then the last `❯` is the
+        // transcript's echo of an earlier prompt (Claude Code's /btw answer
+        // panel mid-turn, 2026-09-25). A real composer never continues into a
+        // tool bullet `⏺`, a tool result `⎿` or a panel's top border `▔`, so
+        // reaching one means there is no composer to read. Reading on made the
+        // whole transcript "typed", and a /btw that was answering on screen
+        // was reported "not submitted".
+        if matches!(t.chars().next(), Some('\u{23fa}') | Some('\u{23bf}') | Some('\u{2594}')) {
+            static HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !HIDDEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(measured = true, n_considered = 1, verdict = "composer_hidden_prompt_is_transcript_echo",
+                    "last prompt glyph is followed by transcript or a panel border; the composer is not visible");
+            }
+            return ComposerState::NotVisible;
         }
         if matches!(t.chars().next(), Some('\u{2500}') | Some('\u{23f5}'))
             || plain_footer
@@ -10457,12 +10754,26 @@ pub(crate) struct AutoDelivery {
 /// Three outcomes and no fourth: delivered (verified), queued (with the row id),
 /// or refused (with the reason). `ok == true` never means "delivered" on its
 /// own — read `submitted`.
+/// A schedule's delivery guard (`sched:<id>`, set by the scheduler).
+pub(crate) fn is_schedule_guard(guard: &str) -> bool {
+    guard.starts_with("sched:")
+}
+
 pub(crate) async fn deliver_automated(
     state: &AppState,
     name: &str,
     text: &str,
     guard: &str,
 ) -> AutoDelivery {
+    // A schedule into an isolated worker is delivered as owner input; see
+    // `is_schedule_guard` and the queue's isolation gate.
+    let origin = if is_schedule_guard(guard) && session_is_isolated(name) {
+        tracing::info!(session = %name, guard, verdict = "isolated_schedule_delivered",
+            "schedule delivering into an isolated worker as owner configuration");
+        SendOrigin::Owner
+    } else {
+        SendOrigin::Automation
+    };
     let refuse = |why: String| AutoDelivery {
         message: why,
         submitted: Some(false),
@@ -10532,7 +10843,7 @@ pub(crate) async fn deliver_automated(
         // says "this is an automated producer, and `guard` already names which
         // one". This branch skipped the queue for a stopped lane, and with it
         // the queue's isolation gate (AMUX-3764).
-        let (ok, msg) = send_text(state, name, text, false, SendOrigin::Automation).await;
+        let (ok, msg) = send_text(state, name, text, false, origin).await;
         return classify(ok, msg);
     }
 
@@ -10563,7 +10874,7 @@ pub(crate) async fn deliver_automated(
             from_steering: true,
             allow_mid_turn: false,
             hook_confirmed_idle: false,
-            origin: SendOrigin::Automation,
+            origin,
         };
         let mut queue_id = None;
         let (ok, msg) = send_text_inner(state, name, text, mode, &mut queue_id).await;
@@ -10806,7 +11117,9 @@ async fn submit_project_execution_draft_if_owned(
     let sent_at = now_f64();
     send_key(name, "Enter").await;
     let generating = detect_claude_status(&raw) == "active";
-    let (submission, retried) = verify_submitted(name, text, sent_at, !generating).await;
+    // No retry Enter on a slash command: it would act inside its panel.
+    let (submission, retried) =
+        verify_submitted(name, text, sent_at, !generating && !is_slash_command(text)).await;
     Some(send_outcome(submission, generating, retried))
 }
 
@@ -10864,7 +11177,8 @@ async fn submit_own_steering_draft(
     .await;
     let sent_at = now_f64();
     send_key(name, "Enter").await;
-    let (submission, retried) = verify_submitted(name, text, sent_at, true).await;
+    let (submission, retried) =
+        verify_submitted(name, text, sent_at, !is_slash_command(text)).await;
     Some(send_outcome(submission, false, retried))
 }
 
@@ -11028,6 +11342,20 @@ async fn send_text_inner_bound(
             false,
             "iTerm2-backed sessions are not supported by the rust origin yet".into(),
         );
+    }
+    // ACW-6: every producer (owner send, peers, steering, schedules, board
+    // dispatch) has converged by here, after the isolation, pause and
+    // project gates. The worker type's adapter delivers, or the terminal
+    // pipeline below does.
+    let adapter = crate::api::worker_exec::adapter_for(
+        &crate::api::worker_exec::worker_type_of_env(cfg.get("CC_WORKER_TYPE")),
+    );
+    if let crate::api::worker_exec::Dispatch::Handled(r) =
+        adapter.deliver(state, name, text, origin).await
+    {
+        crate::api::worker_exec::note_dispatch(name, "deliver", adapter.worker_type());
+        let _ = admitted_claim;
+        return r;
     }
     if backend_of_cfg(&cfg) == "herdr" {
         return herdr_send(name, text).await;
@@ -11855,7 +12183,31 @@ async fn send_text_inner_bound(
     // also use bare Enter: picker-shaped input was pasted, so Escape would only
     // risk interrupting a newly accepted turn.
     // ------------------------------------------------------------------
-    let (first, retried) = verify_submitted(name, &text, sent_at, !generating).await;
+    // A SLASH COMMAND GETS EXACTLY ONE ENTER (Ethan 2026-09-25: "i tried to do
+    // a /btw command it didnt work"). Many slash commands open a panel or a
+    // picker in place of the composer: Claude Code's /btw answer panel, /model,
+    // /status, /context; codex's /model and /approvals. There a second Enter is
+    // not a retry, it is an ACTION: reproduced live, a second Enter closes the
+    // /btw panel and the answer is gone, which is what the retry below did to
+    // launch-videos at 21:30:36Z. So no retry and no idle watcher for them.
+    let is_slash = is_slash_command(&text);
+    let (first, retried) = verify_submitted(name, &text, sent_at, !generating && !is_slash).await;
+    if is_slash {
+        // The verifier reads "stuck" whenever it never saw the composer come
+        // back empty. A panel (/btw, /status) HIDES the composer, so that read
+        // said "text is sitting in the input box" while the answer was on
+        // screen. Re-read once: only our text visibly back in the box is stuck.
+        let after = if first == Submission::Stuck {
+            Some(read_frame(&tmux_capture(name, 25).await, &send_tail_squashed(&text)))
+        } else {
+            None
+        };
+        let (ok, msg) = slash_outcome(first, after, generating);
+        tracing::info!(session = %name, submission = ?first, frame_after = ?after, ok,
+            measured = true, n_considered = 1, verdict = "slash_command_single_enter",
+            "slash command sent with one Enter; no retry, because a second Enter acts inside its panel or picker");
+        return (ok, msg);
+    }
     if first == Submission::Stuck && generating {
         // One bare-Enter retry, then re-read the evidence. No sleep-tuning: the
         // retry is gated on the OBSERVED composer contents, not on a guess
@@ -11901,7 +12253,36 @@ fn direct_draft_watches() -> &'static std::sync::Mutex<std::collections::HashSet
 /// `grace_s`: for this long an EMPTY box does not end the watch (Claude Code
 /// can clear the box and restore the text a second or more later); only the
 /// transcript recording the message, or the grace running out, does.
+/// A message that is a CLI slash command (`/btw …`, `/model`, `/status`):
+/// the first token starts with `/` and is a bare word, so a pasted path such as
+/// `/Users/x/file.md` is not mistaken for one.
+pub(crate) fn is_slash_command(text: &str) -> bool {
+    let t = text.trim_start();
+    let first = t.split_whitespace().next().unwrap_or("");
+    first.len() > 1
+        && first.starts_with('/')
+        && first[1..].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+}
+
+/// The send outcome for a slash command, given the verifier's verdict and one
+/// frame read taken after it. Pure so the panel case is pinned by a test.
+pub(crate) fn slash_outcome(first: Submission, after: Option<FrameRead>, generating: bool) -> (bool, String) {
+    match (first, after) {
+        (Submission::Stuck, Some(FrameRead::NoUi | FrameRead::Cleared)) => (
+            true,
+            "sent (slash command; submission could not be verified: its panel or picker replaced the input box)"
+                .into(),
+        ),
+        _ => send_outcome(first, generating, false),
+    }
+}
+
 fn spawn_direct_draft_idle_submit(name: &str, text: &str, sent_at: f64, grace_s: f64) {
+    if is_slash_command(text) {
+        // Never press Enter on a slash command later: its panel or picker may be
+        // open, and Enter there selects or closes (see send_text).
+        return;
+    }
     let key = format!("{name}\u{0}{}", text.split_whitespace().collect::<String>());
     if let Ok(mut w) = direct_draft_watches().lock() {
         if !w.insert(key.clone()) {
@@ -11980,7 +12361,9 @@ const ALLOWED_TMUX_KEYS: [&str; 47] = [
 ];
 // "1": the resume-mode auto-answer selects BY DIGIT (see resume_mode_action —
 // Enter would take whatever is highlighted, including "Don't ask me again").
-const ALLOWED_TMUX_CHAR_KEYS: [&str; 6] = ["y", "n", "q", "x", "1", "3"];
+// "2": the exact registered project-checkout picker selects the current
+// directory without persisting a provider preference.
+const ALLOWED_TMUX_CHAR_KEYS: [&str; 8] = ["y", "n", "q", "x", "r", "1", "2", "3"];
 
 async fn send_keys_op(name: &str, keys: &str) -> (bool, String) {
     if !is_running(name).await {
@@ -12804,6 +13187,13 @@ pub(crate) async fn start_session(
     if !f.exists() {
         return (false, format!("session '{name}' not found"));
     }
+    // ACW-6: the worker type's adapter starts it, or hands back to the
+    // terminal pipeline below (coding).
+    let adapter = crate::api::worker_exec::adapter_for_session(name);
+    if let crate::api::worker_exec::Dispatch::Handled(r) = adapter.start(state, name).await {
+        crate::api::worker_exec::note_dispatch(name, "start", adapter.worker_type());
+        return r;
+    }
     let cfg = parse_env(name);
     if cfg.get("CC_PAUSED") == Some("1") {
         return (false, "worker is paused; resume it first".into());
@@ -12898,7 +13288,20 @@ pub(crate) async fn start_session(
     let worktree_enabled = fanout || cfg.get_or("CC_WORKTREE", "") == "1";
     if fanout {
         let workspace = if let Some(project) = cfg.get("CC_PROJECT").filter(|_| !isolated) {
-            crate::project_execution::checkout::ensure(&home(), project, name, &work_dir).await
+            // The lead is also the checkout owner. start_session already holds
+            // this worker's session_op_lock, so calling checkout::ensure here
+            // would reacquire the same lock and deadlock every lead start.
+            // The project driver prepared the checkout before entering start.
+            if cfg.get("CC_PROJECT_LEAD") == Some("1") {
+                crate::project_execution::checkout::load(&home(), project)
+                    .filter(|w| {
+                        crate::project_execution::checkout::belongs_to(&home(), project, w)
+                            && std::path::Path::new(&w.path).is_dir()
+                    })
+                    .ok_or_else(|| "project lead checkout is missing; project driver must prepare it before start".to_string())
+            } else {
+                crate::project_execution::checkout::ensure(&home(), project, name, &work_dir).await
+            }
         } else {
             crate::fanout_workspace::ensure(&home(), name, &work_dir).await
         };
@@ -13154,7 +13557,10 @@ pub(crate) async fn start_session(
             if codex_yolo {
                 codex_flags = strip_provider_yolo_flags(&codex_flags);
             }
-            let mut opts = String::new();
+            // An unattended worker must reach its composer without stopping at
+            // Codex's optional npm upgrade picker. This is a per-process
+            // override, so we do not change the owner's global Codex settings.
+            let mut opts = String::from(" -c check_for_update_on_startup=false");
             if !codex_flags.is_empty() {
                 opts += &format!(" {}", shell_quote_flags(&codex_flags));
             }
@@ -13310,6 +13716,7 @@ pub(crate) async fn start_session(
                 " --oss --local-provider ollama --model {}",
                 sh_quote(&model)
             );
+            opts += " -c check_for_update_on_startup=false";
             if !opts.contains("--dangerously-bypass") && !opts.contains("-a ") {
                 opts += if ollama_yolo {
                     " --dangerously-bypass-approvals-and-sandbox"
@@ -14207,32 +14614,94 @@ pub(crate) async fn start_for_board_dispatch(state: &AppState, name: &str) -> Re
     if parse_env(name).get("CC_REVIEW_HELD") == Some("1") {
         return Err("review-held workers are excluded from board automation".into());
     }
-    let (started, detail) = start_session(state, name, "", false).await;
-    if !started {
-        return Err(detail);
-    }
-    // Process creation and the provider reaching the PTY are separate events.
-    // Slow shell/profile startup must not strand an already reserved board task.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !is_running(name).await {
-        if lane_is_paused(name) || session_is_isolated(name) {
-            return Err("worker protected during provider startup".into());
+    let cfg = parse_env(name);
+    let codex_project = cfg.get("CC_PROJECT").is_some() && provider_of(&cfg) == "codex";
+    let failed_before_launch = codex_project
+        && cfg.get("CC_BOARD_CARD").is_some_and(|card| {
+            state.store.read().ok()
+                .and_then(|c| crate::project_execution::planner::execution(&c, card).ok())
+                .and_then(|e| e.last_failure)
+                .as_deref()
+                .is_some_and(crate::project_execution::planner::prelaunch_failure)
+        });
+    let mut fresh_retry = false;
+    loop {
+        // A failed Codex resume can exit to the shell with this exact error.
+        // Reusing its recorded conversation ID would recreate the same error
+        // forever. This is only for a claimed project executor; start_session
+        // rechecks the exclusive task permit before touching its checkout.
+        let stale_resume = codex_project
+            && codex_resume_config_failure(&tmux_capture(name, 25).await);
+        let fresh = fresh_retry || stale_resume || failed_before_launch;
+        if fresh {
+            let mut meta = load_meta(name);
+            meta.remove("codex_session_id");
+            meta.remove("pending_structured_resume_context");
+            meta.remove("pending_structured_resume_token");
+            save_meta(name, &meta);
         }
-        if tokio::time::Instant::now() >= deadline {
-            tracing::warn!(
-                session = name,
-                verdict = "board_provider_start_timeout",
-                measured = true,
-                n_considered = 1,
-                "provider did not become live after process startup"
-            );
-            return Err(format!(
-                "start reported '{detail}', but no live provider process remains after 30s"
-            ));
+        let (started, detail) = start_session(state, name, "", fresh).await;
+        if !started {
+            return Err(detail);
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Process creation and the provider reaching the PTY are separate
+        // events. Check that it stays live long enough to avoid delivering a
+        // task packet to a shell after an immediate Codex resume failure.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !is_running(name).await {
+            if lane_is_paused(name) || session_is_isolated(name) {
+                return Err("worker protected during provider startup".into());
+            }
+            if codex_project && !fresh
+                && codex_resume_config_failure(&tmux_capture(name, 25).await)
+            {
+                fresh_retry = true;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(session=name,measured=true,n_considered=1,
+                    verdict="board_provider_start_timeout",
+                    "provider did not become live after process startup");
+                return Err(format!(
+                    "start reported '{detail}', but no live provider process remains after 30s"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if fresh_retry && !fresh {
+            continue;
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        if is_running(name).await {
+            return Ok(());
+        }
+        if codex_project && !fresh
+            && codex_resume_config_failure(&tmux_capture(name, 25).await)
+        {
+            fresh_retry = true;
+            continue;
+        }
+        return Err(format!(
+            "start reported '{detail}', but provider exited before task delivery"
+        ));
     }
-    Ok(())
+}
+
+fn codex_resume_config_failure(pane: &str) -> bool {
+    pane.contains("Failed to rebuild configuration for resume:")
+        && pane.contains("Failed to rebuild config for cwd ")
+}
+
+#[cfg(test)]
+mod codex_project_resume_tests {
+    use super::codex_resume_config_failure;
+
+    #[test]
+    fn only_exact_failed_resume_configuration_restarts_fresh() {
+        assert!(codex_resume_config_failure("Failed to rebuild configuration for resume:\nFailed to rebuild config for cwd /repo/.worktrees/project-demo"));
+        assert!(!codex_resume_config_failure("Failed to rebuild config for cwd /repo while applying user changes"));
+        assert!(!codex_resume_config_failure("This conversation is open in another app"));
+    }
 }
 
 #[cfg(unix)]
@@ -14685,6 +15154,11 @@ async fn stop_session_process(name: &str) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
     }
+    let adapter = crate::api::worker_exec::adapter_for_session(name);
+    if let crate::api::worker_exec::Dispatch::Handled(r) = adapter.stop(name).await {
+        crate::api::worker_exec::note_dispatch(name, "stop", adapter.worker_type());
+        return r;
+    }
     let cfg = parse_env(name);
     if backend_of_cfg(&cfg) == "herdr" {
         if !herdr_agent_running(name).await {
@@ -15010,6 +15484,14 @@ pub(crate) fn set_legacy_paused(name: &str, paused: bool) -> anyhow::Result<()> 
 pub(crate) async fn stop_for_pause(state: &AppState, name: &str) -> anyhow::Result<()> {
     let lock = session_op_lock(name);
     let _guard = lock.lock().await;
+    let adapter = crate::api::worker_exec::adapter_for_session(name);
+    if let crate::api::worker_exec::Dispatch::Handled((ok, detail)) = adapter.stop(name).await {
+        crate::api::worker_exec::note_dispatch(name, "stop", adapter.worker_type());
+        anyhow::ensure!(ok, "{detail}");
+        crate::api::sessions_legacy::invalidate_sessions_runtime_cache();
+        let _ = state;
+        return Ok(());
+    }
     let cfg = parse_env(name);
     if backend_of_cfg(&cfg) == "herdr" {
         let (ok, detail) = stop_session_process(name).await;
@@ -19963,6 +20445,15 @@ fn pipe_writer_marker_path() -> PathBuf {
 /// those would spray shell noise into per-worker logs for lanes that have no
 /// worker; 10 of the 11 unpiped panes measured were exactly that (disposable
 /// smprobe*/zz-* test lanes) and only ONE was a live agent.
+/// Does this server's home own the lane behind an `amux-<name>` pane?
+fn pane_is_owned(name: &str) -> bool {
+    pane_is_owned_in(&sessions_dir(), name)
+}
+
+fn pane_is_owned_in(sessions: &Path, name: &str) -> bool {
+    sessions.join(format!("{name}.env")).is_file()
+}
+
 fn should_rearm_pipe(pane_pipe: i64, children: usize, writer_changed: bool) -> bool {
     children > 0 && (pane_pipe == 0 || writer_changed)
 }
@@ -19992,6 +20483,7 @@ pub async fn pipe_reconcile_tick() -> usize {
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut rearmed = 0usize;
     let mut failed = false;
+    let mut foreign = 0usize;
     for line in text.lines() {
         let mut f = line.split_whitespace();
         let (Some(sess), Some(pipe), Some(pid)) = (f.next(), f.next(), f.next()) else {
@@ -20000,6 +20492,15 @@ pub async fn pipe_reconcile_tick() -> usize {
         let Some(name) = sess.strip_prefix("amux-") else {
             continue;
         };
+        // Only panes THIS server owns. tmux is shared by every amux server on
+        // the machine (a second server with its own AMUX_HOME, a test rig),
+        // and that server's marker starts empty, so it read every live pane as
+        // "writer changed" and re-pointed 20 real lanes' logs into its own
+        // home (2026-09-24). A lane is ours iff our sessions dir has its env.
+        if !pane_is_owned(name) {
+            foreign += 1;
+            continue;
+        }
         let pipe: i64 = pipe.parse().unwrap_or(1); // unparsable -> assume piped, never re-arm blind
         let children = tokio::process::Command::new("pgrep")
             .args(["-P", pid])
@@ -20024,6 +20525,10 @@ pub async fn pipe_reconcile_tick() -> usize {
                 tracing::error!(session = %name, children, writer_changed, "failed to re-arm pipe-pane");
             }
         }
+    }
+    if foreign > 0 {
+        tracing::debug!(foreign, measured = true, verdict = "pipe_reconcile_foreign_panes_skipped",
+            "amux-* panes with no env file in this server's home were left to their owner");
     }
     // Mark the fleet current only after every eligible pane accepted the new
     // writer. A partial failure deliberately retries the migration next tick.
@@ -20133,6 +20638,59 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             let _ = reconcile_terminal_subagents(state, name).await;
         }
         let pane = tmux_capture(name, 30).await;
+        // A Codex resume can stop at its exclusive-conversation screen after
+        // the previous project attempt has timed out. Delivery cannot retry it:
+        // the old packet is no longer an active claim, while the project driver
+        // refuses to claim a non-boundary worker. Only a *currently claimable*
+        // repair may retry this exact provider screen. Never press into an
+        // isolated, paused, archived, or unrelated worker.
+        let now = now_i64();
+        let last_retry = meta_i64(&load_meta(name), "codex_open_elsewhere_retry_at");
+        if project_codex_conversation_retry_ready(&cfg, &pane, last_retry, now) {
+            if let Some(project) = cfg.get("CC_PROJECT").filter(|p| !p.is_empty()) {
+                if project_repair_claim_ready(state, project, name) {
+                    let lock = lane_send_lock(name);
+                    let _guard = lock.lock().await;
+                    if codex_conversation_open_elsewhere(&tmux_capture(name, 15).await)
+                        && project_repair_claim_ready(state, project, name)
+                    {
+                        update_meta(name, &[("codex_open_elsewhere_retry_at", json!(now))]);
+                        let (ok, detail) = send_keys_op(name, "r").await;
+                        tracing::warn!(session=%name,project=%project,ok,detail=%detail,measured=true,n_considered=1,verdict="project_repair_codex_conversation_retry","retrying exact Codex conversation screen for a claimable project repair");
+                        emit_event(state,name,"project.conversation_retry",Some(json!({"ok":ok,"detail":detail})),None,"status").await;
+                        if ok {
+                            sleep_ms(2000).await;
+                            if codex_conversation_open_elsewhere(&tmux_capture(name, 15).await)
+                                && project_repair_claim_ready(state, project, name)
+                            {
+                                // The other app still owns the old Codex
+                                // conversation. The task packet and candidate
+                                // files are durable, so release only this
+                                // worker's locked process; the normal project
+                                // claim path will start a fresh conversation.
+                                // Never attempt to take over the other owner.
+                                send_key(name, "Escape").await;
+                                sleep_ms(500).await;
+                                let (stopped, stop_detail) = stop_session(state, name).await;
+                                if stopped && !is_running(name).await {
+                                    kill_tmux_session(name).await;
+                                    let mut meta = load_meta(name);
+                                    meta.remove("codex_session_id");
+                                    meta.remove("pending_structured_resume_context");
+                                    meta.remove("pending_structured_resume_token");
+                                    save_meta(name, &meta);
+                                    tracing::warn!(session=%name,project=%project,measured=true,n_considered=1,verdict="project_repair_codex_conversation_recycled","locked local process stopped; next project claim will launch a fresh Codex conversation in the registered checkout");
+                                    emit_event(state,name,"project.conversation_recycled",Some(json!({"reason":"codex_open_elsewhere","stopped":true})),None,"status").await;
+                                } else {
+                                    tracing::warn!(session=%name,project=%project,stopped,detail=%stop_detail,measured=true,n_considered=1,verdict="project_repair_codex_recycle_held","locked provider could not be stopped; conversation identity retained");
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
         if let Some(key) = project_hook_review_key(&cfg, &pane) {
             let (ok, msg) = send_keys_op(name, key).await;
             tracing::info!(session=%name,ok,detail=%msg,measured=true,n_considered=1,verdict="project_hook_review_safe_choice","requesting safe startup choice without granting hook trust");
@@ -20140,6 +20698,24 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             // Reobserve on the next sweep: never press Enter on an assumed
             // selection or send task text while the picker is transitioning.
             continue;
+        }
+
+        if let (Some(project), Some(repo)) = (cfg.get("CC_PROJECT"), cfg.get("CC_DIR")) {
+            let checkout = crate::project_execution::checkout::load(&home(), project);
+            if let Some(key) = checkout.as_ref().filter(|w| crate::fanout_workspace::same_repository(&w.repo, repo))
+                .and_then(|w| project_checkout_directory_key(&cfg, &pane, Path::new(&w.path))) {
+                let permitted = state.store.read().ok().is_some_and(|c|
+                    crate::project_execution::checkout::start_permit(&c, project, name).is_ok())
+                    || project_repair_claim_ready(state, project, name);
+                if permitted {
+                    let (ok, msg) = send_keys_op(name, key).await;
+                    tracing::warn!(session=%name,project=%project,ok,detail=%msg,measured=true,n_considered=1,verdict=if ok {"registered_project_checkout_selected"} else {"registered_project_checkout_choice_failed"},"attempted registered project checkout choice");
+                    emit_event(state,name,"project.checkout_selector_resolved",Some(json!({"key":key,"ok":ok,"detail":msg})),None,"status").await;
+                    if ok { continue; }
+                } else {
+                    tracing::warn!(session=%name,project=%project,measured=true,n_considered=1,verdict="project.checkout_selector_held","registered checkout selector detected but no active or claimable project task authorizes continuation");
+                }
+            }
         }
 
         // RESUME-MODE SELECTOR: amux's to answer (D2; policy set once by Ethan
@@ -20291,10 +20867,31 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             }
         }
 
-        let observation = observe_claude_limit(
+        let records = if provider_of(&cfg) == "claude" {
+            session_jsonl_path(name).map(|p| iter_jsonl_tail(&p, 256 * 1024)).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let transcript_reset = transcript_rate_limit(&records);
+        // An ordinary API error the turn ended on: stamp it so the session
+        // list reads `api_error` (sessions_legacy), clear it once anything
+        // newer lands. Same stamp-in-sweep, read-in-list shape as the picker.
+        let api_error = transcript_api_error(&records);
+        let since = meta_i64(&load_meta(name), "api_error_since");
+        match (&api_error, since > 0) {
+            (Some(kind), false) => {
+                update_meta(name, &[("api_error_since", json!(now_i64())), ("api_error_code", json!(kind))]);
+                tracing::warn!(session = %name, kind = %kind, verdict = "api_error_turn_end",
+                    "the worker's last turn ended on an API error; it needs a retry or continue");
+            }
+            (None, true) => update_meta(name, &[("api_error_since", json!(0)), ("api_error_code", json!(""))]),
+            _ => {}
+        }
+        let observation = observe_claude_limit_with(
             &pane,
             meta_i64(&load_meta(name), "rate_limited_until"),
             chrono::Local::now(),
+            transcript_reset,
         );
         let Some(observation) = observation else {
             // Neither the menu nor the credit banner is on screen: clear the stamp.
@@ -20310,6 +20907,7 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                         ("rate_limited_since", json!(0)),
                         ("rate_limited_until", json!(0)),
                         ("rate_limited_by", json!("")),
+                        ("rate_limited_weekly", json!(false)),
                         ("rate_limit_resume_announced_for", json!(0)),
                     ],
                 );
@@ -20341,6 +20939,14 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         let kind = observation.kind;
         if meta_str(&load_meta(name), "rate_limited_by") != kind {
             update_meta(name, &[("rate_limited_by", json!(kind))]);
+        }
+        // WEEKLY OR NOT, PERSISTED. The list has always projected
+        // `rate_limit_weekly` from this key and the dashboard badge reads it
+        // ("Weekly limit until ..."), but nothing wrote it, so the badge never
+        // showed. Written every tick for the same reason as `rate_limited_by`.
+        let weekly = is_weekly_limit(&pane, reset, observed_now);
+        if load_meta(name).get("rate_limited_weekly").and_then(|v| v.as_bool()) != Some(weekly) {
+            update_meta(name, &[("rate_limited_weekly", json!(weekly))]);
         }
         if meta_i64(&load_meta(name), "rate_limited_since") == 0 {
             update_meta(
@@ -21193,7 +21799,7 @@ async fn get_dispatch(
             )
             .await
         }
-        "peek" => peek_verb(name, qs).await,
+        "peek" => peek_verb(state, name, qs).await,
         "transcript" => {
             // Codex/Ollama run a native TUI whose raw mirror is what Ethan saw
             // looked nothing like Claude (AMUX-3201). They also write a
@@ -24521,7 +25127,29 @@ pub(crate) async fn steer_history_verb(
     let blocked = lane_block_reason(name).await;
     let max_age = steer_max_age_s();
     let now = now_f64();
+    // WHAT THE QUEUE IS WAITING FOR (MSG-68866, 2026-09-24: "this message
+    // disappeared from queued, it was never sent either"). The row said
+    // deliverable=true, blocked_reason=None while the drain held it behind a
+    // 53-minute turn with 5 background agents, so nothing distinguished waiting
+    // from lost. Ask the drain's own decision, once, with the oldest row's age.
+    let oldest_age = out
+        .iter()
+        .filter_map(|r| r["queued_at"].as_f64())
+        .map(|q| now - q)
+        .fold(0.0_f64, f64::max);
+    let waiting_for = if out.is_empty() || blocked.is_some() {
+        None
+    } else {
+        match steer_delivery_for(state, name, oldest_age).await {
+            SteerDelivery::Hold => Some(
+                "the worker's current turn to end: queued messages are delivered at its next idle point \
+                 (a turn with live background agents waits for them too). Send now delivers it immediately.",
+            ),
+            _ => None,
+        }
+    };
     for row in out.iter_mut() {
+        row["waiting_for"] = json!(waiting_for);
         let age = now - row["queued_at"].as_f64().unwrap_or(now);
         row["age_s"] = json!(age as i64);
         row["overdue"] = json!(age >= max_age);
@@ -25329,8 +25957,13 @@ pub(crate) fn lane_env_exists(name: &str) -> bool {
 /// them is a store row, so that route answered 404 for essentially every lane
 /// it was asked about. `send` never had the problem because it falls back to
 /// the key and lands here; this is the same landing spot for peek.
-pub(crate) async fn peek_verb(name: &str, qs: &[(String, String)]) -> Response {
+pub(crate) async fn peek_verb(state: &AppState, name: &str, qs: &[(String, String)]) -> Response {
     let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
+    let adapter = crate::api::worker_exec::adapter_for_session(name);
+    if let crate::api::worker_exec::Dispatch::Handled(v) = adapter.peek(state, name, lines).await {
+        crate::api::worker_exec::note_dispatch(name, "peek", adapter.worker_type());
+        return j200(v);
+    }
     let live_only = qs_flag(qs, "live");
     let no_trim = qs_flag(qs, "notrim");
     // The reader's visible width in columns, for table layout (default 100).
@@ -25637,6 +26270,27 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
         );
     }
     let cfg = parse_env(name);
+    // A project owns one checkout shared by all of its task executors.
+    // Deleting one executor used to reclaim that *shared* checkout while
+    // another task was checking out or writing it, so project workers were
+    // refused outright. That left the owner no way to clear finished or
+    // archived executors (Ethan, 2026-09-26: "i want a way to delete
+    // workers", 25 project workers selected with no Delete offered).
+    // The hazard was the checkout, not the worker: a STOPPED project worker
+    // is deletable, and its checkout is never reclaimed here (the worktree
+    // block below is skipped for it). A running one is still refused, since
+    // it may be writing that checkout right now.
+    let project = cfg.get("CC_PROJECT").map(|p| p.to_string());
+    if let Some(project) = project.as_deref() {
+        if is_running(name).await {
+            tracing::info!(session = name, project, verdict = "project_worker_delete_refused_running",
+                "refused deleting a running project worker; its project checkout is shared");
+            return jresp(
+                StatusCode::CONFLICT,
+                json!({"error":"this project worker is running and shares its project's checkout; pause or archive it first, then delete"}),
+            );
+        }
+    }
     if cfg.get("CC_PINNED") == Some("1") && !is_session_blocked(name) {
         return jresp(
             StatusCode::FORBIDDEN,
@@ -25654,7 +26308,11 @@ async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Respo
     // ephemeral workers, with 111 MB of directory still on disk for one of
     // them. The remedy a human would reach for, `git worktree prune`, skips
     // locked entries and so reported the repo clean the whole time.
-    if cfg.get("CC_WORKTREE") == Some("1") {
+    if let Some(project) = project.as_deref() {
+        tracing::info!(session = name, project, verdict = "project_worker_deleted_checkout_kept",
+            "deleted a stopped project worker; the project's shared checkout was left in place");
+    }
+    if cfg.get("CC_WORKTREE") == Some("1") && project.is_none() {
         // THE WORKSPACE RECORD IS THE AUTHORITY, THE ENV IS THE FALLBACK
         // (AMUX-4914). The env used to be the only source, and fan-out creation
         // never writes CC_WORKTREE_REPO: board.rs sets CC_DIR, CC_WORKTREE=1,
@@ -25921,7 +26579,15 @@ fn apply_subagent_event(
     // than an evicted terminal edge still cannot resurrect that agent.
     let mut terminal_floor_ts = next["terminal_floor_ts"].as_f64().unwrap_or(0.0);
 
-    if !event_id.is_empty() && seen.iter().any(|id| id == event_id) {
+    // A REFUSED EVENT WAS NEVER DELIVERED. Every event id is recorded, the
+    // refused ones included, so once the floor fix (c9106be8) made the
+    // healer's stop valid, its retry was dropped here as a duplicate and the
+    // live agent stayed live. A stop for an agent that is still live has, by
+    // definition, not taken effect yet.
+    let ends_a_live_agent = matches!(ev, "stop" | "done")
+        && !agent_id.is_empty()
+        && agent_edges.get(agent_id).and_then(|edge| edge["state"].as_str()) == Some("live");
+    if !event_id.is_empty() && seen.iter().any(|id| id == event_id) && !ends_a_live_agent {
         return SubagentApply {
             next,
             verdict: "duplicate_event",
@@ -25953,11 +26619,21 @@ fn apply_subagent_event(
         && prior_agent_ts > 0.0
         && (event_ts < prior_agent_ts
             || (event_ts == prior_agent_ts && ev == "start" && prior_agent_state == "terminal"));
+    // A STOP FOR AN AGENT STILL MARKED LIVE IS NEVER STALE (2026-09-24,
+    // celery-retirement). The floor exists so an old event cannot resurrect an
+    // agent whose edge was compacted away; ending a live agent resurrects
+    // nothing. Refusing it left a subagent that finished at 15:40Z counted
+    // live for hours, because the healer's terminal record (15:40:09) sat
+    // below a floor (16:44) raised by unrelated agents' later stops.
+    let stops_a_live_agent = matches!(ev, "stop" | "done")
+        && prior_agent_state == "live"
+        && event_ts >= prior_agent_ts;
     let stale_terminal_floor = ev != "reset"
         && !agent_id.is_empty()
         && event_ts > 0.0
         && terminal_floor_ts > 0.0
-        && event_ts <= terminal_floor_ts;
+        && event_ts <= terminal_floor_ts
+        && !stops_a_live_agent;
     let mut verdict = "applied";
 
     if stale_time || stale_session || stale_agent_order || stale_terminal_floor {
@@ -26027,7 +26703,7 @@ fn apply_subagent_event(
         }
     }
 
-    if !event_id.is_empty() {
+    if !event_id.is_empty() && !seen.iter().any(|id| id == event_id) {
         seen.push(event_id.to_string());
         if seen.len() > SUBAGENT_EVENT_HISTORY_LIMIT {
             seen.drain(..seen.len() - SUBAGENT_EVENT_HISTORY_LIMIT);
@@ -26188,12 +26864,48 @@ fn lifecycle_transcript_path(name: &str, lifecycle_session: &str) -> Option<Path
     if !cached_re!(r"^[0-9a-fA-F-]{36}$").is_match(lifecycle_session) {
         return None;
     }
+    // A WORKTREE WORKER'S TRANSCRIPT IS NOT UNDER CC_DIR (2026-09-24,
+    // celery-retirement read WORKING for 5h on a subagent that finished at
+    // 15:40). Claude Code files a conversation under the directory it was
+    // launched in, which for a worktree worker is <repo>/.worktrees/<name>,
+    // while CC_DIR names the repo. This looked only under CC_DIR, found
+    // nothing, and the lost-stop healer and interrupt detector silently did
+    // nothing for every worktree worker.
     let wd = work_dir_of(&parse_env(name));
-    let path = claude_home()
-        .join("projects")
-        .join(project_name(&wd))
-        .join(format!("{lifecycle_session}.jsonl"));
-    path.exists().then_some(path)
+    let bases = [
+        std::path::Path::new(&wd).join(".worktrees").join(name).to_string_lossy().into_owned(),
+        meta_str(&load_meta(name), "cc_cwd"),
+        wd.clone(),
+    ];
+    static FOUND: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> =
+        std::sync::OnceLock::new();
+    let cache = FOUND.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(lifecycle_session) {
+        if hit.exists() {
+            return Some(hit.clone());
+        }
+    }
+    let (hit, by_id) = find_transcript(&claude_home().join("projects"), &bases, lifecycle_session)?;
+    if by_id {
+        tracing::info!(session = name, path = %hit.display(), verdict = "lifecycle_transcript_found_by_id",
+            "conversation found by its id outside the worker's configured directory");
+    }
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(lifecycle_session.to_string(), hit.clone());
+    Some(hit)
+}
+
+/// Known launch directories first, then the id itself: it is a UUID, so a
+/// match anywhere under `projects` is this conversation. The bool says the
+/// fallback was needed.
+fn find_transcript(projects: &std::path::Path, bases: &[String], id: &str) -> Option<(PathBuf, bool)> {
+    let file = format!("{id}.jsonl");
+    for base in bases.iter().filter(|b| !b.trim().is_empty()) {
+        let path = projects.join(project_name(base)).join(&file);
+        if path.exists() {
+            return Some((path, false));
+        }
+    }
+    std::fs::read_dir(projects).ok()?.flatten().map(|e| e.path().join(&file)).find(|p| p.exists()).map(|p| (p, true))
 }
 
 fn stored_live_subagent_lanes(state: &AppState) -> std::collections::HashSet<String> {
@@ -27912,6 +28624,7 @@ pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> 
 async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Response {
     let changes_runtime = [
         "provider",
+        "worker_type",
         "model",
         "effort",
         "toggle_yolo",
@@ -28011,6 +28724,78 @@ async fn config_patch_with_liveness(
     // hood"). See rename_session below.
     if let Some(rename) = body.get("rename") {
         return rename_session(state, name, rename.as_str().unwrap_or("")).await;
+    }
+
+    // Change worker type (ACW-2/5). The type picks the execution adapter, so
+    // a running worker is stopped by its CURRENT adapter before the type is
+    // written and started by the NEW one after: the worker (name, board,
+    // history, groups) survives; only the execution is swapped.
+    if let Some(tv) = body.get("worker_type") {
+        let Some(tv) = tv.as_str() else {
+            return jresp(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "worker_type must be a string"}),
+            );
+        };
+        let new_type = match amux_core::worker_type::WorkerTypeId::parse(tv) {
+            Ok(t) => t,
+            Err(e) => return jresp(StatusCode::BAD_REQUEST, json!({"error": e})),
+        };
+        let old_type = crate::api::worker_exec::worker_type_of_env(cfg.get("CC_WORKER_TYPE"));
+        if new_type == old_type {
+            return j200(json!({"ok": true, "worker_type": new_type,
+                "message": format!("worker type already {new_type}")}));
+        }
+        let descriptor = new_type.descriptor();
+        if let Err(e) =
+            descriptor.validate(&provider_of(&cfg), cfg.get_or("CC_WORKTREE", "") == "1")
+        {
+            return jresp(StatusCode::BAD_REQUEST, json!({"error": e}));
+        }
+        if running {
+            let (ok, detail) = stop_session_process(name).await;
+            if !ok {
+                return jresp(
+                    StatusCode::CONFLICT,
+                    json!({"error": format!("could not stop the {old_type} session before switching type: {detail}")}),
+                );
+            }
+        }
+        if new_type.as_str() == amux_core::worker_type::WorkerTypeId::CODING {
+            cfg.remove("CC_WORKER_TYPE");
+        } else {
+            cfg.set("CC_WORKER_TYPE", new_type.as_str());
+        }
+        if cfg.get_or("CC_DIR", "").trim().is_empty()
+            && descriptor.project_dir != amux_core::worker_type::Requirement::Required
+        {
+            let dir = crate::api::chat_worker::default_chat_dir(name);
+            let _ = std::fs::create_dir_all(&dir);
+            cfg.set("CC_DIR", &dir);
+        }
+        if let Err(e) = cfg.write(&f) {
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("could not write worker env: {e}")}),
+            );
+        }
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+        let restarted = running && start_session(state, name, "", false).await.0;
+        emit_event(
+            state,
+            name,
+            "worker.type_changed",
+            Some(json!({"from": old_type, "to": new_type, "was_running": running, "restarted": restarted})),
+            None,
+            "api-config",
+        )
+        .await;
+        tracing::info!(session = %name, from = %old_type, to = %new_type, restarted,
+            measured = true, n_considered = 1, verdict = "worker_type_changed",
+            "worker type changed; execution adapter swapped, worker identity kept");
+        return j200(json!({"ok": true, "worker_type": new_type, "renderer": descriptor.renderer,
+            "restarted": restarted,
+            "message": format!("worker type set to {}", descriptor.label)}));
     }
 
     // Change provider (py:76434).
@@ -31519,6 +32304,20 @@ mod tests {
     /// NEVER the queue wait — GE-626 (done before delivery) drops; MS-1188
     /// (still `doing` at delivery after 578s) delivers.
     #[test]
+    fn a_schedule_is_the_only_automation_an_isolated_worker_accepts() {
+        assert!(is_schedule_guard("sched:SCHED-12"));
+        assert!(!is_schedule_guard("board-drive"));
+        assert!(!is_schedule_guard(""));
+        let src = include_str!("session_verbs.rs");
+        assert!(src.contains("if automation && !isolated_schedule && session_is_isolated(name) {"));
+        let body = src.split_once("pub(crate) async fn deliver_automated(").unwrap().1;
+        let body = body.split_once("\n}\n").unwrap().0;
+        assert!(body.contains("if is_schedule_guard(guard) && session_is_isolated(name)"));
+        assert!(!body.contains("send_text(state, name, text, false, SendOrigin::Automation)"),
+            "the direct send must use the computed origin");
+    }
+
+    #[test]
     fn stale_pickup_voids_iff_card_left_doing_not_by_how_long_it_waited() {
         use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
         let pick = &format!("{PICKUP_ANCHOR}GE-626 — work it now.");
@@ -31750,11 +32549,15 @@ mod tests {
              queue, and drained() hardcodes origin: Owner, which is how a schedule fired straight \
              into an isolated lane's pane"
         );
+        // Policy changed 2026-09-26 (Ethan: "isolated workers can still have
+        // schedulers they should"): the origin is computed, and is Owner ONLY
+        // for a schedule into an isolated worker. Every other automated
+        // delivery still reaches isolation_refusal as Automation.
         assert!(
-            body.contains("origin: SendOrigin::Automation"),
-            "the at-boundary fast path must construct its own SendMode with an Automation origin \
-             so isolation_refusal actually sees it"
+            body.contains("            origin,\n") && body.contains("SendOrigin::Automation\n    };"),
+            "the at-boundary fast path must use the computed origin, whose default is Automation"
         );
+        assert!(body.contains("if is_schedule_guard(guard) && session_is_isolated(name)"));
     }
 
     /// The test above spawned real sessions, so this pins the property that
@@ -36120,6 +36923,67 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
     /// this asserts the discriminator directly against real picker shapes, so a
     /// regression that reclassifies a selector cannot pass green.
     #[test]
+    fn a_worktree_workers_lifecycle_transcript_is_found() {
+        let claude = tempfile::tempdir().unwrap();
+        let projects = claude.path().join("projects");
+        let id = "5ded726c-c40a-4b9d-ac1d-6029b5e8d55b";
+        let wt = projects.join(project_name("/repo/.worktrees/wt-worker"));
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        // The old lookup: CC_DIR only. It finds nothing for a worktree worker.
+        let old = projects.join(project_name("/repo")).join(format!("{id}.jsonl"));
+        assert!(!old.exists());
+        let bases = ["/repo/.worktrees/wt-worker".to_string(), String::new(), "/repo".to_string()];
+        assert_eq!(find_transcript(&projects, &bases, id), Some((wt.join(format!("{id}.jsonl")), false)));
+        // Launched somewhere amux does not know: still found by the id.
+        let other = projects.join("-somewhere-else");
+        std::fs::create_dir_all(&other).unwrap();
+        let id2 = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(other.join(format!("{id2}.jsonl")), "{}\n").unwrap();
+        assert_eq!(find_transcript(&projects, &bases, id2), Some((other.join(format!("{id2}.jsonl")), true)));
+        assert_eq!(find_transcript(&projects, &bases, "99999999-2222-3333-4444-555555555555"), None);
+    }
+
+    #[test]
+    fn a_turn_that_ended_on_an_api_error_is_found_in_the_transcript() {
+        // amux-chat-worker, 2026-09-25T00:30:38Z, shape from its transcript.
+        let err = json!({"type":"assistant","error":"server_error","isApiErrorMessage":true,
+            "message":{"role":"assistant","content":[{"type":"text",
+                "text":"API Error: The response stopped arriving. The response above may be incomplete."}]}});
+        let limit = json!({"type":"assistant","error":"rate_limit","isApiErrorMessage":true,
+            "quotaLimits":{"status":"rejected","resetsAt":1}});
+        let ok = json!({"type":"assistant","message":{"role":"assistant","content":[]}});
+        let owner = json!({"type":"user","message":{"role":"user","content":"continue"}});
+        assert_eq!(transcript_api_error(&[ok.clone(), err.clone()]), Some("server_error".into()));
+        assert_eq!(transcript_api_error(&[err.clone(), owner]), None, "a retry ends it");
+        assert_eq!(transcript_api_error(&[err, ok]), None, "a later turn ends it");
+        assert_eq!(transcript_api_error(&[limit]), None, "limits are the rate-limit rule's");
+    }
+
+    #[test]
+    fn a_limit_recorded_in_the_transcript_is_seen_when_the_banner_scrolled_away() {
+        // mvs-infra, 2026-09-24 18:39Z, shape copied from its transcript.
+        let limit = json!({"type":"assistant","isSidechain":false,"error":"rate_limit",
+            "isApiErrorMessage":true,"apiErrorStatus":429,
+            "quotaLimits":{"status":"rejected","resetsAt":1790280600,"rateLimitType":"five_hour"},
+            "message":{"role":"assistant","content":[{"type":"text",
+                "text":"You've hit your session limit \u{00b7} resets 4:10pm (America/New_York)"}]}});
+        let tool = json!({"type":"assistant","message":{"role":"assistant","content":[]}});
+        let owner = json!({"type":"user","message":{"role":"user","content":"continue"}});
+        let meta = json!({"type":"user","isMeta":true,"message":{"role":"user","content":"x"}});
+        let system = json!({"type":"system","content":"Remote Control disconnected"});
+        assert_eq!(transcript_rate_limit(&[tool.clone(), limit.clone(), system.clone(), meta]), Some(1790280600));
+        assert_eq!(transcript_rate_limit(&[limit.clone(), owner]), None, "the owner's continue ends it");
+        assert_eq!(transcript_rate_limit(&[limit.clone(), tool]), None, "a later turn ends it");
+        // The pane shows only the ordinary idle footer, 12+ lines under the banner.
+        let pane = "\u{276f} \n\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+        let now = chrono::Local::now();
+        assert!(observe_claude_limit(pane, 0, now).is_none(), "the screen alone cannot see it");
+        let seen = observe_claude_limit_with(pane, 0, now, Some(1790280600)).expect("transcript sees it");
+        assert_eq!((seen.kind, seen.reset_at, seen.menu), ("transcript", 1790280600, false));
+    }
+
+    #[test]
     fn empty_send_at_a_selector_takes_the_enter_path() {
         // Predicate under test: the exact gate shipped in send_text_inner.
         let picker_enter =
@@ -37452,6 +38316,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
 
         let id = WorkerId::from_ulid(ulid::Ulid::new());
         let config = WorkerConfig {
+            worker_type: Default::default(),
             display_name: "hw".into(),
             name_aliases: Vec::new(),
             cwd: "/tmp".into(),
@@ -37543,6 +38408,7 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         // `managed` is store-managed; `plain` deliberately is not.
         let id = WorkerId::from_ulid(ulid::Ulid::new());
         let config = WorkerConfig {
+            worker_type: Default::default(),
             display_name: "managed".into(),
             name_aliases: vec!["oldname".into()],
             cwd: "/tmp".into(),
@@ -38935,6 +39801,14 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             Some(json!({"toggle_pin": true})),
         )
         .await;
+        let mut project_env = EnvFile::load(&env_path("probe"));
+        project_env.set("CC_PROJECT", "sample");
+        project_env.write(&env_path("probe")).unwrap();
+        let (st, v) = call(&app, "POST", "/api/sessions/probe/delete", None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert!(env_path("probe").exists(), "project worker history must survive");
+        project_env.remove("CC_PROJECT");
+        project_env.write(&env_path("probe")).unwrap();
         let (st, v) = call(&app, "POST", "/api/sessions/probe/delete", None).await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert!(!env_path("probe").exists());
@@ -40798,6 +41672,30 @@ mod steer_boundary_tests {
         assert_eq!(replay.count, 0);
     }
 
+    /// celery-retirement, 2026-09-24: one agent started at 15:39 and its stop
+    /// was lost; later agents' stops pushed the floor to 16:44. The healer's
+    /// terminal record (15:40) must still end the live agent.
+    #[test]
+    fn a_lost_stop_below_the_floor_still_ends_a_live_agent() {
+        let sid = "5ded726c-c40a-4b9d-ac1d-6029b5e8d55b";
+        let mut current = apply_subagent_event(&json!({}), "start", "ghost", "ghost-start", 100.0, sid, 100.0).next;
+        for i in 0..=SUBAGENT_EVENT_HISTORY_LIMIT {
+            current = apply_subagent_event(&current, "start", &format!("later-{i:03}"), &format!("s-{i:03}"), 200.0 + i as f64, sid, 300.0).next;
+            current = apply_subagent_event(&current, "stop", &format!("later-{i:03}"), &format!("e-{i:03}"), 200.5 + i as f64, sid, 300.0).next;
+        }
+        assert!(current["terminal_floor_ts"].as_f64().unwrap() > 101.0, "the floor rose past the ghost's stop");
+        assert_eq!(current["count"], json!(1), "only the ghost is live");
+        // The first delivery was refused under the old rule but its id was
+        // recorded, exactly as on the live server. A retry must still land.
+        current["seen_events"].as_array_mut().unwrap().push(json!("transcript-terminal:ghost"));
+        let healed = apply_subagent_event(&current, "done", "ghost", "transcript-terminal:ghost", 101.0, sid, 999.0);
+        assert_eq!(healed.verdict, "applied");
+        assert_eq!(healed.count, 0);
+        // A replayed START below the floor is still refused.
+        let replay = apply_subagent_event(&healed.next, "start", "later-000", "old-start", 150.0, sid, 999.0);
+        assert_eq!(replay.verdict, "stale_before_terminal_floor");
+    }
+
     /// Fail-closed is the whole safety property: an unknown lane must not be
     /// treated as idle. With no report AND no pane (no tmux session under test),
     /// the capture is empty and "cannot tell" must read as "do not deliver" —
@@ -42095,6 +42993,56 @@ mod composer_state_tests {
     }
 
     #[test]
+    fn slash_commands_are_recognised_and_paths_are_not() {
+        for c in ["/btw should the tagline be x?", "/model", "  /status", "/context", "/compact please", "/mcp:tools", "/review-pr 12"] {
+            assert!(is_slash_command(c), "{c}");
+        }
+        for m in ["/Users/ethan/x.md is here", "/tmp/a.txt", "hello /btw", "/", "//comment", "./x.sh"] {
+            assert!(!is_slash_command(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn a_slash_command_is_never_retried() {
+        let src = include_str!("session_verbs.rs");
+        let i = src.find("let is_slash = is_slash_command(&text);").expect("send path");
+        let body = &src[i..i + 1400];
+        assert!(body.contains("!generating && !is_slash"), "no idle retry keys for slash commands:\n{body}");
+        assert!(body.contains("return (ok, msg);"), "returns before the mid-turn retry:\n{body}");
+    }
+
+    #[test]
+    fn a_panel_over_the_composer_leaves_only_the_transcript_echo() {
+        // Shape of the live mid-turn /btw frame (Claude Code 2.1.283): the
+        // composer is replaced by the answer panel, so the last ❯ is the echo
+        // of the running turn's prompt.
+        let frame = "\u{276f} count slowly from 1 to 60\n\u{23fa} Counting from 1 to 60 \u{b7} 4s\n  \u{23bf}  $ for i in $(seq 1 60); do echo $i; done\n\u{b7} Metamorphosing\u{2026} (9s)\n\u{2594}\u{2594}\u{2594}\u{2594}\n    /btw what is 3+3\n      3 + 3 = 6\n    Esc to close\n";
+        assert_eq!(composer_state(frame), ComposerState::NotVisible);
+        assert_eq!(read_frame(frame, &send_tail_squashed("/btw what is 3+3")), FrameRead::NoUi);
+        // Panel alone, no tool output between: the border still ends it.
+        let frame2 = "\u{276f} hello there\n\u{2594}\u{2594}\u{2594}\n    /btw hi\n    Esc to close\n";
+        assert_eq!(composer_state(frame2), ComposerState::NotVisible);
+    }
+
+    #[test]
+    fn a_slash_panel_hiding_the_composer_is_not_reported_stuck() {
+        // Live 2026-09-25: /btw, /status and /help each opened their panel and
+        // amux answered ok:false "text is sitting in the input box".
+        for gen in [false, true] {
+            for f in [FrameRead::NoUi, FrameRead::Cleared] {
+                let (ok, msg) = slash_outcome(Submission::Stuck, Some(f), gen);
+                assert!(ok, "{f:?} gen={gen}: {msg}");
+                assert_eq!(submit_verdict_of(&msg), Some("unverified"), "{msg}");
+            }
+            for f in [FrameRead::StillThereIdle, FrameRead::StillThereGenerating] {
+                let (ok, msg) = slash_outcome(Submission::Stuck, Some(f), gen);
+                assert!(!ok, "our text back in the box is stuck: {msg}");
+            }
+        }
+        assert_eq!(slash_outcome(Submission::Confirmed, None, false), send_outcome(Submission::Confirmed, false, false));
+    }
+
+    #[test]
     fn a_dim_suggestion_is_not_pending_input() {
         assert_eq!(
             composer_state(LIVE_PLACEHOLDER),
@@ -43095,6 +44043,35 @@ mod steer_max_age_tests {
         ));
     }
 
+    #[test]
+    fn a_confirmed_limit_is_classified_weekly_or_not() {
+        let now = 1_790_000_000;
+        // Reset far out: weekly with no text at all.
+        assert!(is_weekly_limit("", now + 5 * 86_400, now));
+        // The live specimen (2026-09-26, gs-3-bucket-objects), reset unknown.
+        let pane = "\u{23fa} You've hit your weekly limit \u{b7} resets Oct 2 at 3am (America/New_York)\n\
+                    \u{2139} Goal paused \u{b7} usage limit reached\n\
+                    What do you want to do?\n\
+                    \u{276f} 1. Stop and wait for limit to reset";
+        assert!(is_weekly_limit(pane, 0, now));
+        // A session limit resetting soon is not weekly.
+        assert!(!is_weekly_limit(
+            "You've hit your session limit \u{b7} resets 8:30pm",
+            now + 2 * 3600,
+            now
+        ));
+        // The newest sentence wins: a later session-limit line supersedes an
+        // older weekly one still on screen.
+        assert!(!is_weekly_limit(
+            "You've hit your weekly limit \u{b7} resets Oct 2 at 3am\nlater\nYou've hit your session limit \u{b7} resets 8pm",
+            now + 3600,
+            now
+        ));
+        // Beyond the 40-line tail, scrollback does not count.
+        let old = format!("You've hit your weekly limit\n{}", "x\n".repeat(60));
+        assert!(!is_weekly_limit(&old, now + 3600, now));
+    }
+
     /// AMUX-3815: the banner that says a lane IS limited also says WHEN it
     /// lifts, and amux read the first half and dropped the second.
     ///
@@ -43154,6 +44131,36 @@ mod steer_max_age_tests {
             parse_rate_limit_reset_at("continuing automatically at 2am", eleven_pm),
             Some(at(2, 0) + 86_400)
         );
+
+        // A WEEKLY limit names the day (2026-09-26, gs-3-bucket-objects): the
+        // banner line and the menu option both carry "Oct 2 at 3am".
+        let oct2_3am = chrono::Local
+            .with_ymd_and_hms(2026, 10, 2, 3, 0, 0)
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            parse_rate_limit_reset_at(
+                "You've hit your weekly limit \u{b7} resets Oct 2 at 3am (America/New_York)",
+                noon
+            ),
+            Some(oct2_3am)
+        );
+        assert_eq!(
+            parse_rate_limit_reset_at("2. Wait here, then continue automatically at Oct 2 at 3am", noon),
+            Some(oct2_3am)
+        );
+        assert_eq!(
+            parse_rate_limit_reset_at("resets October 2, 3am", noon),
+            Some(oct2_3am)
+        );
+        // A named date already well past is next year's, never months overdue.
+        let dec30 = chrono::Local.with_ymd_and_hms(2026, 12, 30, 12, 0, 0).unwrap();
+        assert_eq!(
+            parse_rate_limit_reset_at("resets Jan 2 at 9am", dec30),
+            Some(chrono::Local.with_ymd_and_hms(2027, 1, 2, 9, 0, 0).unwrap().timestamp())
+        );
+        // A month word with no day is not a date.
+        assert_eq!(parse_rate_limit_reset_at("resets soon", noon), None);
 
         // THE CONTROLS. `None` must stay distinguishable from a time, because
         // the steering detector suppresses a card on a known future reset and
@@ -43673,7 +44680,21 @@ mod gate_agreement_tests {
 
 #[cfg(test)]
 mod pipe_reconcile_tests {
-    use super::should_rearm_pipe;
+    use super::{pane_is_owned_in, should_rearm_pipe};
+
+    /// A second amux server shares the machine's tmux server. Its reconciler
+    /// must leave panes it does not own alone: on 2026-09-24 a test server
+    /// with its own AMUX_HOME re-pointed 20 live lanes' pane logs into its
+    /// scratch home, because every foreign pane read as "writer changed".
+    #[test]
+    fn only_panes_with_an_env_file_in_this_home_are_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mine.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        assert!(pane_is_owned_in(dir.path(), "mine"));
+        assert!(!pane_is_owned_in(dir.path(), "someone-elses-lane"));
+        std::fs::create_dir(dir.path().join("dir.env")).unwrap();
+        assert!(!pane_is_owned_in(dir.path(), "dir"), "a directory is not a lane");
+    }
 
     /// THE POSITIVE CASE: the incident that motivated this — rec-gov, a live
     /// `node` agent with 1 child and pane_pipe=0, logging nothing.
@@ -47256,6 +48277,59 @@ mod project_hook_review_tests {
         }
         cfg.set("CC_PROVIDER","claude"); assert_eq!(project_hook_review_key(&cfg,pane),None);
         cfg.set("CC_PROVIDER","codex"); cfg.remove("CC_PROJECT"); assert_eq!(project_hook_review_key(&cfg,pane),None);
+    }
+    #[test]
+    fn project_checkout_picker_uses_only_the_registered_checkout_without_persisting_preference() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("worker.env");
+        std::fs::write(&path,"CC_PROVIDER=codex\nCC_PROJECT=demo\n").unwrap();
+        let mut cfg=EnvFile::load(&path);
+        let pane="› 1. Use session directory (/repo/.worktrees/old)\n  2. Use current directory (/repo/.worktrees/project-demo)\n  3. Always use session directory\n  4. Always use current directory\n  Press enter to continue";
+        let checkout=Path::new("/repo/.worktrees/project-demo");
+        assert_eq!(project_checkout_directory_key(&cfg,pane,checkout),Some("2"));
+        assert!(ALLOWED_TMUX_CHAR_KEYS.contains(&project_checkout_directory_key(&cfg,pane,checkout).unwrap()), "the exact checkout choice must be sendable");
+        assert_eq!(project_checkout_directory_key(&cfg,&pane.replace("› 1.","  1.").replace("  2.","› 2."),checkout),Some("Enter"));
+        assert_eq!(project_checkout_directory_key(&cfg,pane,Path::new("/repo/.worktrees/other")),None);
+        assert_eq!(project_checkout_directory_key(&cfg,&pane.replace("2. Use current directory", "2. Trust this directory"),checkout),None);
+        assert_eq!(project_checkout_directory_key(&cfg,&format!("{pane}\n› Work on something else"),checkout),None);
+        for key in ["CC_ISOLATED","CC_PAUSED","CC_ARCHIVED","CC_PROJECT_PAUSED"] {
+            cfg.set(key,"1"); assert_eq!(project_checkout_directory_key(&cfg,pane,checkout),None); cfg.remove(key);
+        }
+        cfg.set("CC_PROVIDER","claude"); assert_eq!(project_checkout_directory_key(&cfg,pane,checkout),None);
+    }
+    #[test]
+    fn queued_repair_can_clear_its_checkout_picker_without_creating_a_new_claim() {
+        use crate::project_execution::planner::{CardPlan, Execution};
+        use amux_core::project::Phase;
+        let mut plan=CardPlan{id:"A".into(),phase:Phase::Ready,action:"claim".into(),waiting_reason:None,waiting_label:None,
+            execution:Execution{stage:"repair".into(),worker:"owner".into(),..Default::default()}};
+        assert!(project_checkout_repair_claim_ready(&[plan.clone()],"owner"));
+        assert!(!project_checkout_repair_claim_ready(&[plan.clone()],"other"));
+        plan.execution.suspended=true;assert!(!project_checkout_repair_claim_ready(&[plan.clone()],"owner"));
+        plan.execution.suspended=false;plan.action="observe".into();assert!(!project_checkout_repair_claim_ready(&[plan.clone()],"owner"));
+        plan.action="claim".into();plan.execution.stage="waiting".into();assert!(!project_checkout_repair_claim_ready(&[plan],"owner"));
+    }
+    #[test]
+    fn only_a_live_project_codex_retry_screen_is_eligible_for_bounded_repair() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("worker.env");
+        std::fs::write(&path,"CC_PROVIDER=codex\nCC_PROJECT=demo\n").unwrap();
+        let mut cfg=EnvFile::load(&path);
+        let pane="This conversation is open in another app   R to Retry\nClose it there and press R to continue here.\nr retry";
+        assert!(project_codex_conversation_retry_ready(&cfg,pane,0,1000));
+        assert!(ALLOWED_TMUX_CHAR_KEYS.contains(&"r"),"the retry key must be accepted by the sender");
+        assert!(!project_codex_conversation_retry_ready(&cfg,pane,900,1000));
+        assert!(project_codex_conversation_retry_ready(&cfg,pane,700,1000));
+        assert!(!project_codex_conversation_retry_ready(&cfg,"› Ask Codex to do anything",0,1000));
+        for key in ["CC_ISOLATED","CC_PAUSED","CC_PROJECT_PAUSED","CC_ARCHIVED","CC_REVIEW_HELD"] {
+            cfg.set(key,"1");
+            assert!(!project_codex_conversation_retry_ready(&cfg,pane,0,1000),"{key}");
+            cfg.remove(key);
+        }
+        cfg.set("CC_PROVIDER","claude");
+        assert!(!project_codex_conversation_retry_ready(&cfg,pane,0,1000));
+        cfg.set("CC_PROVIDER","codex");cfg.remove("CC_PROJECT");
+        assert!(!project_codex_conversation_retry_ready(&cfg,pane,0,1000));
     }
 }
 

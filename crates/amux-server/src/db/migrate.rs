@@ -495,8 +495,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 87,
-        name: "0087_window_stats_indexes",
-        sql: include_str!("../../migrations/0087_window_stats_indexes.sql"),
+        name: "0087_worker_type",
+        sql: include_str!("../../migrations/0087_worker_type.sql"),
+    },
+    Migration {
+        version: 88,
+        name: "0088_window_stats_indexes",
+        sql: include_str!("../../migrations/0088_window_stats_indexes.sql"),
     },
 ];
 

@@ -2717,6 +2717,32 @@ fn confirmed_active_model(meta: &serde_json::Value, provider: &str) -> String {
 /// `board_fresh` and `summary_fresh` carry the SAME rule (`ts > 0 && age <= 24h`)
 /// so the two time-sensitive sources age out identically; a stale summary falls
 /// through to a stale board title, then to desc.
+/// "[09:28 AM] build a video like this @/Users/x/up.png" -> "build a video like this",
+/// one line, at most 140 characters. Slash commands and bare "continue"-style
+/// nudges say nothing about the task and yield "".
+fn task_label_from_message(text: &str) -> String {
+    let t = text.trim();
+    static STAMP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static UPLOAD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let stamp = STAMP.get_or_init(|| regex::Regex::new(r"^\[\s*\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?\s*\]\s*").unwrap());
+    let upload = UPLOAD.get_or_init(|| regex::Regex::new(r"@?/[^\s]+\.(?:png|jpe?g|gif|webp|heic|pdf)\b").unwrap());
+    let t = stamp.replace(t, "");
+    let t = upload.replace_all(&t, "");
+    let one: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = one.to_lowercase();
+    if one.starts_with('/') || one.chars().count() < 12
+        || matches!(lower.as_str(), "continue" | "go" | "yes" | "ok" | "do both" | "you do it" | "you do it all")
+    {
+        return String::new();
+    }
+    let mut out: String = one.chars().take(140).collect();
+    if one.chars().count() > 140 {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+#[cfg(test)]
 fn resolve_task_name(
     board_title: Option<&str>,
     board_fresh: bool,
@@ -2724,10 +2750,27 @@ fn resolve_task_name(
     summary_fresh: bool,
     desc: &str,
 ) -> (String, &'static str) {
+    resolve_task_name_with(board_title, board_fresh, summary, summary_fresh, None, desc)
+}
+
+/// `recent_message` is the owner's latest message to this worker within 24h.
+/// It outranks a stale card title and the role description (Ethan,
+/// 2026-09-25: "make sure the task names are up to date"; amux-helper, a
+/// worker with no card, showed its role text as its task).
+fn resolve_task_name_with(
+    board_title: Option<&str>,
+    board_fresh: bool,
+    summary: &str,
+    summary_fresh: bool,
+    recent_message: Option<&str>,
+    desc: &str,
+) -> (String, &'static str) {
     if board_fresh {
         (board_title.unwrap_or_default().to_string(), "board")
     } else if summary_fresh {
         (summary.to_string(), "summary")
+    } else if let Some(m) = recent_message.filter(|m| !m.trim().is_empty()) {
+        (m.to_string(), "message")
     } else if let Some(t) = board_title {
         (t.to_string(), "board")
     } else {
@@ -3772,7 +3815,38 @@ pub async fn create_session_legacy(
         )
             .into_response();
     }
-    let dir = s("dir");
+    // WORKER TYPE (ACW-2): selects the execution adapter + renderer. Absent
+    // means coding, the only behaviour that existed before the field, so old
+    // clients create exactly what they always did. Type requirements are
+    // checked HERE, before anything is written, so an impossible combination
+    // (a chat worker in a worktree, a provider its adapter cannot drive) is a
+    // 400 naming the reason, not a worker that fails at its first turn.
+    let worker_type = match amux_core::worker_type::WorkerTypeId::parse(&s("worker_type")) {
+        Ok(t) => t,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
+    let descriptor = worker_type.descriptor();
+    let requested_provider = match s("provider") {
+        p if p.is_empty() => "claude".to_string(),
+        p => p,
+    };
+    if let Err(e) = descriptor.validate(&requested_provider, worktree) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e, "worker_type": worker_type})),
+        )
+            .into_response();
+    }
+    let mut dir = s("dir");
+    if dir.is_empty()
+        && descriptor.project_dir != amux_core::worker_type::Requirement::Required
+    {
+        // No project needed: a private scratch dir keeps every cwd reader
+        // (transcripts, scope, peek) working without a repo.
+        dir = crate::api::chat_worker::default_chat_dir(&name);
+    }
     match ensure_work_dir(&dir) {
         WorkDirOutcome::Ok => {}
         WorkDirOutcome::Created => {
@@ -3808,6 +3882,10 @@ pub async fn create_session_legacy(
         &default_model,
     );
     let mut pairs: Vec<(&str, String)> = vec![("CC_DIR", dir.clone())];
+    // Written only when not the default, same convention as CC_PROVIDER.
+    if worker_type.as_str() != amux_core::worker_type::WorkerTypeId::CODING {
+        pairs.push(("CC_WORKER_TYPE", worker_type.as_str().to_string()));
+    }
     // An invited human's author comes from the verified member cookie. The
     // request body and ordinary worker/session headers are caller-controlled,
     // so neither may decide who appears as the worker's creator.
@@ -3917,15 +3995,19 @@ pub async fn create_session_legacy(
     // leave the worker stopped, saying why.
     let requested = body.get("start").and_then(serde_json::Value::as_bool).unwrap_or(true)
         && provider != "iterm2";
+    // The spawn guard protects the tmux server; a type that runs no terminal
+    // has nothing for it to protect.
+    let needs_terminal =
+        descriptor.terminal != amux_core::worker_type::Requirement::Unsupported;
     let autostart = requested
-        && match crate::backend::tmux_health::spawn_allowed_here() {
+        && (!needs_terminal || match crate::backend::tmux_health::spawn_allowed_here() {
             Ok(()) => true,
             Err(why) => {
                 tracing::info!(session = %name, %why, measured = true, n_considered = 1,
                     verdict = "created_worker_autostart_skipped", "not starting the created worker");
                 false
             }
-        };
+        });
     let prompt = s("prompt");
     if autostart {
         let st = _state.clone();
@@ -3956,6 +4038,8 @@ pub async fn create_session_legacy(
             "name": name,
             "dir": dir,
             "provider": provider,
+            "worker_type": worker_type,
+            "renderer": descriptor.renderer,
             "creator": creator,
             "running": false,
             "starting": autostart,
@@ -4117,7 +4201,17 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         // the retained shell; the durable lifecycle marker supplies the
         // authoritative worker-liveness boundary.
         let review_held = env.get("CC_REVIEW_HELD").is_some_and(|v| v == "1");
-        let is_running = signals.agent_running(&tmux) && !review_held;
+        // ACW-6: liveness comes from the worker type's execution adapter;
+        // the terminal pipeline's answer is the tmux scan.
+        let worker_type = crate::api::worker_exec::worker_type_of_env(
+            env.get("CC_WORKER_TYPE").map(String::as_str),
+        );
+        let adapter_running =
+            match crate::api::worker_exec::adapter_for(&worker_type).running(&name) {
+                crate::api::worker_exec::Dispatch::Handled(r) => r,
+                crate::api::worker_exec::Dispatch::Terminal => signals.agent_running(&tmux),
+            };
+        let is_running = adapter_running && !review_held;
         // CC_ARCHIVED=1 is Python's session-archive marker (amux-server.py
         // :20346) — blocked-sessions.txt is QUARANTINE, a different thing;
         // conflating them reported 0 archived against a fleet with dozens.
@@ -4172,6 +4266,15 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             && meta["input_required_since"].as_i64().unwrap_or(0) > 0
         {
             status = "waiting".to_string();
+        }
+        // A TURN THAT ENDED ON AN API ERROR is `api_error`, not idle (Ethan,
+        // 2026-09-24: "The response stopped arriving" read idle). The sweep
+        // stamps it from the conversation's own error record.
+        if is_running
+            && matches!(status.as_str(), "idle" | "waiting")
+            && meta["api_error_since"].as_i64().unwrap_or(0) > 0
+        {
+            status = "api_error".to_string();
         }
         // STUCK COMPOSER (AMUX-2904): genuinely TYPED text sits under `❯`
         // with no live turn and no live agents — an Enter that never landed,
@@ -4296,7 +4399,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // consumer). code/count stay honest empties — the tail scrape
             // proves a 5xx is PRESENT, not which one or how many times.
             "api_error": status == "api_error",
-            "api_error_code": "",
+            "api_error_code": meta["api_error_code"].as_str().unwrap_or(""),
             "api_error_count": 0,
             // COMPUTED, NOT HARDCODED (AMUX-2820). These were literal `false`
             // and `0`, with a comment calling them "a correct-TYPED honest
@@ -4368,6 +4471,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "provider": configured_provider,
             "model": env.get("CC_MODEL").cloned().unwrap_or_default(),
             "dir": env.get("CC_DIR").cloned().unwrap_or_default(),
+            "project": env.get("CC_PROJECT").cloned().unwrap_or_default(),
             "preview": "",
             "task_name": "",
             "desc": env.get("CC_DESC").cloned().unwrap_or_default(),
@@ -4409,6 +4513,11 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
                 env.get("CC_BACKEND").map(String::as_str),
             ),
         }));
+        // Outside the literal above, which sits at json!'s recursion limit.
+        if let Some(row) = out.last_mut() {
+            row["worker_type"] = json!(worker_type);
+            row["renderer"] = json!(worker_type.descriptor().renderer);
+        }
     }
     out
 }
@@ -4513,7 +4622,7 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
         "SELECT w.display_name, w.state, w.provider, w.model, w.cwd,
                 (SELECT COUNT(*) FROM _amux_sessions s
                  WHERE s.worker_id = w.id AND s.ended_at IS NULL) AS live,
-                w.lifecycle
+                w.lifecycle, w.worker_type
          FROM _amux_workers w
          WHERE w.lifecycle != 'deleted'
          ORDER BY w.display_name",
@@ -4529,6 +4638,7 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             .get::<_, Option<String>>(6)?
             .unwrap_or_else(|| "active".into());
         let archived = lifecycle == "archived";
+        let worker_type = amux_core::worker_type::WorkerTypeId::new(r.get::<_, String>(7)?);
         Ok(json!({
             // The Python list's load-bearing fields; ones the Rust side
             // cannot honestly fill yet are present-and-empty, NOT omitted —
@@ -4539,6 +4649,8 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             "archived": archived,
             "lifecycle": lifecycle,
             "provider": provider,
+            "worker_type": worker_type,
+            "renderer": worker_type.descriptor().renderer,
             "model": model.unwrap_or_default(),
             "dir": cwd,
             "preview": "",
@@ -4582,6 +4694,24 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             }
         }
     }
+    // The owner's latest message per worker in the last 24h, cleaned for a
+    // one-line task label (stamp and attachment paths removed).
+    let recent_owner_messages: BTreeMap<String, String> = {
+        let since_ms = (crate::runtime_jobs::registry::unix_now() as i64 - 86_400) * 1000;
+        let mut stmt = conn.prepare(
+            "SELECT session, text FROM cmd_history WHERE type = 'user' AND ts >= ?1
+             AND session IS NOT NULL ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = BTreeMap::new();
+        for (sess, text) in rows.flatten() {
+            let label = task_label_from_message(&text);
+            if !label.is_empty() {
+                out.insert(sess, label);
+            }
+        }
+        out
+    };
     // Board linkage per card, Python's exact query + precedence
     // (py:20187-20197, 20348-20365): ORDER BY updated ASC with dict
     // overwrite so the NEWEST-touched doing card wins (the 2026-07-22
@@ -4591,6 +4721,7 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
         let mut stmt = conn.prepare(
             "SELECT session, id, title, COALESCE(updated, 0) FROM issues
              WHERE status = 'doing' AND deleted IS NULL AND session IS NOT NULL
+               AND COALESCE(archived, 0) = 0
              ORDER BY updated ASC",
         )?;
         let mut doing: BTreeMap<String, (String, String, i64)> = BTreeMap::new();
@@ -4794,8 +4925,16 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             };
             if v["isolated"].as_bool() == Some(true) {
                 // Raw CLI status must not be rewritten by historical board claims.
-                v["task_name"] = v["desc"].clone();
-                v["task_source"] = json!("desc");
+                // The owner's own latest message is not a board claim: it is
+                // what this worker was last asked to do, so it names the task
+                // better than the role description (amux-helper, 2026-09-25).
+                if let Some(m) = recent_owner_messages.get(&name) {
+                    v["task_name"] = json!(m);
+                    v["task_source"] = json!("message");
+                } else {
+                    v["task_name"] = v["desc"].clone();
+                    v["task_source"] = json!("desc");
+                }
                 v["task_board_id"] = json!("");
                 v["last_human_ts"] = json!(last_human_ts.get(&name).copied().unwrap_or(0));
                 v["runtime_board"] = json!({"measured":true,"n_considered":0,
@@ -4906,16 +5045,20 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             // worker's role, which is honest rather than a wrong task claim.
             let summary_fresh = !summary.is_empty() && summary_ts > 0 && now - summary_ts <= 86400;
             let desc = v["desc"].as_str().unwrap_or("").to_string();
-            let (tname, tsrc) = resolve_task_name(
+            let (tname, tsrc) = resolve_task_name_with(
                 board.map(|(_, t, _)| t.as_str()),
                 board_fresh,
                 &summary,
                 summary_fresh,
+                recent_owner_messages.get(&name).map(String::as_str),
                 &desc,
             );
             v["task_name"] = json!(tname);
             v["task_source"] = json!(tsrc);
-            v["task_override"] = json!(summary);
+            // The dashboard shows a non-empty override as the task headline, so
+            // a stale one must not be sent at all: this is how a 40-day-old
+            // "AMUX-2676 — worker card evidence" sat above amux's real card.
+            v["task_override"] = json!(if summary_fresh { summary.as_str() } else { "" });
             v["task_override_updated"] = json!(summary_ts);
             v["status"] = json!(truth.status);
             v["task_board_id"] = json!(truth.card_id);
@@ -5910,6 +6053,20 @@ pub(crate) mod tests {
         let (name, src) = resolve_task_name(None, false, "", false, "just the role");
         assert_eq!(src, "desc");
         assert_eq!(name, "just the role");
+    }
+
+    #[test]
+    fn a_worker_with_no_card_shows_the_owners_latest_message_not_its_role() {
+        let label = task_label_from_message(
+            "[10:43 AM] figure out why this task is stuck up ehtere. and make sure the task names are up to date @/Users/ethan/.amux/uploads/95fcc22b70cc-image.png");
+        assert_eq!(label, "figure out why this task is stuck up ehtere. and make sure the task names are up to date");
+        assert_eq!(task_label_from_message("continue"), "");
+        assert_eq!(task_label_from_message("/clear"), "");
+        let (name, src) = resolve_task_name_with(None, false, "", false, Some(&label), "Ethan's direct-request session");
+        assert_eq!((name.as_str(), src), (label.as_str(), "message"));
+        // A fresh card still wins; a stale card title does not beat a recent message.
+        assert_eq!(resolve_task_name_with(Some("AMUX-9 card"), true, "", false, Some(&label), "d").1, "board");
+        assert_eq!(resolve_task_name_with(Some("old card"), false, "", false, Some(&label), "d").1, "message");
     }
 
     /// ATE-92: a control/checkpoint turn does not release still-live causal
