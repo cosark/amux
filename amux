@@ -1362,7 +1362,12 @@ cmd_send() {
 
   local tname
   tname=$(tmux_name "$name")
-  is_running "$name" || die "worker '$name' is not running"
+  # NO LOCAL is_running GATE for a message (AMUX-5237). This used to die with
+  # "worker 'X' is not running" before the server was asked, so mixpeek-general's
+  # follow-ups to paused mixpeek-observability and backend were dropped on the
+  # floor. The server decides now: a paused or stopped lane gets the message
+  # QUEUED for resume and the reply says the sender owns the outcome meanwhile.
+  # Raw --keys still needs a live pane, so the check stays on that branch.
 
   # ── Payload via --stdin / --file: the text NEVER transits a shell-evaluated
   # string (AMUX-1888). Passing a message as a double-quoted argument lets the
@@ -1415,6 +1420,7 @@ cmd_send() {
   # Check for --keys flag
   if [[ "${1:-}" == "--keys" ]]; then
     shift
+    is_running "$name" || die "worker '$name' is not running"
     tmux send-keys -t "=$tname:" "$@"
     echo "${GREEN}sent keys${RESET} to $name"
   else
@@ -1646,6 +1652,11 @@ if d.get("error") or d.get("ok") is False:
     print(f"send to {tgt} FAILED: {d.get('error') or d.get('message') or 'no reason given'}",
           file=sys.stderr)
     sys.exit(2)
+if d.get("held_for_resume"):
+    # AMUX-5237: NOT delivered. Say so first, so a caller skimming for "sent"
+    # cannot read a parked message as a landed one.
+    print(f"QUEUED for {tgt}, not delivered: {d.get('message', '')}")
+    sys.exit(0)
 print(f"sent to {tgt} (origin-stamped): {d.get('message', 'ok')}")
 PYEOF
     # A send that REACHED the server is the only moment we know it is
@@ -1713,6 +1724,9 @@ if d.get("error") or d.get("ok") is False:
         file=sys.stderr,
     )
     sys.exit(2)
+if d.get("held_for_resume"):
+    print(f"QUEUED for {tgt} (retry {attempt} after {waited}s), not delivered: {d.get('message', '')}")
+    sys.exit(0)
 # Both operands are REQUIRED, not defaulted: a missing one must crash here
 # rather than print an empty field that reads as a measured zero. That default
 # is the whole bug this line is fixing, and the refusal arm above reads the

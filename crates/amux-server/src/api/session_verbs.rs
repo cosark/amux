@@ -15718,6 +15718,15 @@ pub(crate) fn set_legacy_paused(name: &str, paused: bool) -> anyhow::Result<()> 
         cfg.remove("CC_PAUSED");
     }
     cfg.write(&env_path(name))?;
+    // WHEN it was paused (AMUX-5237), so a send held for resume can tell the
+    // sender "paused since <time>" instead of a bare "paused". Only a real
+    // transition stamps it: re-pausing a paused lane keeps the original time.
+    let meta = load_meta(name);
+    if paused && meta_i64(&meta, "paused_at") <= 0 {
+        update_meta(name, &[("paused_at", json!(now_i64()))]);
+    } else if !paused {
+        update_meta(name, &[("paused_at", Value::Null)]);
+    }
     crate::api::sessions_legacy::invalidate_sessions_cache();
     Ok(())
 }
@@ -17225,7 +17234,8 @@ const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-gene
      When YOUR card truly needs an event only another lane can produce (a clearance, an \
      approval), park it with `amux signal wait <CARD> <name>` instead of polling their pane. \
      The lane that produces it runs `amux signal raise <name> --note <text>`, which clears \
-     every wait on that name and wakes you.\n\n\
+     every wait on that name and wakes you. A send to a paused or stopped lane is queued \
+     until it resumes, and you own that work meanwhile.\n\n\
      | worker | groups | description | provider / model | workspace / branch |\n|---|---|---|---|---|\n";
 
 /// The fleet roster every worker gets, regenerated on each write.
@@ -23964,6 +23974,17 @@ pub(crate) fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static
     ) {
         return Err(why);
     }
+    cross_group_policy_ok(origin, target)
+}
+
+/// [`cross_group_send_ok`] without its lifecycle half: isolation and the group
+/// policy only. For a send the lifecycle gate has already decided to HOLD for a
+/// paused or stopped target (AMUX-5237); every other caller wants the full
+/// resolver.
+pub(crate) fn cross_group_policy_ok(origin: &str, target: &str) -> Result<&'static str, String> {
+    if origin.is_empty() || origin == target {
+        return Ok("self-or-human");
+    }
     // ISOLATED TARGET (AMUX-3232): a raw agent is not a peer/relay target. The
     // OWNER (empty origin) already returned above, so this refuses ONLY a PEER
     // send; owner peek/send from the dashboard is untouched. The refusal names
@@ -24299,6 +24320,112 @@ pub(crate) async fn send_verb(
     send_post_detached(state, name, headers, body).await
 }
 
+/// A peer send HELD for the target's resume instead of refused (AMUX-5237).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerHold {
+    /// `paused` or `not-running`: the same reason slugs `lane_block_reason`
+    /// uses, so the queued row and the send response agree about why.
+    pub(crate) reason: &'static str,
+    /// Unix seconds the lane was paused, when amux recorded it (`paused_at` in
+    /// the session meta, written by `set_legacy_paused`). `None` means NOT
+    /// RECORDED: lanes paused before this shipped, and every stopped lane.
+    pub(crate) since: Option<i64>,
+}
+
+/// Kill switch for queueing a peer send to a paused or stopped lane. Resolved
+/// on the TARGET lane (worker > group > global, process env wins), default ON.
+/// Off restores the AMUX-4566 refusal for that lane.
+pub(crate) const PAUSED_SEND_QUEUE_KEY: &str = "AMUX_SEND_QUEUE_FOR_PAUSED";
+
+pub(crate) fn paused_send_queue_enabled_in(
+    home: &std::path::Path,
+    target: &str,
+    process: Option<&str>,
+) -> bool {
+    fn is_off(v: &str) -> bool {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    }
+    if let Some(v) = process.filter(|v| !v.trim().is_empty()) {
+        return !is_off(v);
+    }
+    scoped_setting_in(home, target, PAUSED_SEND_QUEUE_KEY)
+        .as_deref()
+        .map(|v| !is_off(v))
+        .unwrap_or(true)
+}
+
+/// What the lifecycle gate does with a PEER send, with every lookup done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerLifecycle {
+    Pass,
+    /// Queue it for delivery when the lane resumes; the reason slug.
+    Hold(&'static str),
+    /// The AMUX-4566 refusal (sender not active, target archived or
+    /// review-held, or queueing switched off for a paused target).
+    RefuseLifecycle,
+    /// The 2026-09-15 stopped-lane refusal, kept when queueing is off.
+    RefuseStopped,
+}
+
+/// The decision, pure. `target_running` is only consulted for an ACTIVE
+/// target, which is the only case the live probe is run for.
+///
+/// WHY PAUSED AND STOPPED NOW QUEUE (AMUX-5237). mixpeek-general sent follow-ups
+/// to mixpeek-observability and backend, both paused, got "is not running",
+/// and dropped the work: a refusal tells the sender "no" without telling it the
+/// work is still its own. A paused lane is resumed routinely, and the steering
+/// queue already holds a `paused` row until resume (`block_reason_explain`), so
+/// the message is kept and the sender is told, in the same response, that it
+/// owns the outcome meanwhile. Automated producers are still refused at the
+/// chokepoint (the AMUX-4574 flood of callbacks into paused lanes), because
+/// the hold passes an EMPTY guard only for a verified peer's own words.
+///
+/// What still refuses, unchanged: a sender that is not active, an archived
+/// target (nothing wakes it), a review-held target (a human decision is
+/// pending), and isolated targets (checked before this, a separate fix).
+pub(crate) fn peer_lifecycle_verdict(
+    origin_lifecycle: &str,
+    target_lifecycle: &str,
+    target_running: bool,
+    queue_enabled: bool,
+) -> PeerLifecycle {
+    if origin_lifecycle != "active" {
+        return PeerLifecycle::RefuseLifecycle;
+    }
+    match target_lifecycle {
+        "active" if target_running => PeerLifecycle::Pass,
+        "active" if queue_enabled => PeerLifecycle::Hold("not-running"),
+        "active" => PeerLifecycle::RefuseStopped,
+        "paused" if queue_enabled => PeerLifecycle::Hold("paused"),
+        _ => PeerLifecycle::RefuseLifecycle,
+    }
+}
+
+/// The sentence a held send answers with. Starts with "queued" on purpose:
+/// `submission_verdict` and the history row read that prefix as a deferred
+/// delivery, which is exactly what this is.
+pub(crate) fn held_send_message(name: &str, hold: &PeerHold) -> String {
+    let since = hold
+        .since
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    let state = match (hold.reason, since) {
+        ("paused", Some(t)) => format!("'{name}' is paused since {t}"),
+        ("paused", None) => format!("'{name}' is paused (pause time not recorded)"),
+        (_, _) => format!("'{name}' is stopped (not running; stop time not recorded)"),
+    };
+    let when = if hold.reason == "paused" {
+        format!("when the owner resumes it (amux resume {name})")
+    } else {
+        "when the worker is started".to_string()
+    };
+    format!(
+        "queued, not delivered: {state}. It delivers {when}, and nothing forces it through \
+         before then. You own the outcome meanwhile: do the work yourself or route it \
+         elsewhere rather than waiting on this lane."
+    )
+}
+
 /// Isolation is a reachability boundary for both direct and queued peer
 /// messages. Check before recording history/dedupe/queue state, independently
 /// of the configurable group policy. Authenticated dashboard members remain
@@ -24306,74 +24433,99 @@ pub(crate) async fn send_verb(
 /// AMUX-4566 on the send path, BEFORE the group gate: a group refusal mints a
 /// single-use cross-group approval grant, and no grant can make a paused or
 /// archived lane a peer, so this answer must never reach that branch.
-async fn lifecycle_peer_refusal(
+///
+/// `Ok(None)` passes, `Ok(Some(hold))` queues for resume (AMUX-5237),
+/// `Err(response)` refuses.
+async fn lifecycle_peer_gate(
     state: &AppState,
     name: &str,
     headers: &HeaderMap,
-) -> Option<Response> {
+) -> Result<Option<PeerHold>, Response> {
     let origin: String = hdr_worker(headers).trim().chars().take(64).collect();
     if super::org::local_member_actor(headers).is_some() || origin.is_empty() || origin == name {
-        return None;
+        return Ok(None);
     }
     let (origin_lc, target_lc) = (lane_lifecycle(&origin), lane_lifecycle(name));
-    if let Some(reason) = lifecycle_interaction_refusal(&origin, origin_lc, name, target_lc) {
-        tracing::warn!(origin = %origin, target = %name, origin_lifecycle = origin_lc,
-            target_lifecycle = target_lc, verdict = "lifecycle_refused", "{reason}");
-        emit_event(
-            state,
-            name,
-            "send.lifecycle_refused",
-            Some(json!({"origin": origin, "target": name,
-                        "origin_lifecycle": origin_lc, "target_lifecycle": target_lc})),
-            None,
-            "lifecycle",
-        )
-        .await;
-        return Some(jresp(
-            StatusCode::CONFLICT,
-            json!({
-                "ok": false, "error": reason, "blocked": "lifecycle", "code": "lifecycle_not_active",
-                "origin_lifecycle": origin_lc, "target_lifecycle": target_lc,
-                "what_to_do": "Only active workers interact. Resume the paused lane (amux resume <name>) or ask the owner; no approval grant changes this.",
-            }),
-        ));
+    // The live probe only for an active target: a paused lane is stopped by
+    // construction, and the probe is the one expensive read here.
+    let running = origin_lc != "active" || target_lc != "active" || is_running(name).await;
+    let queue_enabled = paused_send_queue_enabled_in(
+        &home(),
+        name,
+        std::env::var(PAUSED_SEND_QUEUE_KEY).ok().as_deref(),
+    );
+    match peer_lifecycle_verdict(origin_lc, target_lc, running, queue_enabled) {
+        PeerLifecycle::Pass => Ok(None),
+        PeerLifecycle::Hold(reason) => {
+            let since = (reason == "paused")
+                .then(|| meta_i64(&load_meta(name), "paused_at"))
+                .filter(|t| *t > 0);
+            tracing::info!(origin = %origin, target = %name, reason,
+                paused_since = since.unwrap_or(0), verdict = "peer_send_held_for_resume",
+                measured = true, n_considered = 1,
+                "peer send to a {reason} lane queued for resume; the sender owns the outcome");
+            Ok(Some(PeerHold { reason, since }))
+        }
+        PeerLifecycle::RefuseLifecycle => {
+            let reason = lifecycle_interaction_refusal(&origin, origin_lc, name, target_lc)
+                .unwrap_or_else(|| {
+                    format!(
+                        "interaction refused: '{name}' is {target_lc} and queueing for it is \
+                         switched off ({PAUSED_SEND_QUEUE_KEY}=0)."
+                    )
+                });
+            tracing::warn!(origin = %origin, target = %name, origin_lifecycle = origin_lc,
+                target_lifecycle = target_lc, verdict = "lifecycle_refused", "{reason}");
+            emit_event(
+                state,
+                name,
+                "send.lifecycle_refused",
+                Some(json!({"origin": origin, "target": name,
+                            "origin_lifecycle": origin_lc, "target_lifecycle": target_lc})),
+                None,
+                "lifecycle",
+            )
+            .await;
+            Err(jresp(
+                StatusCode::CONFLICT,
+                json!({
+                    "ok": false, "error": reason, "blocked": "lifecycle", "code": "lifecycle_not_active",
+                    "origin_lifecycle": origin_lc, "target_lifecycle": target_lc,
+                    "what_to_do": "Only active workers interact. Resume the paused lane (amux resume <name>) or ask the owner; no approval grant changes this.",
+                }),
+            ))
+        }
+        // STOPPED is a THIRD state `lane_lifecycle` cannot see (Ethan,
+        // 2026-09-15): it reads only CC_ARCHIVED/CC_PAUSED from the env file,
+        // so a lane that crashed or was killed outside amux still reads
+        // "active". Reached only with queueing switched off; otherwise the
+        // send is held above.
+        PeerLifecycle::RefuseStopped => {
+            tracing::warn!(origin = %origin, target = %name, verdict = "stopped_refused",
+                "interaction refused: '{name}' is not running");
+            emit_event(
+                state,
+                name,
+                "send.stopped_refused",
+                Some(json!({"origin": origin, "target": name})),
+                None,
+                "lifecycle",
+            )
+            .await;
+            Err(jresp(
+                StatusCode::CONFLICT,
+                json!({
+                    "ok": false,
+                    "error": format!(
+                        "interaction refused: '{name}' is not running (no live worker process), so no \
+                         peer message reaches it."
+                    ),
+                    "blocked": "lifecycle", "code": "target_not_running",
+                    "what_to_do": "Start or resume the worker before sending, or ask the owner; no approval grant changes this.",
+                }),
+            ))
+        }
     }
-    // STOPPED is a THIRD state `lane_lifecycle` cannot see (Ethan, 2026-09-15):
-    // it reads only CC_ARCHIVED/CC_PAUSED from the env file, so a lane that
-    // crashed, was killed outside amux, or never started at all still reads
-    // "active" and sailed straight through the check above — accepted,
-    // queued, and silently stuck (the same shape as the 21-deep steering
-    // queue measured on a genuinely paused lane, but for a lane that isn't
-    // even formally paused). `is_running` is the same live probe
-    // `stop_session_process` already trusts for this exact question; the
-    // common case (tmux session gone entirely) answers from one cheap `tmux
-    // list-sessions` and never reaches the pane-capture path.
-    if !is_running(name).await {
-        tracing::warn!(origin = %origin, target = %name, verdict = "stopped_refused",
-            "interaction refused: '{name}' is not running");
-        emit_event(
-            state,
-            name,
-            "send.stopped_refused",
-            Some(json!({"origin": origin, "target": name})),
-            None,
-            "lifecycle",
-        )
-        .await;
-        return Some(jresp(
-            StatusCode::CONFLICT,
-            json!({
-                "ok": false,
-                "error": format!(
-                    "interaction refused: '{name}' is not running (no live worker process), so no \
-                     peer message reaches it."
-                ),
-                "blocked": "lifecycle", "code": "target_not_running",
-                "what_to_do": "Start or resume the worker before sending, or ask the owner; no approval grant changes this.",
-            }),
-        ));
-    }
-    None
 }
 
 async fn isolated_peer_refusal(
@@ -24538,9 +24690,10 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     if let Some(refusal) = isolated_peer_refusal(state, name, headers).await {
         return refusal;
     }
-    if let Some(refusal) = lifecycle_peer_refusal(state, name, headers).await {
-        return refusal;
-    }
+    let hold = match lifecycle_peer_gate(state, name, headers).await {
+        Ok(hold) => hold,
+        Err(refusal) => return refusal,
+    };
     // GROUP SCOPING, before anything is delivered or recorded. The origin is the
     // SERVER-VERIFIED stamp (AMUX-1768), never a body-supplied claim, so a lane
     // cannot talk its way across a group boundary.
@@ -24562,7 +24715,15 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
         .unwrap_or(true)
     {
-        if let Err(reason) = cross_group_send_ok(&send_origin, name) {
+        // A HELD send skips only the lifecycle half of the resolver (the gate
+        // above already decided it); the group policy still applies, so a
+        // paused lane is not a way around a boundary an active one enforces.
+        let group_verdict = if hold.is_some() {
+            cross_group_policy_ok(&send_origin, name)
+        } else {
+            cross_group_send_ok(&send_origin, name)
+        };
+        if let Err(reason) = group_verdict {
             // AN OWNER-APPROVED, SINGLE-USE ALLOWANCE RELEASES EXACTLY ONE SEND
             // (AMUX-3997). Checked before the refusal so an approval the owner
             // already gave is honoured on the worker's own retry.
@@ -24863,7 +25024,20 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         );
     }
     let mut queue_id = None;
-    let (ok, msg) = if ConversationRestart::active(name) {
+    let (ok, msg) = if let Some(h) = hold.as_ref() {
+        // EMPTY guard, the sender recorded: this is a verified peer's own
+        // words, not an automated producer, so the AMUX-4574 refusal of
+        // automation into paused lanes does not apply. The row waits under
+        // the `paused`/`not-running` block until the lane is back.
+        let peer: String = hdr_worker(headers).trim().chars().take(64).collect();
+        match steer_enqueue(state, name, &text, "", &peer).await {
+            Ok(id) => {
+                queue_id = Some(id);
+                (true, held_send_message(name, h))
+            }
+            Err(reason) => (false, block_reason_refused(reason, name)),
+        }
+    } else if ConversationRestart::active(name) {
         // Do not hold an HTTP request through a slow provider stop. Mobile
         // cancels/retries it, leaving a reserved identity without a receipt.
         // Persist ordinary input now; the drain waits on the restart boundary.
@@ -25119,6 +25293,15 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     };
     let send_id = send_response_id(name, &msg_id);
     let mut resp = json!({"ok": ok, "message": msg, "id": send_id});
+    if let (true, Some(h)) = (ok, hold.as_ref()) {
+        // AMUX-5237: the fields a sender (and `amux send`) reads to know the
+        // message is parked and the work is still theirs.
+        resp["held_for_resume"] = json!(true);
+        resp["blocked_reason"] = json!(h.reason);
+        resp["target_lifecycle"] = json!(if h.reason == "paused" { "paused" } else { "stopped" });
+        resp["paused_since"] = json!(h.since);
+        resp["sender_owns_outcome"] = json!(true);
+    }
     if let Some(id) = queue_id {
         resp["queue_id"] = json!(id);
     }
@@ -31958,7 +32141,13 @@ mod tests {
             "CC_TAGS=alpha\nCC_SEND_ALLOW=\n",
         )
         .unwrap();
-        std::fs::write(sessions.join("resting.env"), "CC_TAGS=beta\nCC_PAUSED=1\n").unwrap();
+        // AMUX-5237 made a paused target QUEUE by default; this pins the
+        // refusal that the kill switch restores, which is the AMUX-4566 shape.
+        std::fs::write(
+            sessions.join("resting.env"),
+            "CC_TAGS=beta\nCC_PAUSED=1\nAMUX_SEND_QUEUE_FOR_PAUSED=0\n",
+        )
+        .unwrap();
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-amux-session", "caller".parse().unwrap());
         let response = send_post(&state, "resting", &headers, &json!({"text": "do work"})).await;
@@ -31992,7 +32181,13 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\n").unwrap();
         // Neither CC_PAUSED nor CC_ARCHIVED: lane_lifecycle reads "active".
-        std::fs::write(sessions.join("crashed-lane.env"), "CC_TAGS=alpha\n").unwrap();
+        // Queueing switched off (AMUX-5237's kill switch), which is the only
+        // configuration that still refuses a stopped target.
+        std::fs::write(
+            sessions.join("crashed-lane.env"),
+            "CC_TAGS=alpha\nAMUX_SEND_QUEUE_FOR_PAUSED=0\n",
+        )
+        .unwrap();
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-amux-session", "caller".parse().unwrap());
         let response = send_post(
@@ -32013,6 +32208,149 @@ mod tests {
             body.get("grant_id").is_none(),
             "no approval can make a dead process a peer: {body}"
         );
+    }
+
+    /// The decision table, including the pre-fix refusals that must survive.
+    #[test]
+    fn peer_lifecycle_verdict_holds_paused_and_stopped_and_refuses_the_rest() {
+        use PeerLifecycle::*;
+        assert_eq!(peer_lifecycle_verdict("active", "active", true, true), Pass);
+        assert_eq!(peer_lifecycle_verdict("active", "paused", false, true), Hold("paused"));
+        assert_eq!(peer_lifecycle_verdict("active", "active", false, true), Hold("not-running"));
+        // Kill switch off: exactly the pre-AMUX-5237 answers.
+        assert_eq!(peer_lifecycle_verdict("active", "paused", false, false), RefuseLifecycle);
+        assert_eq!(peer_lifecycle_verdict("active", "active", false, false), RefuseStopped);
+        // Never held, switch or no switch.
+        for q in [true, false] {
+            assert_eq!(peer_lifecycle_verdict("paused", "active", true, q), RefuseLifecycle);
+            assert_eq!(peer_lifecycle_verdict("active", "archived", false, q), RefuseLifecycle);
+            assert_eq!(peer_lifecycle_verdict("active", "review", false, q), RefuseLifecycle);
+        }
+    }
+
+    #[test]
+    fn a_held_send_says_queued_since_when_and_who_owns_it() {
+        let paused = held_send_message(
+            "backend",
+            &PeerHold { reason: "paused", since: Some(1_790_000_000) },
+        );
+        assert!(paused.starts_with("queued"), "submission_verdict reads the prefix: {paused}");
+        assert!(paused.contains("'backend' is paused since 2026-09-21T"), "{paused}");
+        assert!(paused.contains("amux resume backend"));
+        assert!(paused.contains("You own the outcome meanwhile"));
+        assert_eq!(submission_verdict(true, &paused), (None, "deferred"));
+        let unknown = held_send_message("backend", &PeerHold { reason: "paused", since: None });
+        assert!(unknown.contains("pause time not recorded"), "{unknown}");
+        let stopped =
+            held_send_message("backend", &PeerHold { reason: "not-running", since: None });
+        assert!(stopped.contains("is stopped") && stopped.contains("when the worker is started"));
+        for m in [paused, unknown, stopped] {
+            assert!(!m.contains('\u{2014}'), "no em-dashes: {m}");
+        }
+    }
+
+    /// AMUX-5237 through the shipped handler, in the incident's shape: an
+    /// active peer sends to a PAUSED lane. It is queued (not refused), the
+    /// reply says paused since when and that the sender owns the outcome, and
+    /// the durable steering row carries the sender and no automation guard.
+    #[tokio::test]
+    async fn a_peer_send_to_a_paused_lane_is_queued_for_resume_and_says_who_owns_it() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("mixpeek-general.env"), "CC_TAGS=ops\n").unwrap();
+        std::fs::write(sessions.join("mixpeek-observability.env"), "CC_TAGS=ops\n").unwrap();
+        set_legacy_paused("mixpeek-observability", true).unwrap();
+        let since = meta_i64(&load_meta("mixpeek-observability"), "paused_at");
+        assert!(since > 0, "pausing records when");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-amux-session", "mixpeek-general".parse().unwrap());
+        let response = send_post(
+            &state,
+            "mixpeek-observability",
+            &headers,
+            &json!({"text": "alert coverage follow-up from the audit"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["held_for_resume"], json!(true), "{body}");
+        assert_eq!(body["target_lifecycle"], json!("paused"), "{body}");
+        assert_eq!(body["paused_since"], json!(since), "{body}");
+        assert_eq!(body["sender_owns_outcome"], json!(true), "{body}");
+        assert!(body["message"].as_str().unwrap().starts_with("queued, not delivered"), "{body}");
+        let conn = state.store.read().unwrap();
+        let (sender, guard, text): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT sender, guard, text FROM steering_queue WHERE session='mixpeek-observability'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sender, "mixpeek-general");
+        assert_eq!(guard, None, "a peer's own words, not automation");
+        assert!(text.contains("alert coverage follow-up"));
+        drop(conn);
+        // Resume clears the stamp, so the next pause records its own time.
+        set_legacy_paused("mixpeek-observability", false).unwrap();
+        assert_eq!(meta_i64(&load_meta("mixpeek-observability"), "paused_at"), 0);
+    }
+
+    /// Holding does not route around the group boundary: a paused target in a
+    /// group the sender may not reach is refused by the group policy, exactly
+    /// as it would be if the target were active.
+    #[tokio::test]
+    async fn a_held_send_still_answers_to_the_group_policy() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\nCC_SEND_ALLOW=\n").unwrap();
+        std::fs::write(sessions.join("resting.env"), "CC_TAGS=beta\nCC_PAUSED=1\n").unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-amux-session", "caller".parse().unwrap());
+        let response = send_post(&state, "resting", &headers, &json!({"text": "do work"})).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["blocked"], json!("cross_group"), "{body}");
+        let queued: i64 = state
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM steering_queue WHERE session='resting'", [], |r| r.get(0))
+            .unwrap_or(0);
+        assert_eq!(queued, 0, "a refused send queues nothing");
+    }
+
+    /// A stopped lane (lifecycle reads active, no process) queues too.
+    #[tokio::test]
+    async fn a_peer_send_to_a_stopped_lane_is_queued_for_start() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("caller.env"), "CC_TAGS=alpha\n").unwrap();
+        std::fs::write(sessions.join("crashed-lane-5237.env"), "CC_TAGS=alpha\n").unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-amux-session", "caller".parse().unwrap());
+        let response =
+            send_post(&state, "crashed-lane-5237", &headers, &json!({"text": "do work"})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["held_for_resume"], json!(true), "{body}");
+        assert_eq!(body["target_lifecycle"], json!("stopped"), "{body}");
+        assert_eq!(body["paused_since"], Value::Null, "{body}");
     }
 
     #[tokio::test]
