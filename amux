@@ -891,7 +891,35 @@ cmd_start() {
   # Skip for dry-run: no tmux session follows, so the worktree would be orphaned.
   local worktree_dir=""
   local _provider="${CC_PROVIDER:-claude}"
-  if ! $dry_run && [[ "${CC_WORKTREE:-}" == "1" ]] \
+  # CLAUDE STARTS THROUGH THE SERVER TOO, whenever the server answers.
+  #
+  # The local builder below cannot give a claude lane its passive status
+  # identity (AMUX_STATUS_WORKER/RUN_ID/HOME/URL): only the server's
+  # native_status::begin_launch mints the run id the hooks report under. A
+  # lane launched here therefore runs with hooks that exit silently, and its
+  # status is guessed from the pane for as long as it lives. Measured
+  # 2026-09-26: the tmux server died at 17:37 on 09-25, the tmux watchdog
+  # recovered the fleet with `amux start-all`, and 22 of 31 running lanes came
+  # back through this door with no status identity (and without --name or
+  # --mcp-config). amux then read "turn over, 4 shells still running" as
+  # active on seven of them for a day.
+  #
+  # So a claude start goes through the server when /api/health answers within
+  # 3s and no inline args were given (the server path does not forward them).
+  # At cold boot the server is often not up yet; that still launches locally,
+  # and says so, with a verdict in the server log so the gap is countable.
+  local _claude_via_server=false
+  if [[ "$_provider" == "claude" && $# -eq 0 ]] && ! $dry_run; then
+    if [[ "$(_curl -sk -m 3 -o /dev/null -w '%{http_code}' "$AMUX_API/api/health" 2>/dev/null)" == "200" ]]; then
+      _claude_via_server=true
+    else
+      echo "${YELLOW}warn:${RESET} amux server not answering at $AMUX_API; launching $name locally WITHOUT status identity (its status will be estimated from the screen until it is restarted through the server)" >&2
+      mkdir -p "$CC_HOME/logs"
+      printf '%s WARN amux::cli verdict=cli_local_launch_no_status_identity session=%s reason=server_unreachable\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" >> "$CC_HOME/logs/server-rs.log"
+    fi
+  fi
+  if ! $dry_run && [[ "${CC_WORKTREE:-}" == "1" ]] && ! $_claude_via_server \
      && ! server_owns_start "$_provider" "${CC_PROJECT:-}" "${CC_EPHEMERAL:-}" \
      && git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
     worktree_dir="$CC_HOME/worktrees/$name"
@@ -938,7 +966,7 @@ cmd_start() {
   # builder below and launched `claude --model sonnet --continue` -- the WRONG AGENT, silently,
   # because the fallback is a default rather than a failure. The server-side arm was correct the
   # whole time; only this door was. Observed live before the fix (muse-hooks-probe).
-  if server_owns_start "$_provider" "${CC_PROJECT:-}" "${CC_EPHEMERAL:-}"; then
+  if $_claude_via_server || server_owns_start "$_provider" "${CC_PROJECT:-}" "${CC_EPHEMERAL:-}"; then
     if $dry_run; then
       echo "${BOLD}$name${RESET} ($_provider — started via server API: POST /api/sessions/$name/start; the server owns the provider→binary map and the provider-specific setup)"
       return
