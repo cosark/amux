@@ -11,7 +11,7 @@ Method: for the 24 running workers with owner messages in the history window (Se
 | celery-retirement | In progress | Real work left (lifecycle matrix 7/17 failing, load round 2, prod roll). Lost ~80 min to the weekly limit, 15:11Z to 16:32Z. |
 | gs-4-gke-minimization | In progress | Grant #1 (actAs on node SA) still unrun by Ethan. Said "last lever I can pull alone", opened AskUserQuestion that sat ~19 min, then found more levers it could pull alone. |
 | mvs-infra | Idle, watchers armed | Incident work was legitimate. Deferred auto-fix canary with "unless you want it sooner" despite authority. Lost ~76 min to the weekly limit. SCHED-494 preflight output unreadable. |
-| mixpeek-frustrations | In progress | Holds ~145 touchpoint cards for Ethan when mixpeek-general already gave the approval the goal required; only 4 needed Ethan. Lost ~81 min to the weekly limit. |
+| mixpeek-frustrations | In progress | Holds ~145 touchpoint cards on MF-2226 for Ethan. Correction: this review first said mixpeek-general had approved them; MF-2226 records its entry as "SORT ONLY, NOT AN APPROVAL", and new public surfaces need Ethan by name, so holding them is correct. Lost ~81 min to the weekly limit. |
 | gs-3-bucket-objects | In progress | Waiting on mvs-infra clearance, watched by regex over mvs-infra's pane (fired a false positive). Promotions failed canary under load; retry scheduled. |
 | gs-10-zero-base-cicd | In progress, partly blocked | Two asks for Ethan live only in its STATUS.md as BLOCKED-ASK lines (roll MVS prod primary without warm standby; enable paid Staging E2E). None became needsyou cards. |
 | tubescience-parity | In progress | Bandwidth-bound vector backfill (1,200/3,310). Needs a semantic-search sign-in from Ethan, stated only in prose. TP-35/TP-36 stale in todo. |
@@ -37,10 +37,10 @@ Method: for the 24 running workers with owner messages in the history window (Se
 
 Ordered by how many workers each would have helped.
 
-1. **Owner asks stuck in prose (9 workers: gs-4, gs-10, tubescience-parity, mvs-infra, mixpeek-cicd, gtm-engine, mixpeek-finances, social-activities, mixpeek-frustrations).** Add a turn-end classifier on the Stop hook. When the final paragraph asks the owner something ("say go", "awaiting your word", "unless you want it sooner", "needs one thing from you", a BLOCKED-ASK line), check it against the standing-authority boundary. In-boundary: steer back "proceed, standing authority covers this". Boundary (money, external send, prod data): auto-create a needsyou card with the question and the unblock line. While a /goal is active, turn AskUserQuestion into a needsyou card and keep the worker going.
+1. **Owner asks stuck in prose (8 workers: gs-4, gs-10, tubescience-parity, mvs-infra, mixpeek-cicd, gtm-engine, mixpeek-finances, social-activities).** Add a turn-end classifier on the Stop hook. When the final paragraph asks the owner something ("say go", "awaiting your word", "unless you want it sooner", "needs one thing from you", a BLOCKED-ASK line), check it against the standing-authority boundary. In-boundary: steer back "proceed, standing authority covers this". Boundary (money, external send, prod data): auto-create a needsyou card with the question and the unblock line. While a /goal is active, turn AskUserQuestion into a needsyou card and keep the worker going.
 2. **No automatic resume after a limit or API error (6 workers: celery-retirement, mvs-infra, mixpeek-frustrations, gs-3, gs-10, mac-ops).** When a limit's reset passes or the signed-in account changes, send "continue" once to every lane paused on it. When a pane ends on "API Error: The response stopped arriving" and stays idle 2 minutes with no background task, send "continue" once and log it.
 3. **Promised next step never taken (2 workers: mvs-research, mac-ops).** When a turn ends with "Next I'll..." or "I'll let the Monitor notify me" and the lane is idle 2 minutes with a doing card and no live background task, re-prompt once with the card id.
-4. **Cross-lane coordination by scraping and refusal (3 workers: gs-3, mixpeek-frustrations, mixpeek-general).** Add a named gate on cards that a peer can clear with one PATCH, waking every subscribed lane; clear a peer-approval gate automatically when the peer's answer lands. A send to a paused lane should queue for resume and tell the sender it owns the work meanwhile.
+4. **Cross-lane coordination by scraping and refusal (2 workers: gs-3, mixpeek-general).** Add a named gate on cards that a peer can clear with one PATCH, waking every subscribed lane. A send to a paused lane should queue for resume and tell the sender it owns the work meanwhile.
 5. **Capture cards never reconciled (4 workers: mixpeek-homepage-claude, primis, tubescience-parity, launch-videos).** Close an intake card when a landed commit or turn-end cites its MSG id. Surface capture cards still open after 24 hours as unreconciled. Give an epic whose children are all done a distinct awaiting-publish state.
 6. **No wake-up on deploy (amux-helper).** When the builder deploys a sha, message the lane that pushed it: "<sha> is live, run your UI check".
 7. **Approvals that expire faster than the owner reads them (gtm-ticker).** Keep an email approval pending until acted on; send one daily digest instead of re-requesting on every fire.
@@ -57,6 +57,6 @@ Ordered by how many workers each would have helped.
 - launch-videos: publish approvals and the music licence.
 - mvs-research: re-enable MVS build/deploy workflows; sign off MP-106.
 - mixpeek-ops-server: RB2B and Ghost webhook URLs; rotate OPS_SLACK_WEBHOOK_URL.
-- mixpeek-frustrations: MF-3230, MF-3554, MF-1737, MF-1963.
+- mixpeek-frustrations: the ~145 touchpoint cards on MF-2226, plus decision cards MF-3230, MF-3554, MF-1737, MF-1963.
 - mixpeek-finances: pay the NY warrants.
 - primis: send the Garik reply.
