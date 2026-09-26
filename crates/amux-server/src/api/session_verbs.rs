@@ -13008,6 +13008,28 @@ pub(crate) async fn start_session(
                 let _ = reclaim_worktree(&work_dir, &wt_path).await;
             }
         }
+        // REUSE a surviving worktree from a previous run.
+        //
+        // reclaim_worktree can fail on large worktrees (49k files in mixpeek,
+        // timeout on remove --force) while the worktree itself is perfectly
+        // valid. Before trying `git worktree add` (which fails with "already
+        // exists"), check if we already have a usable worktree. Verify with
+        // rev-parse so a half-materialised directory from a killed checkout
+        // does not count.
+        if added.is_none() && wt_dir.join(".git").exists() {
+            let verify = run_cmd(
+                "git",
+                &["-C", &wt_path, "rev-parse", "--git-dir"],
+                OP_TIMEOUT,
+            )
+            .await;
+            if verify.as_ref().is_some_and(|o| o.status.success()) {
+                tracing::info!(session = name, worktree = %wt_path,
+                    measured = true, n_considered = 1, verdict = "worktree_reused",
+                    "reused existing worktree from a previous run; reclaim could not remove it");
+                added = verify;
+            }
+        }
         if added.is_none() {
             added = run_cmd(
                 "git",
