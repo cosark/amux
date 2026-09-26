@@ -61,6 +61,7 @@ macro_rules! rx {
         $crate::api::turn_end::re(&CELL, $pat)
     }};
 }
+pub(crate) use rx;
 
 
 // ---------------------------------------------------------------------------
@@ -763,8 +764,12 @@ pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: Strin
     match verdict {
         OwnerAsk::None => {
             tracing::debug!(session = %name, verdict = "owner_ask_none", "turn-end: no owner ask at the end of the turn");
+            // AMUX-5236: an ask wins over a promise, so only a turn with no
+            // ask is remembered for the idle-stall nudge.
+            super::promise_nudge::record_promise(&name, &turn);
         }
         OwnerAsk::InBoundary { ref sentence } => {
+            super::promise_nudge::forget_promise(&name);
             if !enabled(&name, OWNER_ASK_KEY) {
                 tracing::info!(session = %name, verdict = "owner_ask_disabled", sentence = %clip(sentence, 160),
                     "turn-end: in-boundary owner ask left alone ({OWNER_ASK_KEY} is off)");
@@ -794,6 +799,7 @@ pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: Strin
             }
         }
         OwnerAsk::Boundary { ref sentence, kind } => {
+            super::promise_nudge::forget_promise(&name);
             if !enabled(&name, OWNER_ASK_KEY) {
                 tracing::info!(session = %name, verdict = "owner_ask_disabled", boundary = kind.label(),
                     "turn-end: boundary owner ask left alone ({OWNER_ASK_KEY} is off)");

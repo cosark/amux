@@ -21476,6 +21476,29 @@ pub async fn steer_deliver_loop(state: AppState) {
                 tracing::warn!(error = %e, "rate-limit sweep panicked");
             }
         }
+        // AMUX-5236: promised-next-step nudges, on their own time gate. Only
+        // idle lanes with a recorded, un-nudged promise are read.
+        let promise_due = {
+            static LAST: std::sync::OnceLock<std::sync::Mutex<f64>> = std::sync::OnceLock::new();
+            let cell = LAST.get_or_init(|| std::sync::Mutex::new(0.0));
+            let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+            if now_f64() - *g >= super::promise_nudge::PROMISE_SWEEP_SECS {
+                *g = now_f64();
+                true
+            } else {
+                false
+            }
+        };
+        if promise_due {
+            let st3 = state.clone();
+            if let Err(e) = crate::db::interactions::spawn(async move {
+                super::promise_nudge::promise_sweep(&st3).await
+            })
+            .await
+            {
+                tracing::warn!(error = %e, "promise sweep panicked");
+            }
+        }
     }
 }
 
