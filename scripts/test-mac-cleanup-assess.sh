@@ -69,6 +69,7 @@ check "it carries the numbers measured now"           "yes" "$(has "$first" 'Mea
 check "it states four done criteria"                  "4"   "$(printf '%s\n' "$first" | grep -c '^[1-4]\. ')"
 check "it names where to write the card id"           "yes" "$(has "$first" 'its id written to /c.card')"
 check "it carries the boundary"                       "yes" "$(has "$first" "never kill a live lane's workload")"
+check "it forbids live session scratchpads"           "yes" "$(has "$first" 'never touch anything under /private/tmp/claude-\*')"
 again=$(escalation_message cpu "cpu load 40" /b.md /c.card "disk=600G load15=40/28" 6.5 MO-3622 "load15=46.6/28")
 check "a recurrence says RECURRED with its age"       "yes" "$(has "$again" 'this RECURRED. The previous cpu escalation was 6.5h ago')"
 check "and quotes the previous card and its numbers"  "yes" "$(has "$again" 'card: MO-3622; measured then: load15=46.6/28')"
@@ -98,6 +99,19 @@ if [ "$(uname)" = Darwin ]; then
            bash "$TICK" ${3:-} 2>&1; }
   mkhist 13 0 > "$FIX/hist.json"      # a flat disk: the trend must not fire, only the floor knob
   out=$(tick 0 "$REC"); rm -f "$FIX/sent.log"
+  check "the done line carries the elapsed time"       "yes" "$(has "$out" 'done elapsed=[0-9]*s')"
+  check "a normal run prints no timing WARN"           "no"  "$(has "$out" 'WARN tick took')"
+  out=$(AMUX_CLEANUP_TICK_WARN_S=0 tick 0 "$REC")
+  check "control: past the warn line it says so"       "yes" "$(has "$out" 'WARN tick took [0-9]*s, over 0s')"
+  mkdir -p "$FIX/tick/tick.lock"
+  out=$(tick 999999 "$REC")
+  check "a held lock stops a second tick"              "yes" "$(has "$out" 'previous tick still running')"
+  check "and that tick sends nothing"                  "no"  "$([ -f "$FIX/sent.log" ] && echo yes || echo no)"
+  check "and leaves the other run's lock alone"        "yes" "$([ -d "$FIX/tick/tick.lock" ] && echo yes || echo no)"
+  touch -t 202001010000 "$FIX/tick/tick.lock"
+  out=$(tick 0 "$REC")
+  check "control: a stale lock is taken over"          "yes" "$(has "$out" 'constraints none')"
+  check "and released at exit"                         "no"  "$([ -d "$FIX/tick/tick.lock" ] && echo yes || echo no)"
   check "the trend line names its source"              "yes" "$(has "$out" 'from history 13 samples over 1.0h')"
   check "with nothing constrained it says none"        "yes" "$(has "$out" 'constraints none')"
   check "and sends nothing"                            "no"  "$([ -f "$FIX/sent.log" ] && echo yes || echo no)"

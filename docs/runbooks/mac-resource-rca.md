@@ -57,7 +57,11 @@ The symptom fix buys time. The cause fix is what stops the next message:
 ## 4. Stay inside the boundary
 
 - Never delete another lane's uncommitted work, a repo, `.git`, credentials,
-  or a database. Prove regenerability (build output, a clone whose every commit
+  or a database.
+- Never touch anything under `/private/tmp/claude-*`. Those are live Claude
+  session scratchpads. No process standing in a directory at the moment you
+  look does not mean it is unused: on 2026-09-26 a worktree sweep removed the
+  desktop lane's active worktree between two of its commands. Prove regenerability (build output, a clone whose every commit
   is in the real repo) or ask the owner.
 - Never kill a live lane's workload to reclaim memory. Report it to its owner.
 - Spending money, and anything outside the company, needs Ethan.

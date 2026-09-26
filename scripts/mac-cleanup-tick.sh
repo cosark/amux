@@ -62,6 +62,17 @@ for a in "$@"; do
   esac
 done
 
+# One tick at a time. A run the scheduler timed out keeps going, and the next fire
+# started beside it (two ticks were measured running at once on 2026-09-26).
+# mkdir is atomic, so it is the lock; one older than the stale window is a dead run.
+tick_lock() { # <lock_dir> <stale_min>
+  if mkdir "$1" 2>/dev/null; then return 0; fi
+  if [ -n "$(find "$1" -maxdepth 0 -mmin "+$2" 2>/dev/null)" ]; then
+    rmdir "$1" 2>/dev/null; mkdir "$1" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
 # ── knobs ────────────────────────────────────────────────────────────────────
 # Pressure >= this purges. 2 is the kernel's "warn"; it self-clears often, which
 # is why the PAGING tripwire ignores 2 and this one does not: dropping caches is
@@ -109,9 +120,9 @@ TARGET_ROOTS=${AMUX_CLEANUP_TARGET_ROOTS:-/private/tmp/claude-$(id -u)@6:/privat
 TARGET_IDLE_H=${AMUX_CLEANUP_TARGET_IDLE_H:-24}
 TARGET_KEEP=${AMUX_CLEANUP_TARGET_KEEP:-$HOME/.amux/rust-build-target:$HOME/.ao/data/cargo-target-shared:${CARGO_TARGET_DIR:-}}
 TARGET_DEPTH=${AMUX_CLEANUP_TARGET_DEPTH:-8}
-TARGET_SCAN_S=${AMUX_CLEANUP_TARGET_SCAN_S:-120}
+TARGET_SCAN_S=${AMUX_CLEANUP_TARGET_SCAN_S:-90}
 TARGET_WALK_S=${AMUX_CLEANUP_TARGET_WALK_S:-60}
-TARGET_BUDGET_S=${AMUX_CLEANUP_TARGET_BUDGET_S:-300}
+TARGET_BUDGET_S=${AMUX_CLEANUP_TARGET_BUDGET_S:-200}
 LSOF_CMD=${AMUX_CLEANUP_LSOF_CMD:-lsof -nP}
 # Assessment (DESKT-57). A disk is constrained under DISK_FLOOR_GB, or when the
 # burn since the previous tick would fill it within HOURS_TO_FULL. Memory is
@@ -138,6 +149,13 @@ RUNBOOK=docs/runbooks/mac-resource-rca.md
 if [ -n "${AMUX_CLEANUP_CARD_CMD:-}" ]; then CARD_CMD=$AMUX_CLEANUP_CARD_CMD
 else CARD_CMD="curl -sk --max-time 20 -o /dev/null -w %{http_code} -X POST -H Content-Type:application/json -H X-Amux-Session:desktop --data @FILE $(amux url 2>/dev/null || echo https://localhost:8824)/api/board"; fi
 SENDFAIL_CARD_AFTER=${AMUX_CLEANUP_SENDFAIL_CARD_AFTER:-2}
+# The scheduler kills a shell schedule at 600s ("delivery failed: timed out after
+# 600s", twice on 2026-09-26 once the disk-writer search switched on under load
+# 48). The budgets are sized to stay under it, and the done line prints elapsed
+# time with a WARN past TICK_WARN_S so the next regression announces itself.
+TICK_WARN_S=${AMUX_CLEANUP_TICK_WARN_S:-480}
+WRITERS_BUDGET_S=${AMUX_CLEANUP_WRITERS_BUDGET_S:-150}
+LOCK_STALE_MIN=${AMUX_CLEANUP_LOCK_STALE_MIN:-30}
 # Seams: the tests point these at a recorder so an action can be observed
 # without running it. Defaults are what the scheduler actually runs.
 PURGE_CMD=${AMUX_CLEANUP_PURGE_CMD:-sudo -n /usr/sbin/purge}
@@ -610,7 +628,7 @@ escalation_message() { # <cls> <verdict> <bundle> <card_file> <now_snapshot> <pr
   echo "3. The constraint re-measured after the fix, cleared or not, with the number."
   echo "4. A card on your board with the above, and its id written to $cardf (just the id, e.g. MO-1234), so the next escalation for $cls can start from it."
   echo
-  echo "Boundary: never delete another lane's uncommitted work, a repo, .git, credentials or a database; never kill a live lane's workload; spending money or anything outside the company needs Ethan."
+  echo "Boundary: never delete another lane's uncommitted work, a repo, .git, credentials or a database; never touch anything under /private/tmp/claude-* (live Claude session scratchpads: no process standing in a directory does not mean it is unused); never kill a live lane's workload; spending money or anything outside the company needs Ethan."
 }
 
 # One board card for a failure nobody would otherwise see. Deduped by key for 24h
@@ -630,6 +648,12 @@ file_card() { # <state_file> <key> <title> <desc>
 [ "${AMUX_CLEANUP_LIB_ONLY:-0}" = "1" ] && return 0 2>/dev/null
 
 # ── measure ──────────────────────────────────────────────────────────────────
+LOCK="$STATE_DIR/tick.lock"; mkdir -p "$STATE_DIR"
+if ! tick_lock "$LOCK" "$LOCK_STALE_MIN"; then
+  echo "mac-cleanup: previous tick still running (lock $LOCK under ${LOCK_STALE_MIN}m old), not starting a second one"
+  exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 measured=true
 level=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
 case "$level" in ''|*[!0-9]*) level=-1; measured=false ;; esac
@@ -859,10 +883,21 @@ else
     if printf '%s\n' "$verdicts" | grep -q '^disk '; then
       echo; echo "## Files over 500M written in the last hour (the writers)"
       IFS=':' read -r -a wroots <<< "$TARGET_ROOTS"
-      for r in ${wroots[@]+"${wroots[@]}"} "$HOME/.amux" "$HOME/.colima"; do
-        r=${r%@*}; [ -d "$r" ] || continue
-        perl -e 'alarm 45; exec @ARGV' find "$r" -xdev -type f -size +500M -mmin -60 -exec stat -f '%b %z %N' {} + 2>/dev/null
-      done | sort -u | sort -rn | head -15 | awk '{a=$1*512/2^30; z=$2/2^30; $1=$2=""; sub(/^  /,""); printf "- %.1fG allocated (%.1fG apparent) %s\n", a, z, $0}'
+      # ONE budget for the whole search, not one per root: 9 roots at 45s each
+      # was 405s on its own and pushed the tick past the scheduler's 600s kill.
+      # Few-file roots first (VM disks, the amux home), and each remaining root
+      # gets an equal share of what is left, so one tree full of build files
+      # cannot spend it all: the first cut spent 60s in the scratchpads and
+      # searched 1 root of 9. Cargo's internals are pruned for the same reason.
+      wlist=("$HOME/.colima" "$HOME/.amux"); for r in ${wroots[@]+"${wroots[@]}"}; do wlist+=("${r%@*}"); done
+      wdeadline=$(( $(date +%s) + WRITERS_BUDGET_S )); wn=${#wlist[@]}; wi=0
+      for r in "${wlist[@]}"; do
+        wi=$((wi+1)); [ -d "$r" ] || continue
+        wleft=$(( wdeadline - $(date +%s) )); if [ "$wleft" -le 0 ]; then echo "SEARCH-CUT $r" >&2; continue; fi
+        wslice=$(( wleft / (wn - wi + 1) )); [ "$wslice" -ge 3 ] || wslice=3
+        { perl -e 'alarm shift; exec @ARGV' "$wslice" find "$r" -xdev \( -name node_modules -o -name .git -o -name deps -o -name incremental -o -name .fingerprint -o -name build \) -prune -o -type f -size +500M -mmin -60 -exec stat -f '%b %z %N' {} + 2>/dev/null; } 2>/dev/null || echo "SEARCH-CUT $r" >&2
+      done 2>"$STATE_DIR/writers.cut" | sort -u | sort -rn | head -15 | awk '{a=$1*512/2^30; z=$2/2^30; $1=$2=""; sub(/^  /,""); printf "- %.1fG allocated (%.1fG apparent) %s\n", a, z, $0}'
+      if [ -s "$STATE_DIR/writers.cut" ]; then echo "(search budget of ${WRITERS_BUDGET_S}s: $(grep -c . "$STATE_DIR/writers.cut") of ${#wlist[@]} root(s) not fully searched: $(sed 's/^SEARCH-CUT //' "$STATE_DIR/writers.cut" | tr '\n' ' '))"; fi
       echo "(allocated is what the disk actually holds; a sparse VM disk's apparent size is its ceiling, not its use)"
     fi
     echo; echo "## Full tick output"; echo "~/.amux/logs/mac-cleanup-tick.last"
@@ -903,5 +938,8 @@ $verdicts
 EOF
 fi
 
-echo "mac-cleanup: done purge=${purged%% *} agents_restarted=${agents_restarted}/${agents_checked} stale_shells=${stale_killed} targets_reaped=${TARGETS_REAPED} constraints=$(printf '%s' "$verdicts" | grep -c . || true) escalated=${escalated} reported=${reported}"
+if [ "$SECONDS" -ge "$TICK_WARN_S" ]; then
+  echo "mac-cleanup: WARN tick took ${SECONDS}s, over ${TICK_WARN_S}s: the scheduler kills it at 600s, so a slower run is lost; tighten the budgets"
+fi
+echo "mac-cleanup: done elapsed=${SECONDS}s purge=${purged%% *} agents_restarted=${agents_restarted}/${agents_checked} stale_shells=${stale_killed} targets_reaped=${TARGETS_REAPED} constraints=$(printf '%s' "$verdicts" | grep -c . || true) escalated=${escalated} reported=${reported}"
 exit 0
