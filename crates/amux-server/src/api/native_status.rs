@@ -1,6 +1,11 @@
 //! Ordered, passive Codex/Claude lifecycle observations. The local spool survives
 //! network/server outages; every accepted edge shares the existing report/SSE
 //! projection. Observation never sends a prompt or creates a board item.
+//!
+//! One consumer hangs off an applied `Stop` edge: the turn-end owner-ask
+//! classifier (`turn_end::on_turn_end`, AMUX-5234). It is the same consumer the
+//! legacy Stop hook drives, it runs detached from this write, and it refuses
+//! isolated lanes itself, so an isolated lane's observation stays passive.
 use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
 use axum::{
@@ -195,7 +200,7 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
     let name = name.to_owned();
     let body = body.clone();
     let prompt = submitted_prompt(&body);
-    let worker = name.clone();
+    let (worker, event) = (name.clone(), body.clone());
     let outcome = state
         .store
         .write_async(move |conn| apply(conn, &name, &body, &generation(&name)))
@@ -207,6 +212,14 @@ pub(crate) async fn post(state: &AppState, name: &str, body: &Value) -> Response
             if out.applied {
                 if let Some(prompt) = prompt {
                     super::pane_prompts::record(state, &worker, &prompt).await;
+                }
+                if event["event"] == "Stop" {
+                    let sid = event["session_id"].as_str().unwrap_or("").to_string();
+                    crate::db::interactions::spawn(super::turn_end::on_turn_end(
+                        state.clone(),
+                        worker,
+                        sid,
+                    ));
                 }
             }
             Json(json!({"ok":true,"applied":out.applied})).into_response()

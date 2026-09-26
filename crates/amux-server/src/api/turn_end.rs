@@ -1,0 +1,1212 @@
+//! What a worker SAID at the end of its turn, read as a request for action.
+//!
+//! Consumers of the turn-end edge (the Stop hook's `idle` report, or a native
+//! `Stop` lifecycle event), driven by the final assistant text in the lane's
+//! own transcript:
+//!
+//! 1. OWNER ASK (AMUX-5234). The fleet stall review of 2026-09-26
+//!    (docs/fleet-stall-review-2026-09-26.md) found nine of 24 lanes parked on
+//!    a question to the owner written in prose: "say go and I'll...",
+//!    "awaiting your word", "unless you want it sooner", "needs one thing from
+//!    you", a `BLOCKED-ASK` line in a STATUS file. Most of those were inside
+//!    the standing authority the owner had already granted (mixpeek-cicd sat on
+//!    three in-boundary code fixes; gtm-engine spent a round trip asking "say
+//!    go" for a rewrite), and the ones that were not (a paid staging suite, a
+//!    $749 pass, a prod roll without a standby) never became `needsyou` cards,
+//!    so nothing surfaced them. So: an in-boundary ask is steered back ONCE with
+//!    "proceed, standing authority covers this"; a boundary ask becomes a
+//!    deduplicated card carrying the question and what unblocks it: a
+//!    `needsyou` card when the owner's `AMUX_APPROVAL_TYPES` policy covers its
+//!    ask type, otherwise a `type=decision` card (see [`AskPath`]).
+//!    While a `/goal` is active, `AskUserQuestion` is converted the same way at
+//!    PreToolUse (gs-4 sat 19 minutes on a picker, then found more levers it
+//!    could pull alone).
+//!
+//! CONSERVATIVE BY CONSTRUCTION. Every classifier here returns "nothing" when
+//! unsure, and every decision is logged with a `verdict=` so a sweep can count
+//! the misses. The dangerous direction is steering a lane into an action the
+//! owner must approve, so boundary detection is deliberately generous (a false
+//! boundary costs one card) while ask detection is narrow (a false ask costs an
+//! unwanted nudge). Isolated lanes are never touched (CLAUDE.md: no automated
+//! steering or board capture), and `steer_enqueue` enforces that again at its
+//! chokepoint.
+//!
+//! Kill switch `AMUX_OWNER_ASK_STEER`, default ON, scoped worker > group >
+//! global with the process env winning (the `needsyou_ask_required` resolver).
+
+use super::session_verbs as sv;
+use super::AppState;
+use axum::{http::HeaderMap, http::StatusCode, response::IntoResponse, response::Response, Json};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+pub(crate) const OWNER_ASK_KEY: &str = "AMUX_OWNER_ASK_STEER";
+/// Steering guard labels. Non-empty on purpose: `steer_enqueue` treats an
+/// empty guard as the owner's own send, which would bypass the isolation and
+/// pause refusals this automation must respect.
+pub(crate) const OWNER_ASK_GUARD: &str = "owner-ask";
+pub(crate) fn re(
+    cell: &'static OnceLock<regex::Regex>,
+    pat: &str,
+) -> &'static regex::Regex {
+    cell.get_or_init(|| regex::Regex::new(pat).expect("static turn_end pattern"))
+}
+/// Compile-once regex (the `cached_re!` idiom from session_verbs, which is
+/// file-local there). Static patterns only.
+macro_rules! rx {
+    ($pat:expr) => {{
+        static CELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        $crate::api::turn_end::re(&CELL, $pat)
+    }};
+}
+
+
+// ---------------------------------------------------------------------------
+// Kill switches
+// ---------------------------------------------------------------------------
+
+/// Pure resolution: process env wins, then the scoped value, default ON.
+fn switch_on(env: Option<&str>, scoped: Option<&str>) -> bool {
+    fn off(v: &str) -> bool {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    }
+    match env.filter(|v| !v.trim().is_empty()) {
+        Some(v) => !off(v),
+        None => !scoped.is_some_and(off),
+    }
+}
+
+pub(crate) fn enabled(lane: &str, key: &str) -> bool {
+    let env = std::env::var(key).ok();
+    let scoped = sv::scoped_setting_in(&sv::home(), lane, key);
+    switch_on(env.as_deref(), scoped.as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// Text normalisation
+// ---------------------------------------------------------------------------
+
+/// Lowercase, straighten quotes, and drop the parts of a message that are
+/// QUOTED rather than SAID: fenced code, inline code, block quotes and quoted
+/// phrases. A worker discussing "say go" (this module's own commit message, a
+/// review of another lane) must not read as asking it. `say "go"` is folded to
+/// `say go` first, because that one quoted word IS the ask.
+pub(crate) fn said_text(text: &str) -> String {
+    let t = text
+        .replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{201c}', '\u{201d}'], "\"")
+        .to_lowercase();
+    let t = rx!(r#"\bsay (["'])go(["'])"#).replace_all(&t, "say go");
+    let t = rx!(r"(?s)```.*?```").replace_all(&t, " ");
+    let t = rx!(r"`[^`\n]*`").replace_all(&t, " ");
+    let t = rx!(r#""[^"\n]*""#).replace_all(&t, " ");
+    // Single-quoted phrases too. The OPENING quote must follow whitespace and
+    // the closing one precede whitespace or punctuation, so an apostrophe
+    // inside a word ("i'll") neither opens nor closes a quote.
+    let t = rx!(r"(?m)(^|\s)'[^\n]{3,}?'([\s.,;:!?)]|$)").replace_all(&t, "$1 $2");
+    t.lines()
+        .filter(|l| !l.trim_start().starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The last `n` non-empty paragraphs. The ask that parks a lane is the one it
+/// ENDS on; a question in the middle of a long report has already been
+/// answered by the report continuing.
+pub(crate) fn tail_paragraphs(text: &str, n: usize) -> String {
+    let paras: Vec<&str> = rx!(r"\n[ \t]*\n")
+        .split(text)
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let start = paras.len().saturating_sub(n);
+    paras[start..].join("\n\n")
+}
+
+/// Sentences, split on terminal punctuation and on line breaks (a bullet is a
+/// sentence), with list markers and markdown emphasis stripped.
+pub(crate) fn sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = rx!(r"^\s*(?:[-*+]|\d+[.)])\s+").replace(line, "");
+        let line = line.replace("**", "").replace("__", "");
+        let mut cur = String::new();
+        let chars: Vec<char> = line.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            cur.push(*c);
+            let end = matches!(c, '.' | '?' | '!')
+                && chars.get(i + 1).is_none_or(|n| n.is_whitespace());
+            if end {
+                let s = cur.trim().to_string();
+                if !s.is_empty() {
+                    out.push(s);
+                }
+                cur.clear();
+            }
+        }
+        let s = cur.trim().to_string();
+        if !s.is_empty() {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The same sentence split over the ORIGINAL text, for quoting back to the
+/// worker and onto a card in its own casing.
+pub(crate) fn original_sentence(original: &str, lowered: &str) -> String {
+    let flat = |s: &str| {
+        s.to_lowercase()
+            .replace(['\u{2018}', '\u{2019}'], "'")
+            .replace(['\u{201c}', '\u{201d}'], "\"")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let want = flat(lowered);
+    sentences(original)
+        .into_iter()
+        .rev()
+        .find(|s| {
+            let f = flat(s);
+            !want.is_empty() && (f.contains(&want) || (want.contains(&f) && f.len() > 8))
+        })
+        .unwrap_or_else(|| lowered.to_string())
+}
+
+pub(crate) fn clip(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() <= max {
+        s
+    } else {
+        format!("{}...", s.chars().take(max).collect::<String>().trim_end())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F1: owner-ask classifier
+// ---------------------------------------------------------------------------
+
+/// The standing-authority boundary (~/.claude/CLAUDE.md "Standing authority"),
+/// plus the one class of ask only the owner can physically satisfy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Boundary {
+    /// Spending money, paid infrastructure, a billed quota.
+    Money,
+    /// Anything a customer or outside person reads.
+    ExternalSend,
+    /// Deleting, overwriting or migrating customer/production data, or a
+    /// production change with no way back.
+    ProdData,
+    /// `git push` to main over somebody else's commits.
+    ForeignPush,
+    /// A sign-in, grant or credential only the owner can supply. Not in the
+    /// standing-authority list, but "proceed" cannot be obeyed, so steering
+    /// would only produce a second copy of the same ask.
+    OwnerOnly,
+}
+
+impl Boundary {
+    pub(crate) fn ask_type(self) -> &'static str {
+        match self {
+            Boundary::Money => "budget",
+            Boundary::ExternalSend => "customer_outbound",
+            Boundary::ProdData | Boundary::ForeignPush => "decision",
+            Boundary::OwnerOnly => "credential",
+        }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Boundary::Money => "money",
+            Boundary::ExternalSend => "external send",
+            Boundary::ProdData => "production data",
+            Boundary::ForeignPush => "push over foreign commits",
+            Boundary::OwnerOnly => "owner-only access",
+        }
+    }
+    fn unblocks(self, owner: &str, lane: &str) -> String {
+        match self {
+            Boundary::Money => format!(
+                "{owner} approves or declines the spend on this card; {lane} does not spend until it is approved."
+            ),
+            Boundary::ExternalSend => format!(
+                "{owner} approves the outbound message on this card or sends it; {lane} does not send until then."
+            ),
+            Boundary::ProdData => format!(
+                "{owner} approves or declines the production change on this card; {lane} holds that step until then."
+            ),
+            Boundary::ForeignPush => format!(
+                "The authors of the foreign commits (or {owner}) consent to the push on this card."
+            ),
+            Boundary::OwnerOnly => format!(
+                "{owner} completes the sign-in, grant or credential step named in the question and notes it on this card."
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnerAsk {
+    /// No owner-directed ask at the end of the turn, or not sure there is one.
+    None,
+    /// An ask the standing authority already answers.
+    InBoundary { sentence: String },
+    /// An ask that touches the boundary: file it, do not steer.
+    Boundary { sentence: String, kind: Boundary },
+}
+
+/// Owner-directed ask phrasings. Each is second person or an explicit request
+/// for a go-ahead; none matches a worker merely reporting that it asked
+/// somebody. Real specimens from the 2026-09-26 review are the test fixtures.
+fn is_ask_sentence(s: &str) -> bool {
+    let pats: [&regex::Regex; 12] = [
+        rx!(r"\bsay go\b|\bsay the word\b"),
+        rx!(r"\b(awaiting|waiting (on|for)|need|needs|want) your (word|go|go-?ahead|call|decision|approval|sign-?off|ok|okay|green ?light|confirmation|answer)\b"),
+        rx!(r"\bon your (word|go|signal|say-?so)\b"),
+        rx!(r"\bunless you (want|would like|'d like|prefer|say|object)\b"),
+        rx!(r"\bneeds? (one|a|1|two|2) (thing|things|decision|decisions|answer|call|input) from you\b|\bone thing from you\b"),
+        rx!(r"^(want me to|do you want me to|would you like me to|should i|shall i|ok to|okay to|ok if i|may i|can i go ahead)\b.*\?$"),
+        rx!(r"\b(want me to|do you want me to|would you like me to|should i|shall i)\b[^.!]*\?$"),
+        rx!(r"\bif you('d| would)? ?(like|want)( me to)?,? i (can|could|will|'ll)\b"),
+        rx!(r"\blet me know (if|whether|when) you('d| would)? ?(like|want)\b|\blet me know which\b"),
+        rx!(r"\bready (to go |to proceed )?(when|once) you (are|say|give)\b"),
+        rx!(r"\byour call\b|\bgo/no-?go\b"),
+        rx!(r"^blocked-ask\b"),
+    ];
+    pats.iter().any(|p| p.is_match(s))
+}
+
+/// Things the owner said in THIS turn's prompt that make "proceed" wrong: an
+/// explicit request to only plan, only report, or wait. Steering past those
+/// would override the owner, which standing authority does not cover.
+pub(crate) fn owner_said_hold(prompt: &str) -> bool {
+    let p = prompt.to_lowercase().replace(['\u{2018}', '\u{2019}'], "'");
+    rx!(r"\b(don'?t|do not) (do|start|change|touch|make|run|push|proceed|implement|act)\b|\bjust (tell|plan|answer|report|explain|list|show)\b|\bonly (plan|report|answer|explain)\b|\b(wait for|check with|ask) me (first|before)\b|\bhold off\b|\bwait for me\b|\bno changes\b|\bread-?only\b")
+        .is_match(&p)
+}
+
+/// Which part of the boundary, if any, `context` touches. Generous on purpose:
+/// a false positive here files one card, a false negative steers a lane into
+/// spending money or mailing a customer.
+pub(crate) fn boundary_of(context: &str) -> Option<Boundary> {
+    let c = context.to_lowercase();
+    let has = |r: &regex::Regex| r.is_match(&c);
+    if has(rx!(r"\bpush\w*\b")) && has(rx!(r"\bmain\b"))
+        && has(rx!(r"\b(foreign|other lanes?'?|peers?'?|someone else'?s|not mine|others'|their commits|force-?push)"))
+    {
+        return Some(Boundary::ForeignPush);
+    }
+    if has(rx!(r"\$\s?\d|\b\d+\s?(usd|dollars)\b|\b(spend|spending|pay|paying|payment|purchase|buy|buying|billing|billed|invoice|subscription|paid|budget|credit card|pricing|quota increase|raise the quota|upgrade (the |our )?(plan|tier))\b")) {
+        return Some(Boundary::Money);
+    }
+    let send = rx!(r"\b(send|sending|sent|email|emailing|e-mail|dm|reply|replying|respond|post|posting|publish|publishing|tweet|announce|submit|outreach)\b");
+    let outside = rx!(r"\b(customer|customers|client|clients|prospect|prospects|lead|leads|vendor|partner|investor|contact|contacts|recipient|recipients|external|outside|public|publicly|linkedin|twitter|buffer|ghost|blog|newsletter|campaign|instantly|apollo|inbox|thread|them|him|her|upstream|mailing list)\b");
+    if (has(send) && has(outside))
+        || has(rx!(r"\bpr comment|\bcomment on (the |their )?(pr|issue)\b|\bpublish(ed|ing)?\b|\bgo live\b|\bpress release\b"))
+        || has(rx!(r"\b(launch|start|kick off|enable|activate|turn on)\b[\w/ -]{0,40}\b(sequence|campaign|outreach|drip|cadence)\b"))
+    {
+        return Some(Boundary::ExternalSend);
+    }
+    let destructive = rx!(r"\b(delete|deleting|drop|dropping|truncate|purge|wipe|erase|destroy|migrate|migrating|migration|backfill|overwrite|restore over)\b");
+    let data = rx!(r"\b(prod|production|customer|customers|tenant|tenants|table|tables|collection|collections|database|db|bucket|buckets|index|indexes|namespace|namespaces|data|records|rows|documents|mongo|postgres|bigquery|s3|gcs)\b");
+    let prod_risk = rx!(r"\b(roll|rolling|cutover|cut over|failover|fail over|switch|promote|restart|disable|shut ?down|scale (down|to zero)|without (a )?(warm )?standby)\b");
+    if (has(destructive) && has(data)) || (has(rx!(r"\b(prod|production)\b")) && has(prod_risk)) {
+        return Some(Boundary::ProdData);
+    }
+    if has(rx!(r"\b(sign[- ]?in|log ?in|re-?auth\w*|oauth|credentials?|password|2fa|mfa|api key|secret|iam|grant|role binding|act ?as|permission|console access|admin rights)\b"))
+        && has(rx!(r"\b(you|your|ethan|owner)\b"))
+    {
+        return Some(Boundary::OwnerOnly);
+    }
+    None
+}
+
+/// Classify the final assistant text of a turn.
+pub(crate) fn classify_owner_ask(text: &str) -> OwnerAsk {
+    let said = said_text(text);
+    // A BLOCKED-ASK line is a structured marker wherever it sits (gs-10 wrote
+    // them into STATUS.md and echoed them in its report).
+    let marker = said
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|l| l.starts_with("blocked-ask"))
+        .map(str::to_string);
+    let tail = tail_paragraphs(&said, 2);
+    let sents = sentences(&tail);
+    let hit = sents
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, s)| is_ask_sentence(s))
+        .map(|(i, s)| (i, s.clone()));
+    let (sentence, context) = match (hit, marker) {
+        (Some((i, s)), _) => {
+            let prev = if i > 0 { sents[i - 1].as_str() } else { "" };
+            let ctx = format!("{prev} {s}");
+            (s, ctx)
+        }
+        (None, Some(m)) => (m.clone(), m),
+        (None, None) => return OwnerAsk::None,
+    };
+    let sentence = original_sentence(text, &sentence);
+    match boundary_of(&context) {
+        Some(kind) => OwnerAsk::Boundary { sentence, kind },
+        None => OwnerAsk::InBoundary { sentence },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript readers (pure over the records `iter_jsonl_tail` returns)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn rec_ts(r: &Value) -> Option<f64> {
+    chrono::DateTime::parse_from_rfc3339(r["timestamp"].as_str()?)
+        .ok()
+        .map(|t| t.timestamp_millis() as f64 / 1000.0)
+}
+
+pub(crate) fn text_blocks(content: &Value) -> Vec<String> {
+    match content {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str().map(str::to_string))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// A user record that is a new instruction rather than a tool result or
+/// harness chrome. Task notifications count: they start a new turn.
+fn is_real_prompt(r: &Value) -> bool {
+    if r["type"] != "user" || r["isMeta"] == true || r["isSidechain"] == true {
+        return false;
+    }
+    let content = &r["message"]["content"];
+    if let Some(a) = content.as_array() {
+        if a.iter().any(|b| b["type"] == "tool_result") {
+            return false;
+        }
+    }
+    !text_blocks(content).join("").trim().is_empty()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TurnTail {
+    /// `uuid` of the final assistant record: the dedupe key for both nudges.
+    pub uuid: String,
+    pub text: String,
+    pub ts: f64,
+    /// The prompt that started this turn, for [`owner_said_hold`].
+    pub prompt: String,
+}
+
+/// The final assistant TEXT of the most recent turn, if the turn ended on it.
+///
+/// Claude writes one message as several records sharing `message.id`
+/// (thinking, text, tool_use). The turn ended on text only if the LAST
+/// assistant record carries text and no tool_use; a turn that stopped mid-tool
+/// (interrupt, API error) has no final statement to classify and returns None.
+/// A real prompt after the final assistant record also returns None: the lane
+/// has already been spoken to.
+pub(crate) fn final_turn(records: &[Value]) -> Option<TurnTail> {
+    let last_asst = records
+        .iter()
+        .rposition(|r| r["type"] == "assistant" && r["isSidechain"] != true)?;
+    if records[last_asst + 1..].iter().any(is_real_prompt) {
+        return None;
+    }
+    let last = &records[last_asst];
+    let blocks = last["message"]["content"].as_array()?;
+    if blocks.iter().any(|b| b["type"] == "tool_use") {
+        return None;
+    }
+    let mid = last["message"]["id"].as_str().unwrap_or("");
+    let mut parts: Vec<String> = Vec::new();
+    for r in records[..=last_asst].iter().rev() {
+        if r["type"] != "assistant" {
+            continue;
+        }
+        if mid.is_empty() || r["message"]["id"].as_str() != Some(mid) {
+            break;
+        }
+        let t = text_blocks(&r["message"]["content"]).join("\n\n");
+        if !t.trim().is_empty() {
+            parts.push(t);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    let prompt = records[..last_asst]
+        .iter()
+        .rev()
+        .find(|r| is_real_prompt(r))
+        .map(|r| text_blocks(&r["message"]["content"]).join("\n"))
+        .unwrap_or_default();
+    Some(TurnTail {
+        uuid: last["uuid"].as_str().unwrap_or("").to_string(),
+        text: parts.join("\n\n"),
+        ts: rec_ts(last).unwrap_or(0.0),
+        prompt,
+    })
+}
+
+/// The condition of the `/goal` active in this transcript, if one is.
+///
+/// Claude Code records the goal as `attachment.type == "goal_status"` with
+/// `met` and `condition` (written when the goal is set and at every goal
+/// check), and the command itself as a `<command-name>/goal` user record.
+/// Measured 2026-09-26 on gs-3-bucket-objects: 239 goal_status attachments,
+/// 19 `/goal` commands. The NEWEST record decides: `met: true` or a `/goal`
+/// with empty/clear arguments ends it. Nothing found means no goal, which is
+/// the conservative answer (the question is left alone).
+pub(crate) fn goal_condition(records: &[Value]) -> Option<String> {
+    for r in records.iter().rev() {
+        if r["type"] == "attachment" && r["attachment"]["type"] == "goal_status" {
+            if r["attachment"]["met"] == true {
+                return None;
+            }
+            return Some(
+                r["attachment"]["condition"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+            .filter(|c| !c.trim().is_empty());
+        }
+        if r["type"] == "user" {
+            let t = text_blocks(&r["message"]["content"]).join("");
+            if t.contains("<command-name>/goal</command-name>") {
+                let args = rx!(r"(?s)<command-args>(.*?)</command-args>")
+                    .captures(&t)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().trim().to_lowercase())
+                    .unwrap_or_default();
+                if matches!(args.as_str(), "" | "clear" | "off" | "stop" | "cancel" | "none") {
+                    return None;
+                }
+                return Some(args);
+            }
+        }
+    }
+    None
+}
+// ---------------------------------------------------------------------------
+// Side effects
+// ---------------------------------------------------------------------------
+
+fn owner_name() -> String {
+    std::env::var("AMUX_OWNER_NAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AMUX_OWNER_EMAIL")
+                .ok()
+                .and_then(|e| e.split('@').next().map(str::to_string))
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_else(|| "ethan".into())
+}
+
+pub(crate) fn transcript_for(name: &str, session_id: &str) -> Option<PathBuf> {
+    (!session_id.is_empty())
+        .then(|| sv::lifecycle_transcript_path(name, session_id))
+        .flatten()
+        .or_else(|| sv::session_jsonl_path(name))
+}
+
+/// Record `idem` once. True only for the call that inserted it, so a restart,
+/// a duplicate Stop, or a legacy and native report for the same turn cannot
+/// act twice.
+async fn claim_once(state: &AppState, session: &str, etype: &str, idem: String, data: Value) -> bool {
+    let session = session.to_string();
+    let etype = etype.to_string();
+    state
+        .store
+        .write_async(move |conn| {
+            sv::ensure_fleet_tables(conn)?;
+            let n = conn.execute(
+                "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+                 VALUES (?1,?2,?3,?4,?5,'turn-end')",
+                rusqlite::params![crate::config::now_f64(), session, etype, data.to_string(), idem],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: n == 1, events: vec![] })
+        })
+        .await
+        .map(|o| o.applied)
+        .unwrap_or(false)
+}
+
+fn question_key(q: &str) -> String {
+    let norm: String = q
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let digest = Sha256::digest(norm.as_bytes());
+    format!("owner-ask:{}", hex_prefix(&digest, 6))
+}
+fn hex_prefix(bytes: &[u8], n: usize) -> String {
+    bytes.iter().take(n).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A question as a card can carry it: one sentence ending in `?`.
+fn as_question(sentence: &str, lane: &str) -> String {
+    let s = clip(sentence, 280);
+    if s.trim_end().ends_with('?') {
+        s
+    } else {
+        format!("May {lane} proceed with this: {}?", s.trim_end_matches(['.', '!', ':']))
+    }
+}
+
+/// Which board shape an ask takes. `needsyou` is reserved for the owner's
+/// configured authorization categories (`AMUX_APPROVAL_TYPES`; the board API
+/// answers 409 `needsyou_outside_approval_policy` for any other ask_type, and
+/// this box's global policy is `budget,customer_outbound`). An ask outside that
+/// policy is recorded the way the refusal directs: a `type=decision` card in
+/// `backlog` carrying `decision_question`, `decision_rationale` and a
+/// structured `waiting_on`, so it is visible without claiming an approval
+/// category the owner did not configure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskPath {
+    NeedsYou,
+    Decision,
+}
+impl AskPath {
+    pub(crate) fn for_type(lane: &str, ask_type: &str) -> Self {
+        if crate::db::board_store::approval_type_allowed(Some(lane), ask_type) {
+            AskPath::NeedsYou
+        } else {
+            AskPath::Decision
+        }
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            AskPath::NeedsYou => "needsyou",
+            AskPath::Decision => "decision",
+        }
+    }
+}
+
+/// File (or find) the card for an ask. Returns (id, created, path).
+async fn file_ask_card(
+    state: &AppState,
+    lane: &str,
+    kind: Option<Boundary>,
+    question: &str,
+    context: &str,
+    origin: &str,
+) -> Result<(String, bool, AskPath), String> {
+    let ask_type = kind.map(Boundary::ask_type).unwrap_or("decision");
+    file_ask_card_via(state, lane, kind, question, context, origin, AskPath::for_type(lane, ask_type)).await
+}
+
+async fn file_ask_card_via(
+    state: &AppState,
+    lane: &str,
+    kind: Option<Boundary>,
+    question: &str,
+    context: &str,
+    origin: &str,
+    path: AskPath,
+) -> Result<(String, bool, AskPath), String> {
+    use crate::db::board_store as bs;
+    let tag = question_key(question);
+    let owner = owner_name();
+    let ask_type = kind.map(Boundary::ask_type).unwrap_or("decision");
+    let label = kind.map(Boundary::label).unwrap_or("decision");
+    let title = format!("Owner ask ({label}): {}", clip(question, 110));
+    let why = match kind {
+        Some(_) => format!(
+            "because the ask touches the standing-authority boundary ({label}), so it was not steered"
+        ),
+        None => "because a /goal was active; the worker was told to proceed on its \
+                 recommended option, so this card is the record of the choice"
+            .to_string(),
+    };
+    let unblocks = match kind {
+        Some(k) => k.unblocks(&owner, lane),
+        None => format!(
+            "{owner} confirms or overrides the choice on this card; {lane} has already proceeded on its recommended option."
+        ),
+    };
+    let desc = format!(
+        "{lane} asked the owner. Filed automatically by the {origin} (AMUX-5234) {why}.\n\n\
+         Question: {question}\n\nContext, in the worker's words:\n\n{}",
+        clip(context, 1500)
+    );
+    let needsyou = path == AskPath::NeedsYou;
+    let mut tags = vec![tag.clone()];
+    if needsyou {
+        tags.insert(0, bs::NEEDS_YOU_TAG.to_string());
+    }
+    let new = bs::NewIssue {
+        acceptance_criteria: None,
+        next_action: None,
+        title,
+        desc,
+        status: if needsyou { "needsyou" } else { "backlog" }.into(),
+        session: Some(lane.to_string()),
+        item_type: if needsyou { "chore" } else { "decision" }.into(),
+        creator: "amux".into(),
+        owner_type: "agent".into(),
+        due: None,
+        due_time: None,
+        reviewer: None,
+        shepherd: None,
+        gate: vec![],
+        depends_on: vec![],
+        tags,
+        ask_type: needsyou.then(|| ask_type.to_string()),
+        ask_question: needsyou.then(|| question.to_string()),
+        ask_unblocks: needsyou.then(|| unblocks.clone()),
+        ask_actor: needsyou.then(|| owner.clone()),
+        source: Some("turn_end".into()),
+        requested_by: None,
+        callback_session: None,
+        callback_prompt: None,
+    };
+    let waiting_on = json!({"actor": owner, "type": ask_type, "question": question, "unblocks": unblocks})
+        .to_string();
+    let rationale = format!("{why}. {unblocks}");
+    let lane_s = lane.to_string();
+    let q = question.to_string();
+    let found = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, bool)>));
+    let slot = found.clone();
+    state
+        .store
+        .write_async(move |conn| {
+            use rusqlite::OptionalExtension;
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT i.id FROM issues i JOIN issue_tags t ON t.issue_id = i.id \
+                     WHERE i.session = ?1 AND t.tag = ?2 AND i.deleted IS NULL \
+                     AND i.status NOT IN ('done','verified','discarded') LIMIT 1",
+                    rusqlite::params![lane_s, tag],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let out = match existing {
+                Some(id) => (id, false),
+                None => {
+                    let row = bs::create_issue(conn, &new, crate::config::now_f64() as i64)?;
+                    if !needsyou {
+                        // NewIssue has no decision/wait fields; set them the way
+                        // PATCH does, through the one row writer.
+                        if let Some(mut row) = bs::get_issue(conn, &row.id)? {
+                            row.decision_question = Some(q);
+                            row.decision_rationale = Some(rationale);
+                            row.waiting_on = Some(waiting_on);
+                            bs::save_patched(conn, &mut row)?;
+                        }
+                    }
+                    (row.id, true)
+                }
+            };
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let out = found.lock().unwrap_or_else(|e| e.into_inner()).take();
+    out.map(|(id, created)| (id, created, path))
+        .ok_or_else(|| "card write returned no id".into())
+}
+
+const BOUNDARY_TEXT: &str = "spending money, anything a customer or outside person \
+reads (email, DM, PR comment, post), deleting or migrating customer or production data, \
+and pushing to main over someone else's commits";
+
+fn steer_text(sentence: &str) -> String {
+    format!(
+        "[amux owner-ask] Your last turn ended by asking the owner: \"{}\". Standing \
+         authority covers this, so proceed without waiting; if you offered options, take \
+         your recommended one. The only boundary where you stop and ask is {BOUNDARY_TEXT}. \
+         If this really crosses one of those, put the question and what unblocks it on \
+         a card for the owner, then keep going on other work.",
+        clip(sentence, 240)
+    )
+}
+
+/// The turn-end consumer. Spawned from the report handler on the idle edge
+/// (legacy Stop hook) and on an applied native `Stop` event.
+pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: String) {
+    if sv::session_is_isolated(&name) || sv::provider_of(&sv::parse_env(&name)) != "claude" {
+        return;
+    }
+    // The Stop hook fires as the final record is written; give the transcript
+    // writer a moment so the classifier reads the turn that just ended.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let Some(path) = transcript_for(&name, &session_id) else {
+        tracing::debug!(session = %name, verdict = "turn_end_no_transcript", "turn-end: no transcript to classify");
+        return;
+    };
+    let records = sv::iter_jsonl_tail(&path, 2_000_000);
+    let Some(turn) = final_turn(&records) else {
+        tracing::debug!(session = %name, verdict = "turn_end_no_final_text", "turn-end: turn did not end on text");
+        return;
+    };
+    let verdict = classify_owner_ask(&turn.text);
+    match verdict {
+        OwnerAsk::None => {
+            tracing::debug!(session = %name, verdict = "owner_ask_none", "turn-end: no owner ask at the end of the turn");
+        }
+        OwnerAsk::InBoundary { ref sentence } => {
+            if !enabled(&name, OWNER_ASK_KEY) {
+                tracing::info!(session = %name, verdict = "owner_ask_disabled", sentence = %clip(sentence, 160),
+                    "turn-end: in-boundary owner ask left alone ({OWNER_ASK_KEY} is off)");
+                return;
+            }
+            if owner_said_hold(&turn.prompt) {
+                tracing::info!(session = %name, verdict = "owner_ask_owner_said_hold", sentence = %clip(sentence, 160),
+                    "turn-end: in-boundary owner ask not steered; this turn's prompt asked the lane to hold or only report");
+                return;
+            }
+            if !claim_once(&state, &name, "turn_end.owner_ask", format!("owner-ask:{name}:{}", turn.uuid),
+                json!({"sentence": sentence, "uuid": turn.uuid, "verdict": "in_boundary"})).await
+            {
+                tracing::debug!(session = %name, verdict = "owner_ask_already_handled", "turn-end: ask already handled");
+                return;
+            }
+            let id = format!("owner-ask-{}", turn.uuid);
+            match sv::steer_enqueue_idempotent_report(&state, &name, &steer_text(sentence), OWNER_ASK_GUARD, "", &id).await {
+                Ok(r) => {
+                    tracing::warn!(session = %name, verdict = "owner_ask_steered", steer_id = %r.id,
+                        sentence = %clip(sentence, 160),
+                        "turn-end: lane ended on an in-boundary owner ask; steered once to proceed (AMUX-5234)");
+                    sv::steer_deliver_for_session(&state, &name).await;
+                }
+                Err(e) => tracing::warn!(session = %name, verdict = "owner_ask_steer_refused", error = e,
+                    "turn-end: in-boundary owner ask could not be steered"),
+            }
+        }
+        OwnerAsk::Boundary { ref sentence, kind } => {
+            if !enabled(&name, OWNER_ASK_KEY) {
+                tracing::info!(session = %name, verdict = "owner_ask_disabled", boundary = kind.label(),
+                    "turn-end: boundary owner ask left alone ({OWNER_ASK_KEY} is off)");
+                return;
+            }
+            if !claim_once(&state, &name, "turn_end.owner_ask", format!("owner-ask:{name}:{}", turn.uuid),
+                json!({"sentence": sentence, "uuid": turn.uuid, "verdict": "boundary", "boundary": kind.label()})).await
+            {
+                return;
+            }
+            let question = as_question(sentence, &name);
+            let context = tail_paragraphs(&turn.text, 2);
+            match file_ask_card(&state, &name, Some(kind), &question, &context, "turn-end owner-ask classifier").await {
+                Ok((id, true, path)) => tracing::warn!(session = %name, verdict = "owner_ask_card_filed", card = %id,
+                    boundary = kind.label(), path = path.label(),
+                    "turn-end: boundary owner ask filed as a card (needsyou if the approval policy allows its type, else a decision card) (AMUX-5234)"),
+                Ok((id, false, path)) => tracing::info!(session = %name, verdict = "owner_ask_card_duplicate", card = %id,
+                    boundary = kind.label(), path = path.label(), "turn-end: boundary owner ask already has an open card"),
+                Err(e) => tracing::warn!(session = %name, verdict = "owner_ask_card_failed", error = %e,
+                    "turn-end: boundary owner ask could not be filed"),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AskUserQuestion under an active /goal (PreToolUse, scripts/hooks/ask-guard.py)
+// ---------------------------------------------------------------------------
+
+/// Flatten `AskUserQuestion.tool_input` into (question text, options text).
+pub(crate) fn describe_questions(input: &Value) -> (String, String) {
+    let mut qs = Vec::new();
+    let mut opts = Vec::new();
+    for q in input["questions"].as_array().into_iter().flatten() {
+        if let Some(t) = q["question"].as_str() {
+            qs.push(t.trim().to_string());
+        }
+        let labels: Vec<String> = q["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o["label"].as_str().or(o.as_str()).map(str::to_string))
+            .collect();
+        if !labels.is_empty() {
+            opts.push(labels.join(" | "));
+        }
+    }
+    (qs.join(" "), opts.join("; "))
+}
+
+/// POST /api/sessions/{name}/owner-ask. Called by the PreToolUse hook before an
+/// `AskUserQuestion` runs. Answers `{"decision":"allow"}` or
+/// `{"decision":"deny","reason":...}`; the hook fails open on anything else.
+pub(crate) async fn ask_user_question_post(
+    state: &AppState,
+    name: &str,
+    headers: &HeaderMap,
+    body: &Value,
+) -> Response {
+    let origin = sv::hdr_worker(headers);
+    if !origin.is_empty() && origin != name {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "an ask may only be reported by the lane asking it"})))
+            .into_response();
+    }
+    let allow = |why: &str| {
+        tracing::debug!(session = %name, verdict = why, "ask intercept: question allowed through");
+        Json(json!({"decision": "allow", "why": why})).into_response()
+    };
+    if sv::session_is_isolated(name) {
+        return allow("ask_intercept_isolated");
+    }
+    if !enabled(name, OWNER_ASK_KEY) {
+        return allow("ask_intercept_disabled");
+    }
+    let sid = body["session_id"].as_str().unwrap_or("");
+    let Some(path) = transcript_for(name, sid) else {
+        return allow("ask_intercept_no_transcript");
+    };
+    let records = sv::iter_jsonl_tail(&path, 8_000_000);
+    let Some(goal) = goal_condition(&records) else {
+        return allow("ask_intercept_no_goal");
+    };
+    let (question, options) = describe_questions(&body["tool_input"]);
+    if question.trim().is_empty() {
+        return allow("ask_intercept_unreadable_question");
+    }
+    // Not every goal-time question touches the boundary, but the owner is not
+    // at the keyboard, so the card is the record either way. `decision` is the
+    // honest type for an in-boundary one.
+    let boundary = boundary_of(&format!("{question} {options}"));
+    let q = as_question(&question, name);
+    let context = format!("AskUserQuestion while /goal is active (goal: {}).\n\nOptions: {options}", clip(&goal, 300));
+    let filed = file_ask_card(state, name, boundary, &q, &context, "AskUserQuestion goal intercept").await;
+    let card = match filed {
+        Ok((id, created, path)) => {
+            tracing::warn!(session = %name, verdict = "ask_intercept_converted", card = %id, created, path = path.label(),
+                boundary = boundary.map(Boundary::label).unwrap_or("none"),
+                "ask intercept: AskUserQuestion under an active /goal filed as needsyou and denied (AMUX-5234)");
+            id
+        }
+        Err(e) => {
+            tracing::warn!(session = %name, verdict = "ask_intercept_card_failed", error = %e,
+                "ask intercept: could not file the card; letting the question through");
+            return allow("ask_intercept_card_failed");
+        }
+    };
+    let reason = match boundary {
+        Some(b) => format!(
+            "amux: a /goal is active on this lane, so this question was filed as board card {card} \
+             instead of waiting on the owner. It touches the boundary ({}): do NOT take that action. \
+             Continue with other in-boundary work toward the goal; the card waits for the owner.",
+            b.label()
+        ),
+        None => format!(
+            "amux: a /goal is active on this lane, so this question was filed as board card {card} \
+             instead of waiting on the owner. Standing authority covers it: proceed with your \
+             recommended option (the first one if you marked none) and keep driving the goal. \
+             The boundary where you must not proceed is {BOUNDARY_TEXT}."
+        ),
+    };
+    Json(json!({"decision": "deny", "reason": reason, "card": card})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ask(text: &str) -> OwnerAsk {
+        classify_owner_ask(text)
+    }
+    fn in_boundary(text: &str) -> bool {
+        matches!(ask(text), OwnerAsk::InBoundary { .. })
+    }
+    fn boundary(text: &str) -> Option<Boundary> {
+        match ask(text) {
+            OwnerAsk::Boundary { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    // --- F1 specimens from docs/fleet-stall-review-2026-09-26.md ------------
+
+    #[test]
+    fn gtm_engine_say_go_for_a_rewrite_is_in_boundary() {
+        let t = "Rewrote 152 of the 192 emails and loaded them into the sequence drafts.\n\n\
+                 The remaining 40 still use the old opener. Say go and I'll rewrite those too.";
+        assert!(in_boundary(t), "{:?}", ask(t));
+        match ask(t) {
+            OwnerAsk::InBoundary { sentence } => assert_eq!(sentence, "Say go and I'll rewrite those too."),
+            other => panic!("{other:?}"),
+        }
+        // The quoted form of the same ask: the one quoted word IS the ask.
+        assert!(in_boundary("Loaded.\n\nSay \"go\" and I'll rewrite the rest."));
+    }
+
+    #[test]
+    fn mixpeek_cicd_awaiting_your_word_is_in_boundary() {
+        let t = "MC-2092, MC-2094 and MC-2096 each have a one-line fix ready in the deploy resolver.\n\n\
+                 Awaiting your word on all three.";
+        assert!(in_boundary(t), "{:?}", ask(t));
+    }
+
+    #[test]
+    fn mvs_infra_unless_you_want_it_sooner_is_in_boundary() {
+        let t = "Watchers are armed on shard 3.\n\nI'll run the auto-fix canary at 02:00 unless you want it sooner.";
+        assert!(in_boundary(t), "{:?}", ask(t));
+    }
+
+    #[test]
+    fn want_me_to_and_shall_i_are_asks() {
+        assert!(in_boundary("All green.\n\nWant me to open the follow-up for the flaky test?"));
+        assert!(in_boundary("Done with the refactor. Shall I also split the module?"));
+    }
+
+    #[test]
+    fn gtm_engine_money_ask_is_a_boundary() {
+        let t = "The Advertising Week pass is $749 and the early rate ends Friday.\n\nSay go and I'll buy it.";
+        assert_eq!(boundary(t), Some(Boundary::Money));
+    }
+
+    #[test]
+    fn gs10_blocked_ask_lines_are_boundary_asks() {
+        let t = "Status written to STATUS.md.\n\n\
+                 BLOCKED-ASK: may I roll the MVS prod primary without a warm standby?\n\n\
+                 Everything else is green.";
+        assert_eq!(boundary(t), Some(Boundary::ProdData));
+        let paid = "BLOCKED-ASK: enable the paid Staging E2E suite (about $40/day)?";
+        assert_eq!(boundary(paid), Some(Boundary::Money));
+    }
+
+    #[test]
+    fn tubescience_sign_in_needs_one_thing_from_you() {
+        let t = "Backfill is at 1,200 of 3,310 vectors.\n\n\
+                 Needs one thing from you: a semantic-search sign-in so I can validate parity.";
+        assert_eq!(boundary(t), Some(Boundary::OwnerOnly));
+    }
+
+    #[test]
+    fn external_send_ask_is_a_boundary() {
+        let t = "Drafted the reply to Garik.\n\nWant me to send it to him?";
+        assert_eq!(boundary(t), Some(Boundary::ExternalSend));
+        let seq = "Rewrite is loaded.\n\nNeeds your go to launch the Programmatic I/O sequence.";
+        assert_eq!(boundary(seq), Some(Boundary::ExternalSend));
+    }
+
+    #[test]
+    fn foreign_push_ask_is_a_boundary() {
+        let t = "Rebased on origin/main; there are 4 foreign commits from other lanes in the range.\n\n\
+                 Should I push to main anyway?";
+        assert_eq!(boundary(t), Some(Boundary::ForeignPush));
+    }
+
+    // --- Negative controls ---------------------------------------------------
+
+    #[test]
+    fn a_plain_final_summary_is_not_an_ask() {
+        let t = "Shipped the fix in abc1234. Tests: 212 passed. Card AMUX-99 moved to done with evidence.";
+        assert_eq!(ask(t), OwnerAsk::None);
+    }
+
+    #[test]
+    fn discussing_asks_in_quotes_is_not_an_ask() {
+        let t = "The review found lanes ending on \"say go\" and \"awaiting your word\", and \
+                 gtm-engine wrote 'Say go and I'll rewrite them'.\n\n\
+                 I added the classifier and its tests; `want me to ...?` phrasing is covered.";
+        assert_eq!(ask(t), OwnerAsk::None);
+    }
+
+    #[test]
+    fn reporting_that_it_asked_a_peer_is_not_an_ask() {
+        let t = "I asked mvs-infra whether the shard is clear and am waiting for their answer.\n\n\
+                 Meanwhile the loader is building.";
+        assert_eq!(ask(t), OwnerAsk::None);
+    }
+
+    #[test]
+    fn a_question_mid_report_that_the_report_moves_past_is_not_the_ending() {
+        let t = "Want me to check the logs? I did anyway.\n\nThe logs were clean.\n\nThe second pass is clean too.\n\nAll done.";
+        assert_eq!(ask(t), OwnerAsk::None);
+    }
+
+    #[test]
+    fn let_me_know_if_you_have_questions_is_a_sign_off() {
+        assert_eq!(ask("Everything is merged. Let me know if you have questions."), OwnerAsk::None);
+    }
+
+    #[test]
+    fn owner_hold_instructions_are_recognised() {
+        assert!(owner_said_hold("just tell me what is remaining, don't change anything"));
+        assert!(owner_said_hold("Plan it out but wait for me before pushing"));
+        assert!(!owner_said_hold("what is remaining for gs3?"));
+    }
+
+    // --- Transcript shapes ---------------------------------------------------
+
+    fn asst(uuid: &str, mid: &str, ts: &str, content: Value) -> Value {
+        json!({"type":"assistant","uuid":uuid,"timestamp":ts,"message":{"id":mid,"role":"assistant","content":content}})
+    }
+    fn user_text(ts: &str, text: &str) -> Value {
+        json!({"type":"user","timestamp":ts,"message":{"role":"user","content":text}})
+    }
+
+    #[test]
+    fn final_turn_reads_the_last_text_record_and_its_prompt() {
+        let recs = vec![
+            user_text("2026-09-26T10:00:00Z", "what is remaining?"),
+            asst("a1", "m1", "2026-09-26T10:00:05Z", json!([{"type":"thinking","thinking":"..."}])),
+            asst("a2", "m1", "2026-09-26T10:00:06Z", json!([{"type":"text","text":"Two things. Want me to start?"}])),
+            json!({"type":"system","subtype":"stop_hook_summary","timestamp":"2026-09-26T10:00:07Z"}),
+        ];
+        let t = final_turn(&recs).unwrap();
+        assert_eq!(t.uuid, "a2");
+        assert_eq!(t.prompt, "what is remaining?");
+        assert!(t.text.ends_with("Want me to start?"));
+    }
+
+    #[test]
+    fn a_turn_that_stopped_mid_tool_or_was_answered_has_no_final_text() {
+        let tool = vec![asst("a1", "m1", "2026-09-26T10:00:05Z",
+            json!([{"type":"text","text":"Running it."},{"type":"tool_use","id":"t","name":"Bash","input":{}}]))];
+        assert_eq!(final_turn(&tool), None);
+        let answered = vec![
+            asst("a1", "m1", "2026-09-26T10:00:05Z", json!([{"type":"text","text":"Want me to go?"}])),
+            user_text("2026-09-26T10:01:00Z", "yes"),
+        ];
+        assert_eq!(final_turn(&answered), None);
+    }
+
+    #[test]
+    fn goal_is_read_from_the_newest_goal_record() {
+        let set = json!({"type":"attachment","attachment":{"type":"goal_status","met":false,"sentinel":true,
+            "condition":"drive it to completion you have full authority"}});
+        assert_eq!(goal_condition(std::slice::from_ref(&set)).as_deref(), Some("drive it to completion you have full authority"));
+        let met = json!({"type":"attachment","attachment":{"type":"goal_status","met":true,"condition":"x"}});
+        assert_eq!(goal_condition(&[set.clone(), met]), None);
+        let cleared = user_text("2026-09-26T10:00:00Z",
+            "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>clear</command-args>");
+        assert_eq!(goal_condition(&[set.clone(), cleared]), None);
+        assert_eq!(goal_condition(&[]), None);
+    }
+
+    #[test]
+    fn kill_switch_resolution_env_wins_then_scope_default_on() {
+        assert!(switch_on(None, None));
+        assert!(!switch_on(None, Some("0")));
+        assert!(!switch_on(Some("off"), Some("1")));
+        assert!(switch_on(Some("1"), Some("0")));
+        assert!(switch_on(Some(" "), None));
+    }
+
+    #[test]
+    fn ask_card_question_is_a_question() {
+        assert_eq!(as_question("Want me to send it?", "lane"), "Want me to send it?");
+        assert!(as_question("BLOCKED-ASK: enable paid E2E", "gs-10").ends_with('?'));
+        assert_eq!(question_key("Want me to send it?"), question_key("want me to SEND it"));
+    }
+
+    #[test]
+    fn ask_user_question_input_is_flattened_with_options() {
+        let input = json!({"questions":[{"question":"Which pool should I scale?","header":"Pool",
+            "options":[{"label":"cpu-workers (Recommended)","description":"a"},{"label":"gpu","description":"b"}],"multiSelect":false}]});
+        let (q, o) = describe_questions(&input);
+        assert_eq!(q, "Which pool should I scale?");
+        assert_eq!(o, "cpu-workers (Recommended) | gpu");
+    }
+
+    fn hermetic_state() -> (tempfile::TempDir, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&tmp.path().join("test.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        (tmp, state)
+    }
+
+    #[tokio::test]
+    async fn a_boundary_ask_files_one_needsyou_card_and_dedupes_the_repeat() {
+        let (_tmp, state) = hermetic_state();
+        let q = "May gs-10 proceed with this: enable the paid Staging E2E suite?";
+        let (id, created, path) =
+            file_ask_card_via(&state, "gs-10", Some(Boundary::Money), q, "ctx", "test", AskPath::NeedsYou)
+                .await
+                .unwrap();
+        assert!(created);
+        assert_eq!(path, AskPath::NeedsYou);
+        // Same question, different casing and punctuation: the same ask.
+        let again = "may gs-10 proceed with this -- enable the PAID staging e2e suite?";
+        let (id2, created2, _) =
+            file_ask_card_via(&state, "gs-10", Some(Boundary::Money), again, "ctx", "test", AskPath::NeedsYou)
+                .await
+                .unwrap();
+        assert_eq!((id2.as_str(), created2), (id.as_str(), false));
+        let conn = state.store.read().unwrap();
+        let row = crate::db::board_store::get_issue(&conn, &id).unwrap().unwrap();
+        assert_eq!(row.status, "needsyou");
+        assert_eq!(row.ask_type.as_deref(), Some("budget"));
+        assert!(row.ask_question.as_deref().unwrap().ends_with('?'));
+        assert!(crate::db::board_store::ask_verdict(
+            row.ask_actor.as_deref().unwrap_or(""),
+            row.ask_type.as_deref().unwrap_or(""),
+            row.ask_question.as_deref().unwrap_or(""),
+            row.ask_unblocks.as_deref().unwrap_or(""),
+        ) == crate::db::board_store::AskVerdict::Ok, "the card must pass the board's own typed-ask gate");
+    }
+
+    /// AMUX_APPROVAL_TYPES="budget,customer_outbound" (this box's global
+    /// policy): the board refuses needsyou for any other ask_type with a 409,
+    /// so a credential or prod-data ask must land as a decision card instead.
+    #[tokio::test]
+    async fn an_ask_outside_the_approval_policy_becomes_a_decision_card() {
+        let (_tmp, state) = hermetic_state();
+        let q = "Needs one thing from you: a semantic-search sign-in so I can validate parity?";
+        let (id, created, path) = file_ask_card_via(
+            &state, "tubescience-parity", Some(Boundary::OwnerOnly), q, "ctx", "test", AskPath::Decision,
+        )
+        .await
+        .unwrap();
+        assert!(created);
+        assert_eq!(path, AskPath::Decision);
+        let conn = state.store.read().unwrap();
+        let row = crate::db::board_store::get_issue(&conn, &id).unwrap().unwrap();
+        assert_eq!(row.status, "backlog");
+        assert_eq!(row.item_type, "decision");
+        assert_eq!(row.ask_type, None, "no needsyou ask outside the configured categories");
+        assert_eq!(row.decision_question.as_deref(), Some(q));
+        assert!(row.decision_rationale.is_some());
+        let wait: Value = serde_json::from_str(row.waiting_on.as_deref().unwrap()).unwrap();
+        assert_eq!(wait["type"], "credential");
+        assert!(!row.tags.iter().any(|t| t == crate::db::board_store::NEEDS_YOU_TAG));
+        drop(conn);
+        // Dedupe works across both shapes: the same question finds this card.
+        let (id2, created2, _) = file_ask_card_via(
+            &state, "tubescience-parity", Some(Boundary::OwnerOnly), q, "ctx", "test", AskPath::NeedsYou,
+        )
+        .await
+        .unwrap();
+        assert_eq!((id2, created2), (id, false));
+    }
+
+    #[tokio::test]
+    async fn claim_once_acts_exactly_once_per_key() {
+        let (_tmp, state) = hermetic_state();
+        assert!(claim_once(&state, "lane", "turn_end.owner_ask", "k1".into(), json!({})).await);
+        assert!(!claim_once(&state, "lane", "turn_end.owner_ask", "k1".into(), json!({})).await);
+        assert!(claim_once(&state, "lane", "turn_end.owner_ask", "k2".into(), json!({})).await);
+    }
+
+    #[test]
+    fn steer_text_carries_no_em_dash() {
+        assert!(!steer_text("Say go and I'll do it.").contains('\u{2014}'));
+    }
+}

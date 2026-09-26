@@ -38,7 +38,8 @@ printf '%s\n' '{
 
 for _ in 1 2; do
   /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py \
-    --settings "$SETTINGS" --hook-path '$HOME/.amux/hook-report.sh' >/dev/null
+    --settings "$SETTINGS" --hook-path '$HOME/.amux/hook-report.sh' \
+    --ask-guard-path '$HOME/.amux/hooks/ask-guard.py' >/dev/null
 done
 
 /usr/bin/python3 - "$SETTINGS" <<'PY'
@@ -61,6 +62,9 @@ assert any(r[0]=="Notification" and " blocked " in r[2] for r in reports), repor
 assert len([r for r in reports if r[0] == "PostToolUse" and r[1] == ".*"]) == 1
 read_guards=[r for r in rows if "large-read-guard.py" in r[2]]
 assert sorted((r[0],r[1]) for r in read_guards)==[("PreToolUse","Bash"),("PreToolUse","Read")],read_guards
+# AMUX-5234: exactly one anchored AskUserQuestion guard after two installs.
+ask_guards=[r for r in rows if "ask-guard.py" in r[2]]
+assert [(r[0],r[1]) for r in ask_guards]==[("PreToolUse","^AskUserQuestion$")],ask_guards
 assert any(r[2] == "echo unrelated" for r in rows)
 assert any(r[2] == "bash check-format.sh" for r in rows)
 assert not any("/api/sessions/" in r[2] and "hook-report.sh" not in r[2] for r in rows)

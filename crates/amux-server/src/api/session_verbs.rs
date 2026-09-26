@@ -801,7 +801,7 @@ pub(crate) fn cross_group_allow_resolution_in(
     }
 }
 
-fn provider_of(cfg: &EnvFile) -> String {
+pub(crate) fn provider_of(cfg: &EnvFile) -> String {
     let p = cfg.get_or("CC_PROVIDER", "claude").trim().to_lowercase();
     if SESSION_PROVIDERS.contains(&p.as_str()) && !p.is_empty() {
         p
@@ -18109,7 +18109,7 @@ fn session_destructive_allowed(state: &AppState, headers: &HeaderMap) -> bool {
 
 /// Origin header, py:15208 _hdr_worker precedence (X-Amux-Worker first,
 /// legacy X-Amux-Session).
-fn hdr_worker(headers: &HeaderMap) -> String {
+pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
     for k in ["x-amux-worker", "x-amux-session"] {
         if let Some(v) = headers.get(k).and_then(|v| v.to_str().ok()) {
             let v = v.trim();
@@ -23615,6 +23615,9 @@ async fn post_dispatch(
         "reset" => reset_verb(state, name).await,
         "commit-report" => commit_report_verb(state, name, body).await,
         "report" => report_post(state, name, headers, body).await,
+        // AMUX-5234: the PreToolUse AskUserQuestion hook asks whether a /goal
+        // is active; if so the question is filed as a board card and denied.
+        "owner-ask" => super::turn_end::ask_user_question_post(state, name, headers, body).await,
         "apply-template" => apply_template_verb(body),
         "delete" => delete_post(state, name, headers).await,
         // CONVENTIONAL SPELLINGS, routed to the SAME handlers (AMUX-2669/2665).
@@ -27544,7 +27547,7 @@ pub(crate) fn native_claude_interrupt(name: &str, report: &Value) -> Option<f64>
     (ts > report["ts"].as_f64().unwrap_or(f64::MAX) && ts <= now_f64() + 5.0).then_some(ts)
 }
 
-fn lifecycle_transcript_path(name: &str, lifecycle_session: &str) -> Option<PathBuf> {
+pub(crate) fn lifecycle_transcript_path(name: &str, lifecycle_session: &str) -> Option<PathBuf> {
     if !cached_re!(r"^[0-9a-fA-F-]{36}$").is_match(lifecycle_session) {
         return None;
     }
@@ -28341,6 +28344,11 @@ pub(crate) async fn report_post(
                     })
                     .await;
                 });
+                // AMUX-5234: classify what the turn ENDED on. Spawned, because
+                // it reads the transcript and must never delay the hook's reply.
+                let (st_te, name_te) = (state.clone(), name.to_string());
+                let sid = reported_conv.trim().to_string();
+                crate::db::interactions::spawn(super::turn_end::on_turn_end(st_te, name_te, sid));
             }
             // REACTIVE STEERING DELIVERY: if the session just went idle and has
             // queued steering, deliver the oldest one NOW rather than waiting up
