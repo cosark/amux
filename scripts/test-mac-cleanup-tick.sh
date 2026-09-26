@@ -205,6 +205,10 @@ cat > "$FIX/fake-thin.sh" <<EOF
 echo "\$@" >> "$TREC"
 EOF
 chmod +x "$FIX/fake-thin.sh"
+# A listing with ONE snapshot, so the thin arm has something to act on (DESKT-49
+# skips the thin when there is none, and a real Mac may have none at test time).
+printf 'Snapshots for disk /:\ncom.apple.TimeMachine.2026-09-26-120000.local\n' > "$FIX/one-snap.txt"
+export AMUX_CLEANUP_SNAP_LIST_CMD="cat $FIX/one-snap.txt"
 : > "$TREC"
 AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=999999 \
   AMUX_CLEANUP_SNAPSHOT_RECLAIM_GB=7 AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 \
@@ -222,6 +226,15 @@ AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FL
   AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
   AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" >/dev/null 2>&1
 check "no thin when the disk has room" "0" "$(wc -l < "$TREC" | tr -d ' ')"
+: > "$TREC"
+printf 'Snapshots for disk /:\n' > "$FIX/no-snap.txt"
+out=$(AMUX_CLEANUP_SNAP_LIST_CMD="cat $FIX/no-snap.txt" AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=999999 \
+  AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
+  AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" 2>&1)
+check "with no snapshots under the floor, tmutil is not run" "0" "$(wc -l < "$TREC" | tr -d ' ')"
+check "and the line says there was nothing to thin (DESKT-49)" "1" "$(printf '%s\n' "$out" | grep -c 'snapshots none to thin')"
+check "and never prints thinned 0 -> 0" "0" "$(printf '%s\n' "$out" | grep -c 'thinned 0 -> 0' || true)"
+unset AMUX_CLEANUP_SNAP_LIST_CMD
 
 echo "7c. end to end: the family line names a parent and its child count"
 out=$(AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
