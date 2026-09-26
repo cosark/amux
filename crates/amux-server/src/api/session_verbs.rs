@@ -23237,6 +23237,9 @@ pub(crate) async fn steer_mutate(
         };
     }
     if *method == Method::POST {
+        if let Some(refusal) = probe_refusal(state, name, headers, &body_str(body, "text")).await {
+            return refusal;
+        }
         if let Some(refusal) = isolated_peer_refusal(state, name, headers).await {
             return refusal;
         }
@@ -24611,6 +24614,54 @@ async fn lifecycle_peer_gate(
     }
 }
 
+/// Refuse a delivery probe aimed at a real worker (F8(d), AMUX-5241). See
+/// `send_probe` for the incident: a `[send-pipeline-test]` probe was typed into
+/// the primis pane, a customer-facing lane, by an ad-hoc curl. Checked before
+/// anything is reserved, queued or recorded, so a refused probe leaves no
+/// trace in the lane beyond the event that says it was refused.
+pub(crate) async fn probe_refusal(
+    state: &AppState,
+    name: &str,
+    headers: &HeaderMap,
+    text: &str,
+) -> Option<Response> {
+    let tag = super::send_probe::probe_tag(text)?;
+    if !scoped_gate_on(name, super::send_probe::GATE_KEY) {
+        return None;
+    }
+    let origin = hdr_worker(headers);
+    let flag = scoped_setting_in(&home(), name, super::send_probe::TARGET_FLAG);
+    if super::send_probe::is_probe_target(name, flag.as_deref()) {
+        tracing::info!(origin = %origin, target = %name, tag, measured = true, n_considered = 1,
+            verdict = "probe_allowed", "delivery probe addressed to a designated probe lane");
+        return None;
+    }
+    let reason = format!(
+        "send refused: '[{tag}]' is a delivery probe and '{name}' is a real worker. Probes go only to \
+         lanes named {} or lanes that set {}=1.",
+        super::send_probe::PROBE_PREFIXES.map(|p| format!("{p}*")).join(", "),
+        super::send_probe::TARGET_FLAG,
+    );
+    tracing::warn!(origin = %origin, target = %name, tag, measured = true, n_considered = 1,
+        verdict = "probe_refused", "{reason}");
+    emit_event(
+        state,
+        name,
+        "send.probe_refused",
+        Some(json!({"origin": origin, "target": name, "tag": tag})),
+        None,
+        "probe-guard",
+    )
+    .await;
+    Some(jresp(
+        StatusCode::FORBIDDEN,
+        json!({
+            "ok": false, "error": reason, "blocked": "probe", "code": "probe_target_refused",
+            "what_to_do": "Create or reuse a probe lane (e.g. probe-<purpose>) or set CC_PROBE_TARGET=1 on the lane that exists for testing, and send the probe there.",
+        }),
+    ))
+}
+
 async fn isolated_peer_refusal(
     state: &AppState,
     name: &str,
@@ -24770,6 +24821,9 @@ async fn send_post_detached(
 }
 
 async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+    if let Some(refusal) = probe_refusal(state, name, headers, &body_str(body, "text")).await {
+        return refusal;
+    }
     if let Some(refusal) = isolated_peer_refusal(state, name, headers).await {
         return refusal;
     }
