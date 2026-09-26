@@ -51,8 +51,206 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 /// An approval not consumed within this window expires (autodesk's sketch:
-/// "an hour seems right").
+/// "an hour seems right"). Outbound email is EXEMPT since AMUX-5240: see
+/// [`never_expires`].
 pub const APPROVAL_TTL_S: f64 = 3600.0;
+
+/// Does this approval stay pending until a human acts on it? (AMUX-5240)
+///
+/// Outbound email (`send` / `reply`) does. The 1h TTL was sized for a human
+/// sitting at the dashboard while an interactive lane waited, and the parked
+/// drafts that matter come from SCHEDULED lanes: gtm-ticker's SCHED-498 drafts
+/// replies and parks each one, the owner reads the queue hours later, the
+/// draft has expired, and the next fire re-requests it under a new id. Four
+/// drafts (Rami, Abraham, John, AssemblyAI) expired twice that way in the
+/// 2026-09-26 fleet review. Expiry protected nothing: an expired draft was
+/// simply asked for again, so the only thing the TTL did was throw away the
+/// owner's place in the queue. Now it stays until approved or discarded, and
+/// a re-request reuses it ([`request_approval`]).
+///
+/// Any other kind, if one is ever frozen here, keeps the TTL.
+pub fn never_expires(doc: &Value) -> bool {
+    matches!(
+        doc.get("endpoint").and_then(Value::as_str),
+        Some("send") | Some("reply")
+    )
+}
+
+fn expired(doc: &Value, now: f64) -> bool {
+    let created = doc.get("created").and_then(Value::as_f64).unwrap_or(0.0);
+    !never_expires(doc) && now - created > APPROVAL_TTL_S
+}
+
+/// The identity of a DRAFT for dedupe (AMUX-5240): the requesting lane, the
+/// resolved recipients (to + cc, lowercased, sorted) and the subject with
+/// reply/forward prefixes stripped, so "Re: Pilot" on the thread and "Pilot"
+/// to the same person are one draft. A reply with no subject falls back to
+/// its anchor message id. `None` when there are no recipients: nothing to
+/// match on, so never dedupe.
+///
+/// The lane is part of the key on purpose. Two lanes writing to the same
+/// person about the same thing are two drafts a human should see; one lane
+/// asking again on its next schedule fire is the same draft.
+pub fn draft_key(session: &str, preview: &Value, payload: &Value) -> Option<String> {
+    let field = |k: &str| {
+        preview
+            .get(k)
+            .and_then(Value::as_str)
+            .or_else(|| payload.get(k).and_then(Value::as_str))
+            .unwrap_or("")
+    };
+    let mut rcpts: Vec<String> = format!("{},{}", field("to"), field("cc"))
+        .split(',')
+        .map(|a| a.trim().to_lowercase())
+        .filter(|a| a.contains('@'))
+        .collect();
+    rcpts.sort();
+    rcpts.dedup();
+    if rcpts.is_empty() {
+        return None;
+    }
+    let mut subject = field("subject").trim().to_lowercase();
+    loop {
+        let before = subject.len();
+        for pre in ["re:", "fwd:", "fw:"] {
+            if let Some(rest) = subject.strip_prefix(pre) {
+                subject = rest.trim_start().to_string();
+            }
+        }
+        if subject.len() == before {
+            break;
+        }
+    }
+    let thread = if subject.is_empty() {
+        format!(
+            "msg:{}",
+            preview
+                .get("in_reply_to")
+                .or_else(|| payload.get("message_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        )
+    } else {
+        format!("subj:{subject}")
+    };
+    Some(format!("{}|{}|{thread}", session.trim().to_lowercase(), rcpts.join(",")))
+}
+
+/// Result of [`request_approval`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Requested {
+    pub id: String,
+    /// True when an existing pending approval for the same draft was returned.
+    pub reused: bool,
+    /// How many times this draft has now been requested (1 on creation).
+    pub requests: u64,
+    /// The re-request's body differs from the frozen one. The FROZEN draft is
+    /// what a human approves; the caller is told so rather than having the
+    /// draft swapped under a reviewer who may already have it open.
+    pub draft_changed: bool,
+}
+
+fn requests_sidecar(home: &Path, id: &str) -> PathBuf {
+    approvals_dir(home).join(format!("{id}.requests.json"))
+}
+
+fn read_requests(home: &Path, id: &str) -> (u64, f64) {
+    std::fs::read_to_string(requests_sidecar(home, id))
+        .ok()
+        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        .map(|v| {
+            (
+                v.get("requests").and_then(Value::as_u64).unwrap_or(1),
+                v.get("last_requested").and_then(Value::as_f64).unwrap_or(0.0),
+            )
+        })
+        .unwrap_or((1, 0.0))
+}
+
+/// Freeze a refused request, or return the pending approval that already
+/// holds the same draft (AMUX-5240). Handlers call this; `create_approval`
+/// stays the raw primitive.
+///
+/// The re-request count lives in a SIDECAR (`<id>.requests.json`), never in
+/// the approval file itself. Rewriting `<id>.json` could race `consume`'s
+/// rename and resurrect a draft a human just released, which would send it
+/// twice. The sidecar is not an id-shaped `.json` name, so `list_pending`
+/// never mistakes it for an approval.
+pub fn request_approval(
+    home: &Path,
+    session: &str,
+    endpoint: &str,
+    payload: Value,
+    preview: Value,
+) -> std::io::Result<Requested> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(key) = draft_key(session, &preview, &payload) {
+        if let Some(existing) = find_pending_draft(home, &key) {
+            let id = existing
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let (prior, _) = read_requests(home, &id);
+            let requests = prior + 1;
+            let frozen_body = existing
+                .pointer("/payload/body")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let new_body = payload.get("body").and_then(Value::as_str).unwrap_or("");
+            let draft_changed = frozen_body.trim() != new_body.trim();
+            let _ = std::fs::write(
+                requests_sidecar(home, &id),
+                json!({"requests": requests, "last_requested": now_f64(),
+                       "last_draft_changed": draft_changed})
+                .to_string(),
+            );
+            return Ok(Requested {
+                id,
+                reused: true,
+                requests,
+                draft_changed,
+            });
+        }
+    }
+    let id = create_approval(home, session, endpoint, payload, preview)?;
+    Ok(Requested {
+        id,
+        reused: false,
+        requests: 1,
+        draft_changed: false,
+    })
+}
+
+/// The pending, unexpired approval whose draft key is `key`, oldest first.
+fn find_pending_draft(home: &Path, key: &str) -> Option<Value> {
+    let dir = approvals_dir(home);
+    let now = now_f64();
+    let mut hits: Vec<Value> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let id = name.strip_suffix(".json")?;
+            if !valid_id(id) {
+                return None;
+            }
+            let doc: Value = serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+            let session = doc.get("session").and_then(Value::as_str).unwrap_or("");
+            let preview = doc.get("preview").cloned().unwrap_or(Value::Null);
+            let payload = doc.get("payload").cloned().unwrap_or(Value::Null);
+            (!expired(&doc, now) && draft_key(session, &preview, &payload).as_deref() == Some(key))
+                .then_some(doc)
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        let ka = a.get("created").and_then(Value::as_f64).unwrap_or(0.0);
+        let kb = b.get("created").and_then(Value::as_f64).unwrap_or(0.0);
+        ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.into_iter().next()
+}
 
 fn env_list(home: &Path, key: &str) -> Vec<String> {
     crate::api::settings::effective_env(home, key)
@@ -220,8 +418,7 @@ pub fn consume(home: &Path, id: &str) -> Consume {
     let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
         return Consume::Gone;
     };
-    let created = doc.get("created").and_then(Value::as_f64).unwrap_or(0.0);
-    if now_f64() - created > APPROVAL_TTL_S {
+    if expired(&doc, now_f64()) {
         let _ = std::fs::rename(&live, dir.join(format!("{id}.expired.json")));
         return Consume::Expired;
     }
@@ -285,7 +482,8 @@ pub fn fate(home: &Path, id: &str) -> String {
         };
     }
     if dir.join(format!("{id}.expired.json")).exists() {
-        return "this approval EXPIRED unreleased (1h TTL) — the worker must request the send again"
+        return "this approval EXPIRED unreleased under the old 1h TTL (email approvals no longer \
+                expire, AMUX-5240); the worker must request the send again"
             .into();
     }
     "no approval with that id is pending, and the directory holds no record of one".into()
@@ -344,13 +542,25 @@ pub fn list_pending(home: &Path) -> Vec<Value> {
             };
             let created = doc.get("created").and_then(Value::as_f64).unwrap_or(0.0);
             let age = (now_f64() - created).max(0.0);
-            if age > APPROVAL_TTL_S {
+            if expired(&doc, now_f64()) {
                 let _ = std::fs::rename(e.path(), dir.join(format!("{id}.expired.json")));
                 continue;
             }
+            let keeps = never_expires(&doc);
+            let (requests, last_requested) = read_requests(home, id);
             if let Some(obj) = doc.as_object_mut() {
                 obj.insert("age_s".into(), json!(age as i64));
-                obj.insert("expires_in_s".into(), json!((APPROVAL_TTL_S - age) as i64));
+                // null, not a number, for a kind that never expires: a
+                // countdown that never reaches zero is a lie on the banner.
+                obj.insert(
+                    "expires_in_s".into(),
+                    if keeps { Value::Null } else { json!((APPROVAL_TTL_S - age) as i64) },
+                );
+                obj.insert("expires".into(), json!(!keeps));
+                obj.insert("requests".into(), json!(requests));
+                if last_requested > 0.0 {
+                    obj.insert("last_requested".into(), json!(last_requested));
+                }
                 // Business review must distinguish a truncated summary from the
                 // frozen message. Never expose raw attachment data or file paths.
                 // Existing dashboard previews retain their compatible shape.
@@ -522,13 +732,26 @@ mod tests {
             .join(format!("{id}.approved.json"))
             .exists());
         assert!(list_pending(home).is_empty());
-        // Expiry: backdate a fresh approval past the TTL.
-        let id2 = create_approval(home, "s", "send", json!({}), json!({})).unwrap();
+        // Expiry still applies to a NON-email kind: backdate past the TTL.
+        let id2 = create_approval(home, "s", "grant", json!({}), json!({})).unwrap();
         let p = home.join("email-approvals").join(format!("{id2}.json"));
         let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         doc["created"] = json!(now_f64() - APPROVAL_TTL_S - 5.0);
         std::fs::write(&p, doc.to_string()).unwrap();
         assert!(matches!(consume(home, &id2), Consume::Expired));
+        // AMUX-5240: an outbound email approval aged far past the old TTL is
+        // still releasable. This is the SCHED-498 shape: parked at one fire,
+        // read by the owner hours later.
+        let id3 = create_approval(home, "gtm-ticker", "send", json!({"body": "x"}), json!({})).unwrap();
+        let p = home.join("email-approvals").join(format!("{id3}.json"));
+        let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        doc["created"] = json!(now_f64() - 30.0 * 3600.0);
+        std::fs::write(&p, doc.to_string()).unwrap();
+        let pending = list_pending(home);
+        assert_eq!(pending.len(), 1, "a day-old email draft stays pending");
+        assert_eq!(pending[0]["expires_in_s"], Value::Null);
+        assert_eq!(pending[0]["expires"], json!(false));
+        assert!(matches!(consume(home, &id3), Consume::Ready(_)));
         // Traversal shapes never reach the filesystem.
         for bad in [
             "../../etc/passwd",
@@ -540,5 +763,41 @@ mod tests {
             assert!(!valid_id(bad), "{bad}");
             assert!(matches!(consume(home, bad), Consume::Gone));
         }
+    }
+
+    /// AMUX-5240: SCHED-498 re-requests the same reply on every fire. The
+    /// second request must return the FIRST id, count it, and keep the frozen
+    /// draft; a different recipient, subject or lane is a different draft.
+    #[test]
+    fn a_re_request_of_the_same_draft_reuses_the_pending_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let preview = |to: &str, subject: &str| json!({"endpoint": "reply", "to": to, "cc": "", "subject": subject, "in_reply_to": "<a@b>"});
+        let payload = |body: &str| json!({"message_id": "<a@b>", "body": body});
+        let first = request_approval(home, "gtm-ticker", "reply", payload("hi Rami"), preview("Rami@Ext.com", "Pilot")).unwrap();
+        assert!(!first.reused);
+        let again = request_approval(home, "gtm-ticker", "reply", payload("hi Rami"), preview("rami@ext.com", "Re: RE: pilot")).unwrap();
+        assert_eq!(again.id, first.id, "same lane + recipient + subject is one draft");
+        assert!(again.reused && !again.draft_changed);
+        assert_eq!(again.requests, 2);
+        let edited = request_approval(home, "gtm-ticker", "reply", payload("hi Rami, v2"), preview("rami@ext.com", "Pilot")).unwrap();
+        assert_eq!(edited.id, first.id);
+        assert!(edited.draft_changed, "the caller is told its new body is not what is frozen");
+        let pending = list_pending(home);
+        assert_eq!(pending.len(), 1, "no duplicate in the owner's queue");
+        assert_eq!(pending[0]["requests"], json!(3));
+        assert_eq!(pending[0].pointer("/review/body"), Some(&json!("hi Rami")), "frozen draft unchanged");
+        // Different recipient, different subject, different lane: new drafts.
+        for (lane, to, subj) in [("gtm-ticker", "abraham@ext.com", "Pilot"), ("gtm-ticker", "rami@ext.com", "Invoice"), ("refresh-house", "rami@ext.com", "Pilot")] {
+            let r = request_approval(home, lane, "reply", payload("x"), preview(to, subj)).unwrap();
+            assert!(!r.reused, "{lane} {to} {subj}");
+        }
+        assert_eq!(list_pending(home).len(), 4);
+        // Once released, a new request is a new approval (the old one is gone).
+        assert!(matches!(consume(home, &first.id), Consume::Ready(_)));
+        let after = request_approval(home, "gtm-ticker", "reply", payload("hi Rami"), preview("rami@ext.com", "Pilot")).unwrap();
+        assert!(!after.reused && after.id != first.id);
+        // No recipients: never deduped.
+        assert_eq!(draft_key("s", &json!({}), &json!({})), None);
     }
 }

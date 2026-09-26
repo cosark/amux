@@ -57,6 +57,20 @@ pub trait AlertChannels: Send + Sync {
     async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String);
 }
 
+/// The owner's inbox and whether it was PINNED: `AMUX_OWNER_EMAIL` if set,
+/// else the most recently refreshed connected Gmail account (AMUX-3203/3524).
+/// Shared by the fire alarm and the non-urgent owner digests (AMUX-5240) so
+/// the two can never disagree about where "the owner" reads mail.
+pub(crate) fn owner_email_destination(home: &std::path::Path) -> Option<(String, bool)> {
+    if let Some(pinned) = effective_env(home, "AMUX_OWNER_EMAIL").filter(|e| !e.trim().is_empty()) {
+        return Some((pinned, true));
+    }
+    crate::integrations::email::connected_accounts_by_freshness_in(home)
+        .into_iter()
+        .next()
+        .map(|a| (a, false))
+}
+
 /// Production channels: web push via crate::push, SMS via Twilio-or-osascript.
 pub struct RealChannels;
 
@@ -132,7 +146,7 @@ impl AlertChannels for RealChannels {
 ///     as dispatched") reported "sent" for a page nobody received.
 ///
 /// "sent" must mean an endpoint took it, never the send call's self-description.
-fn push_delivery_verdict(results: &[Value]) -> Result<(), String> {
+pub(crate) fn push_delivery_verdict(results: &[Value]) -> Result<(), String> {
     if results.len() == 1 {
         let r = &results[0];
         if r.get("host").and_then(Value::as_str) == Some("")
@@ -920,12 +934,10 @@ async fn post_owner(
     // subscription he never made or a phone he cleared after the 38-SMS night.
     let email_enabled =
         effective_env(&home, "AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
-    let pinned_email = effective_env(&home, "AMUX_OWNER_EMAIL").filter(|e| !e.trim().is_empty());
-    let owner_email = pinned_email.clone().or_else(|| {
-        crate::integrations::email::connected_accounts_by_freshness_in(&home)
-            .into_iter()
-            .next()
-    });
+    let (owner_email, pinned) = match owner_email_destination(&home) {
+        Some((to, pinned)) => (Some(to), pinned),
+        None => (None, false),
+    };
     // SAY WHICH INBOX, AND WHY (AMUX-3524). With AMUX_OWNER_EMAIL unset the
     // destination is "whichever connected account was refreshed most
     // recently" — so the SAME alert class lands in different inboxes over
@@ -935,7 +947,7 @@ async fn post_owner(
     // configured address must still reach someone) but it is no longer
     // silent: the channels map carries the destination and the reason, and
     // an unpinned send WARNs where sweeps look.
-    let owner_email_pinned = pinned_email.is_some();
+    let owner_email_pinned = pinned;
     if !email_enabled {
         out_channels.insert("email".into(), json!("disabled (AMUX_URGENT_EMAIL=0)"));
     } else if owner_email.is_none() {

@@ -534,27 +534,31 @@ pub async fn send(
                 "signature": body.get("signature").cloned().unwrap_or(Value::Null),
                 "attachments": body.get("attachments").cloned().unwrap_or(Value::Null),
             });
-            return match crate::api::email_approval::create_approval(
+            return match crate::api::email_approval::request_approval(
                 &home,
                 &lane,
                 "send",
                 payload,
                 preview.clone(),
             ) {
-                Ok(id) => {
+                Ok(req) => {
+                    let id = req.id.clone();
                     email_log(
                         ctx.client.home(),
                         json!({
                             "endpoint": "send", "blocked": "approval_required",
                             "approval_id": id, "from": from_acct, "to": to,
                             "subject": subject, "session": lane,
+                            "reused": req.reused, "requests": req.requests,
                         }),
                     );
                     tracing::warn!(
-                        session = %lane, approval = %id,
+                        session = %lane, approval = %id, reused = req.reused,
+                        requests = req.requests, draft_changed = req.draft_changed,
+                        verdict = if req.reused { "email_approval_reused" } else { "email_approval_parked" },
                         "[email] EXTERNAL send from a worker held for human approval (AMUX-3510)"
                     );
-                    approval_required_response(&id, preview)
+                    approval_required_response(&req, preview)
                 }
                 Err(e) => err(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -805,14 +809,15 @@ pub async fn reply(
                         "signature": body.get("signature").cloned().unwrap_or(Value::Null),
                         "attachments": body.get("attachments").cloned().unwrap_or(Value::Null),
                     });
-                    return match crate::api::email_approval::create_approval(
+                    return match crate::api::email_approval::request_approval(
                         &home,
                         &lane,
                         "reply",
                         payload,
                         preview.clone(),
                     ) {
-                        Ok(id) => {
+                        Ok(req) => {
+                            let id = req.id.clone();
                             email_log(
                                 ctx.client.home(),
                                 json!({
@@ -820,13 +825,16 @@ pub async fn reply(
                                     "approval_id": id, "from": gmail_from,
                                     "to": r_to, "cc": r_cc, "in_reply_to": message_id,
                                     "subject": r_subject, "session": lane,
+                                    "reused": req.reused, "requests": req.requests,
                                 }),
                             );
                             tracing::warn!(
-                                session = %lane, approval = %id,
+                                session = %lane, approval = %id, reused = req.reused,
+                                requests = req.requests, draft_changed = req.draft_changed,
+                                verdict = if req.reused { "email_approval_reused" } else { "email_approval_parked" },
                                 "[email] EXTERNAL reply from a worker held for human approval (AMUX-3510)"
                             );
-                            approval_required_response(&id, preview)
+                            approval_required_response(&req, preview)
                         }
                         Err(e) => err(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -897,7 +905,11 @@ pub async fn reply(
 /// BACK with an approval id instead of going out. The worker's next honest
 /// move is spelled out in the body, because the AMUX-2325 lesson is that a
 /// refusal whose escape is unstated gets walked around off-trail.
-fn approval_required_response(id: &str, preview: Value) -> Response {
+fn approval_required_response(
+    req: &crate::api::email_approval::Requested,
+    preview: Value,
+) -> Response {
+    let id = req.id.as_str();
     (
         StatusCode::FORBIDDEN,
         Json(json!({
@@ -919,8 +931,22 @@ fn approval_required_response(id: &str, preview: Value) -> Response {
                            STOP — do not resend, do not rephrase, do not approve it yourself. \
                            A human approves from the dashboard origin: \
                            POST /api/email/approve/<approval_id> (no X-Amux-Session header). \
-                           The approval expires in 1h and releases exactly this draft.",
-            "expires_in_s": crate::api::email_approval::APPROVAL_TTL_S as i64,
+                           The approval stays pending until a human approves or discards it, \
+                           and releases exactly the frozen draft. Asking again for the same \
+                           recipient and subject returns this same id (AMUX-5240).",
+            // AMUX-5240: email approvals no longer expire. null rather than a
+            // number, so no caller schedules a re-request against a deadline
+            // that does not exist.
+            "expires_in_s": Value::Null,
+            "reused": req.reused,
+            "requests": req.requests,
+            "draft_changed": req.draft_changed,
+            "draft_changed_note": if req.draft_changed {
+                json!("your new body differs from the draft already waiting; the WAITING draft \
+                       is what a human will approve. Discard it first if the new one should replace it.")
+            } else {
+                Value::Null
+            },
         })),
     )
         .into_response()
@@ -1170,7 +1196,7 @@ pub async fn approve(
         crate::api::email_approval::Consume::Expired => {
             return err(
                 StatusCode::GONE,
-                json!({ "error": "approval expired (1h) — the worker must request the send again" }),
+                json!({ "error": "approval expired under the TTL of its kind; the worker must request the send again" }),
             )
         }
         crate::api::email_approval::Consume::Gone => {
@@ -2183,9 +2209,10 @@ mod tests {
         .unwrap();
         let (_, v) = send_req(&app, "GET", &format!("/api/email/approval/{id}"), None, &[]).await;
         assert_eq!(v["state"], json!("pending"), "{v}");
-        assert!(
-            v["expires_in_s"].as_i64().unwrap() > 0,
-            "a pending approval must say how long is left: {v}"
+        assert_eq!(
+            v["expires_in_s"],
+            Value::Null,
+            "AMUX-5240: an email approval has no deadline, so it must not show one: {v}"
         );
         assert_eq!(
             v["retry_is_safe"],
@@ -2214,9 +2241,9 @@ mod tests {
         assert_eq!(v["state"], json!("rejected"), "{v}");
         assert_eq!(v["retry_is_safe"], json!(true));
 
-        // 4. EXPIRED — the shape every real expiration in the store has, and the
-        //    reason this route exists. Aged past the TTL, then swept by the
-        //    lister exactly as it is in production.
+        // 4. EXPIRED. Email approvals stopped expiring in AMUX-5240, so an
+        //    aged send stays pending; the `.expired.json` files already in the
+        //    store (every pre-5240 expiration) must still read as expired.
         let eid = crate::api::email_approval::create_approval(
             home.path(),
             "gtm-ticker",
@@ -2232,7 +2259,12 @@ mod tests {
             doc["created"].as_f64().unwrap() - crate::api::email_approval::APPROVAL_TTL_S - 5.0
         );
         std::fs::write(&f, doc.to_string()).unwrap();
-        let _ = crate::api::email_approval::list_pending(home.path()); // sweeps it to .expired.json
+        let _ = crate::api::email_approval::list_pending(home.path());
+        let (_, still) =
+            send_req(&app, "GET", &format!("/api/email/approval/{eid}"), None, &[]).await;
+        assert_eq!(still["state"], json!("pending"), "aged email draft stays pending: {still}");
+        // The pre-fix specimen: a file the old TTL sweep renamed.
+        std::fs::rename(&f, dir.join(format!("{eid}.expired.json"))).unwrap();
         let (_, v) = send_req(
             &app,
             "GET",

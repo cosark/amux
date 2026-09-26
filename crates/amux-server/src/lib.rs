@@ -611,6 +611,8 @@ async fn async_main() {
     // AMUX-5238: close auto-captured intake cards on cited evidence and tag
     // the ones still open after 24h as unreconciled.
     drop(runtime_jobs::capture_reconcile::spawn(state.clone()));
+    // AMUX-5240: one daily owner digest of pending outbound-email approvals.
+    drop(runtime_jobs::email_approval_digest::spawn(state.clone()));
 
     // STORAGE RETENTION (AMUX-2700). Seven append-only tables and three cache
     // directories had no retention at all — not leaking, just working as

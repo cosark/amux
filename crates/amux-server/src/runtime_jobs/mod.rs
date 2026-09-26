@@ -58,6 +58,7 @@ pub mod codex_ledger;
 pub mod commit_mention_notes;
 pub mod context_health;
 pub mod disk_watch;
+pub mod email_approval_digest;
 pub(crate) mod executor;
 pub mod gemini_ledger;
 pub mod heartbeat;

@@ -127,6 +127,7 @@ pub mod ids {
     pub const RECORDINGS_TRANSCRIBE: &str = "recordings-transcribe";
     pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
     pub const CAPTURE_RECONCILE: &str = "capture-reconcile";
+    pub const EMAIL_APPROVAL_DIGEST: &str = "email-approval-digest";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -172,6 +173,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::RECORDINGS_TRANSCRIBE,
     ids::MODEL_CATALOG_REFRESH,
     ids::CAPTURE_RECONCILE,
+    ids::EMAIL_APPROVAL_DIGEST,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -729,6 +731,33 @@ pub const CATALOG: &[Doc] = &[
         ],
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::EMAIL_APPROVAL_DIGEST,
+        name: "Email approval digest",
+        purpose: "Once a local day, when outbound email drafts are waiting for approval, sends \
+                  the owner one list of them on web push and the owner inbox (never SMS). \
+                  Approvals for email no longer expire, so this is how the queue reaches the \
+                  owner away from the dashboard. AMUX-5240.",
+        env: &[
+            EnvControl {
+                var: "AMUX_EMAIL_APPROVAL_DIGEST",
+                effect: "0 stops the digest (re-read every tick)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_EMAIL_APPROVAL_DIGEST_HOUR",
+                effect: "local hour the digest becomes due (default 9)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_EMAIL_APPROVAL_DIGEST_SECS",
+                effect: "0 disables the job",
+                off: Some("0"),
+            },
+        ],
+        pref: None,
+        detail: Some("/api/email/approvals"),
     },
 ];
 

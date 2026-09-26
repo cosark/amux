@@ -17096,7 +17096,7 @@ else document.addEventListener('DOMContentLoaded', _syncChipsFromServer);
 // releases them (AMUX-3510). This strip is that human path: visible on every
 // tab, previews the frozen draft, and the Approve POST goes out from this
 // browser with no worker origin — which is exactly the gate's definition of
-// a human context. Polled at 60s (a pending approval expires in 1h, so a
+// a human context. Polled at 60s (an email approval waits until acted on, so a
 // minute of latency costs nothing; the endpoint is ~200 bytes).
 async function _approvalsRefresh() {
   const el = document.getElementById('email-approvals-banner');
@@ -17183,7 +17183,13 @@ async function _approvalsRefresh() {
     }
     for (const p of pending) {
       const pv = p.preview || {};
-      const mins = Math.max(1, Math.round((p.expires_in_s || 0) / 60));
+      // AMUX-5240: email approvals no longer expire (expires_in_s is null), so
+      // show how long the draft has waited and how often it was re-requested.
+      const _ageM = Math.max(1, Math.round((p.age_s || 0) / 60));
+      const _waited = _ageM < 120 ? _ageM + 'm' : (_ageM < 2880 ? Math.round(_ageM / 60) + 'h' : Math.round(_ageM / 1440) + 'd');
+      const apprWhen = (p.expires_in_s == null)
+        ? 'waiting ' + _waited + ((p.requests || 1) > 1 ? ', asked ' + p.requests + 'x' : '')
+        : 'expires in ' + Math.max(1, Math.round(p.expires_in_s / 60)) + 'm';
       // OPEN BY DEFAULT (Ethan: "i should be able to see the draft email").
       // The body was behind a second click, so the banner told you a draft
       // existed and made you hunt for what it said — on the one surface whose
@@ -17193,7 +17199,7 @@ async function _approvalsRefresh() {
         + '<span style="flex:1 1 160px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
         + '<b>' + esc(p.session || '?') + '</b> &middot; '
         + (pv.endpoint === 'reply' ? (pv.reply_all ? 'reply all' : 'reply') : 'new email') + '</span>'
-        + '<span style="opacity:0.7;font-size:0.76rem;">expires in ' + mins + 'm</span>'
+        + '<span style="opacity:0.7;font-size:0.76rem;">' + esc(apprWhen) + '</span>'
         + '<button onclick="event.preventDefault();_apprApprove(\'' + esc(p.id) + '\',this)" '
         + 'style="background:#16a34a;color:#fff;border:none;border-radius:6px;'
         + 'padding:8px 14px;font-size:0.8rem;cursor:pointer;min-height:34px;">Approve</button>'
