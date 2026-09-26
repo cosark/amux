@@ -1973,6 +1973,250 @@ pub(crate) fn rate_limit_action() -> String {
         .unwrap_or_else(|| "wait".into())
 }
 
+// ---------------------------------------------------------------------------
+// AUTOMATIC RESUME (AMUX-5235)
+//
+// 2026-09-26: celery-retirement, mvs-infra and mixpeek-frustrations hit the
+// weekly limit at ~15:11Z ("Goal paused · usage limit reached · send a message
+// after it resets to continue") and nothing moved for ~80 minutes, until
+// Ethan typed "continue" at 16:32Z right after the machine's signed-in Claude
+// account changed. mac-ops died on "API Error: The response stopped arriving"
+// the same day and sat idle until a human continue.
+//
+// What the sweep did at reset time: it logged `delivery_gate_open` and let the
+// steering queue drain. That only moves a lane with something QUEUED. A goal
+// that Claude paused on a limit needs a new message and nobody queued one, so
+// the open gate had nothing to deliver. An account switch was not observed at
+// all, and an ordinary API error was stamped (`api_error_since`) and read by
+// the list, never acted on.
+// ---------------------------------------------------------------------------
+
+/// Scope key for automatic resume. DEFAULT ON. Named apart from
+/// `CC_AUTO_CONTINUE`, which is the per-lane YOLO "never stop" switch and a
+/// different thing: this one only re-sends the "continue" a human would have
+/// typed after an infrastructure stop.
+pub(crate) const AUTO_RESUME_KEY: &str = "AMUX_AUTO_RESUME";
+
+/// Same resolver ladder as `dispatch_backlog_when_idle_in`: process env wins
+/// (the operator switch in `~/.amux/server.env`), then worker > group > global.
+pub(crate) fn auto_resume_enabled_in(
+    home: &std::path::Path,
+    session: &str,
+    process_value: Option<&str>,
+) -> bool {
+    fn is_off(v: &str) -> bool {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    }
+    if let Some(v) = process_value.filter(|v| !v.trim().is_empty()) {
+        return !is_off(v);
+    }
+    scoped_setting_in(home, session, AUTO_RESUME_KEY)
+        .as_deref()
+        .map(|v| !is_off(v))
+        .unwrap_or(true)
+}
+
+pub(crate) fn auto_resume_enabled(session: &str) -> bool {
+    let process_value = std::env::var(AUTO_RESUME_KEY).ok();
+    auto_resume_enabled_in(&home(), session, process_value.as_deref())
+}
+
+/// Is an API error a turn ended on worth one automatic retry?
+///
+/// The kinds come from the live transcripts (2026-09-16..26, every
+/// `isApiErrorMessage` record on the machine): `server_error` covers "The
+/// response stopped arriving", "Server error mid-response", 500 and 529
+/// Overloaded. `authentication_failed` ("Not logged in") and
+/// `oauth_org_not_allowed` need a human; a retry cannot fix them and a loop of
+/// "continue" into a logged-out lane is noise. Unknown kinds are not retried.
+pub(crate) fn api_error_is_retryable(kind: &str) -> bool {
+    matches!(kind, "server_error" | "overloaded_error")
+}
+
+/// Is the lane at rest, so a "continue" lands as a new turn and cannot be typed
+/// into a live one? Every signal the sweep already uses for "not working":
+/// no generating bar, no picker or limit menu, no background agent or shell,
+/// nothing typed in the composer.
+pub(crate) fn auto_resume_pane_idle(pane: &str, agents_live: bool) -> bool {
+    !agents_live
+        && !is_rate_limit_menu(pane)
+        && !pane_bar_says_generating(pane)
+        && !matches!(detect_claude_status(pane).as_str(), "active" | "waiting")
+        && !provider_background_working(pane)
+        && composer_state(pane).typed().is_none()
+}
+
+/// Seconds a lane must sit idle on a retryable API error before amux retries.
+pub(crate) const AUTO_RESUME_API_IDLE_S: i64 = 120;
+/// Grace after a provider reset before amux speaks: Claude's own
+/// "continuing automatically at" banner gets the first chance.
+pub(crate) const AUTO_RESUME_RESET_GRACE_S: i64 = 60;
+/// Retries of API errors per lane per window. An outage that fails every
+/// retry must not become a "continue" every two minutes forever; each is a
+/// distinct occurrence, so the per-occurrence key alone would not stop it.
+pub(crate) const AUTO_RESUME_API_MAX: i64 = 3;
+pub(crate) const AUTO_RESUME_API_WINDOW_S: i64 = 1800;
+
+/// Everything the decision reads, gathered by the sweep. Pure so the controls
+/// (credit cap, working lane, repeat) are tested without a pane or a send.
+pub(crate) struct AutoResumeInputs<'a> {
+    pub enabled: bool,
+    pub idle: bool,
+    pub now: i64,
+    /// This tick's limit observation, if any.
+    pub limit: Option<&'a ClaudeLimitObservation>,
+    /// `rate_limited_since` as stamped BEFORE this tick (0 = not yet stamped).
+    pub limited_since: i64,
+    /// When amux last saw the machine's Claude account change (0 = never).
+    pub account_changed_at: i64,
+    pub api_error: Option<&'a str>,
+    pub api_error_since: i64,
+    /// The dedupe key of the last resume this lane got (`auto_resume_for`).
+    pub last_key: &'a str,
+    pub api_window_start: i64,
+    pub api_count: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AutoResume {
+    /// No resumable condition, or this occurrence was already resumed.
+    Nothing,
+    /// A resumable condition exists but amux will not send; `why` says what
+    /// holds it. `key` is the occurrence, so the hold is logged once.
+    Hold { reason: &'static str, key: String, why: &'static str },
+    Send { reason: &'static str, key: String },
+}
+
+pub(crate) fn auto_resume_decision(i: &AutoResumeInputs) -> AutoResume {
+    let candidate: Option<(&'static str, String)> = match i.limit {
+        // A credit cap has no clock and the lane is still working on credits:
+        // there is nothing to resume. The menu is answered by the sweep's own
+        // Enter first; typing text into it would pick an option.
+        Some(l) if l.kind == "credit-banner" || l.menu => None,
+        Some(l) => {
+            if l.reset_at > 0 && i.now >= l.reset_at + AUTO_RESUME_RESET_GRACE_S {
+                Some(("usage_reset", format!("reset:{}", l.reset_at)))
+            } else if i.account_changed_at > 0
+                && i.limited_since > 0
+                && i.limited_since <= i.account_changed_at
+            {
+                // Only a limit hit BEFORE the switch. A lane limited on the new
+                // account gets a later `since` and waits for its own reset, so a
+                // switch to an account that is also limited cannot loop.
+                Some(("account_changed", format!("account:{}", i.account_changed_at)))
+            } else {
+                None
+            }
+        }
+        None => match i.api_error {
+            Some(kind)
+                if api_error_is_retryable(kind)
+                    && i.api_error_since > 0
+                    && i.now - i.api_error_since >= AUTO_RESUME_API_IDLE_S =>
+            {
+                Some(("api_error", format!("api:{}", i.api_error_since)))
+            }
+            _ => None,
+        },
+    };
+    let Some((reason, key)) = candidate else {
+        return AutoResume::Nothing;
+    };
+    if i.last_key == key {
+        return AutoResume::Nothing;
+    }
+    if !i.enabled {
+        return AutoResume::Hold { reason, key, why: "disabled" };
+    }
+    if !i.idle {
+        return AutoResume::Hold { reason, key, why: "lane_busy" };
+    }
+    if reason == "api_error"
+        && i.now - i.api_window_start < AUTO_RESUME_API_WINDOW_S
+        && i.api_count >= AUTO_RESUME_API_MAX
+    {
+        return AutoResume::Hold { reason, key, why: "api_retry_cap" };
+    }
+    AutoResume::Send { reason, key }
+}
+
+/// The identity of the signed-in Claude account from `~/.claude.json`.
+/// Account AND organization: the provider's banner fires on either ("signed-in
+/// claude.ai account or organization changed on this machine").
+pub(crate) fn claude_account_fingerprint(claude_json: &Value) -> Option<String> {
+    let acct = claude_json.pointer("/oauthAccount/accountUuid").and_then(Value::as_str)?;
+    let org = claude_json
+        .pointer("/oauthAccount/organizationUuid")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    (!acct.is_empty()).then(|| format!("{acct}/{org}"))
+}
+
+/// Fold one reading into the persisted (fingerprint, changed_at). A first
+/// reading records without calling it a change, and a missing reading (logged
+/// out, file mid-write) keeps the old one: neither is a switch to resume on.
+pub(crate) fn next_account_state(
+    prev_fp: &str,
+    prev_changed_at: i64,
+    current: Option<&str>,
+    now: i64,
+) -> (String, i64, bool) {
+    match current {
+        Some(cur) if !prev_fp.is_empty() && cur != prev_fp => (cur.to_string(), now, true),
+        Some(cur) => (cur.to_string(), prev_changed_at, false),
+        None => (prev_fp.to_string(), prev_changed_at, false),
+    }
+}
+
+/// When the machine's Claude account last changed, observed from
+/// `~/.claude.json` and persisted in `~/.amux/claude-account-seen.json` so a
+/// server restart neither loses a change nor invents one. The file is only
+/// parsed when its mtime moves; it can be megabytes.
+///
+/// WHY the file and not the "Remote Control disconnected ... signed-in claude.ai
+/// account or organization changed" banner: the banner lands on EVERY pane at
+/// once and stays in scrollback, so it cannot say which switch it was, and a
+/// pane-text trigger re-fires after the lane is limited again on the new
+/// account. The file carries the account's identity.
+pub(crate) fn observe_claude_account_change(now: i64) -> i64 {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN_MTIME: OnceLock<Mutex<Option<std::time::SystemTime>>> = OnceLock::new();
+    let state_path = home().join("claude-account-seen.json");
+    let saved: Value = std::fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    let prev_fp = saved["fingerprint"].as_str().unwrap_or("").to_string();
+    let prev_changed_at = saved["changed_at"].as_i64().unwrap_or(0);
+    let src = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude.json");
+    let mtime = std::fs::metadata(&src).and_then(|m| m.modified()).ok();
+    {
+        let mut g = SEEN_MTIME.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        if mtime.is_some() && *g == mtime && !prev_fp.is_empty() {
+            return prev_changed_at;
+        }
+        *g = mtime;
+    }
+    let current = std::fs::read_to_string(&src)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| claude_account_fingerprint(&v));
+    let (fp, changed_at, changed) =
+        next_account_state(&prev_fp, prev_changed_at, current.as_deref(), now);
+    if fp != prev_fp {
+        let body = json!({"fingerprint": fp, "changed_at": changed_at});
+        let tmp = state_path.with_extension("json.tmp");
+        if std::fs::write(&tmp, body.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &state_path);
+        }
+    }
+    if changed {
+        tracing::warn!(target: "amux::usage_reset", verdict = "claude_account_changed",
+            changed_at, "the machine's signed-in Claude account changed; lanes limited before now may resume");
+    }
+    changed_at
+}
+
 /// Is this pane sitting on Claude Code's RESUME-MODE selector?
 ///
 /// ```text
@@ -20613,6 +20857,8 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
     // transcript read. This periodic arm heals an already-leaked edge even if
     // the worker never emits another hook after a provider-side failure.
     let lifecycle_reconcile = stored_live_subagent_lanes(state);
+    // Once per sweep, not per lane: one machine, one signed-in account.
+    let account_changed_at = observe_claude_account_change(now_i64());
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("env") {
@@ -20893,6 +21139,83 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             chrono::Local::now(),
             transcript_reset,
         );
+        // AUTOMATIC RESUME (AMUX-5235): decided here, before the stamps below
+        // move, so the account rule reads the `since` of a limit that predates
+        // this tick. See `auto_resume_decision`.
+        if provider_of(&cfg) == "claude" {
+            let meta = load_meta(name);
+            let last_key = meta_str(&meta, "auto_resume_for");
+            let inputs = AutoResumeInputs {
+                enabled: auto_resume_enabled(name) && !lane_is_paused(name),
+                idle: !send_in_flight && auto_resume_pane_idle(&pane, agents_live),
+                now: now_i64(),
+                limit: observation.as_ref(),
+                limited_since: meta_i64(&meta, "rate_limited_since"),
+                account_changed_at,
+                api_error: api_error.as_deref(),
+                api_error_since: meta_i64(&meta, "api_error_since"),
+                last_key: &last_key,
+                api_window_start: meta_i64(&meta, "auto_resume_api_window_start"),
+                api_count: meta_i64(&meta, "auto_resume_api_count"),
+            };
+            match auto_resume_decision(&inputs) {
+                AutoResume::Nothing => {}
+                AutoResume::Hold { reason, key, why } => {
+                    if meta_str(&meta, "auto_resume_held_for") != key {
+                        update_meta(name, &[("auto_resume_held_for", json!(key))]);
+                        tracing::info!(target: "amux::usage_reset", session = %name, reason, key = %key,
+                            why, verdict = "auto_resume_held",
+                            "a resumable stop was found but amux is not sending continue");
+                    }
+                }
+                AutoResume::Send { reason, key } => {
+                    // Stamp the key FIRST: whatever the send does, this
+                    // occurrence is never resumed twice.
+                    update_meta(name, &[("auto_resume_for", json!(key))]);
+                    if reason == "api_error" {
+                        let (start, count) = if inputs.now - inputs.api_window_start
+                            < AUTO_RESUME_API_WINDOW_S
+                        {
+                            (inputs.api_window_start, inputs.api_count + 1)
+                        } else {
+                            (inputs.now, 1)
+                        };
+                        update_meta(name, &[
+                            ("auto_resume_api_window_start", json!(start)),
+                            ("auto_resume_api_count", json!(count)),
+                        ]);
+                    } else {
+                        // Clear the limit stamps BEFORE the send: the send path's
+                        // `lane_block_reason` still reads a future reset (the
+                        // account case) as rate-limited and would park the
+                        // continue behind the very limit it is resuming. If the
+                        // limit is still real, the next sweep re-stamps it.
+                        update_meta(name, &[
+                            ("rate_limited_since", json!(0)),
+                            ("rate_limited_until", json!(0)),
+                            ("rate_limited_by", json!("")),
+                            ("rate_limited_weekly", json!(false)),
+                        ]);
+                    }
+                    let d = deliver_automated(state, name, "continue", &format!("auto-resume:{key}")).await;
+                    let verdict = if d.refused { "auto_resume_refused" } else { "auto_resume_sent" };
+                    tracing::warn!(target: "amux::usage_reset", session = %name, reason, key = %key,
+                        submission = d.submission, detail = %d.message, verdict,
+                        "sent \"continue\" to a lane stopped by a usage limit, an account switch or an API error");
+                    emit_event(
+                        state,
+                        name,
+                        "session.auto_resumed",
+                        Some(json!({"reason": reason, "key": key, "verdict": verdict,
+                            "submission": d.submission, "detail": d.message})),
+                        Some(format!("auto-resume:{name}:{key}")),
+                        "rate-limit",
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        }
         let Some(observation) = observation else {
             // Neither the menu nor the credit banner is on screen: clear the stamp.
             // Presence-based, and both signals are footer/menu-scoped, so scrollback
@@ -20972,6 +21295,11 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         // continues automatically, and injecting Enter into a turn that
         // restarted between capture and send corrupts the user's input. The
         // normal delivery path does the boundary check.
+        //
+        // That covers a lane with something QUEUED. A lane with nothing queued
+        // (a goal Claude paused on the limit) stayed idle past its reset until a
+        // human typed "continue" (2026-09-26); `auto_resume_decision` above now
+        // sends that one "continue" once the grace after reset has passed.
         if reset > 0
             && reset <= observed_now
             && meta_i64(&load_meta(name), "rate_limit_resume_announced_for") != reset
@@ -36958,6 +37286,188 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         assert_eq!(transcript_api_error(&[err.clone(), owner]), None, "a retry ends it");
         assert_eq!(transcript_api_error(&[err, ok]), None, "a later turn ends it");
         assert_eq!(transcript_api_error(&[limit]), None, "limits are the rate-limit rule's");
+    }
+
+    // ---- AMUX-5235 automatic resume ------------------------------------
+
+    /// The idle frame of a weekly-limited lane after the sweep answered the
+    /// menu (celery-retirement, 2026-09-26 15:11Z), with the account-switch
+    /// banner Claude printed on every pane at ~16:30Z.
+    const LIMITED_IDLE_PANE: &str = "\u{23fa} You've hit your weekly limit \u{b7} resets Oct 2 at 3am (America/New_York)\n\
+        \u{2139} Goal paused \u{b7} usage limit reached \u{b7} send a message after it resets to continue\n\
+        \u{2139} Remote Control disconnected \u{2014} signed-in claude.ai account or organization changed on this machine\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+        \u{276f}\u{a0}\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \
+        \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+    /// The same lane mid-turn: generating bar present.
+    const WORKING_PANE: &str = "\u{273b} Crunching\u{2026} (12s \u{b7} \u{2193} 300 tokens)\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+        \u{276f}\u{a0}\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \
+        \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt";
+    /// mac-ops, 2026-09-26: the turn ended on a stream abort and went idle.
+    const API_ERROR_IDLE_PANE: &str = "  \u{23bf} API Error: The response stopped arriving. The response above may be incomplete.\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+        \u{276f}\u{a0}\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \
+        \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+
+    fn resume_inputs<'a>(
+        limit: Option<&'a ClaudeLimitObservation>,
+        api_error: Option<&'a str>,
+    ) -> AutoResumeInputs<'a> {
+        AutoResumeInputs {
+            enabled: true,
+            idle: true,
+            now: 1_790_000_000,
+            limit,
+            limited_since: 0,
+            account_changed_at: 0,
+            api_error,
+            api_error_since: 0,
+            last_key: "",
+            api_window_start: 0,
+            api_count: 0,
+        }
+    }
+
+    #[test]
+    fn the_idle_predicate_reads_the_live_frames() {
+        assert!(auto_resume_pane_idle(LIMITED_IDLE_PANE, false), "limited and idle");
+        assert!(auto_resume_pane_idle(API_ERROR_IDLE_PANE, false), "errored and idle");
+        assert!(!auto_resume_pane_idle(WORKING_PANE, false), "a working lane is never nudged");
+        assert!(!auto_resume_pane_idle(API_ERROR_IDLE_PANE, true), "live background agents hold it");
+        let menu = "What do you want to do?\n\u{276f} 1. Stop and wait for limit to reset\n  2. Switch to usage credits\n  3. Switch to Team plan";
+        assert!(!auto_resume_pane_idle(menu, false), "the menu is answered with a key, never text");
+        let typed = API_ERROR_IDLE_PANE.replace("\u{276f}\u{a0}", "\u{276f} half a message");
+        assert!(!auto_resume_pane_idle(&typed, false), "text in the composer holds it");
+    }
+
+    #[test]
+    fn a_passed_reset_resumes_once_and_a_credit_cap_never_does() {
+        let now = 1_790_000_000;
+        // The live transcript shape after the sweep pressed Enter: kind
+        // `transcript`, weekly resetsAt from quotaLimits.
+        let limited = ClaudeLimitObservation { menu: false, kind: "transcript", reset_at: now - 120 };
+        let i = resume_inputs(Some(&limited), None);
+        assert_eq!(
+            auto_resume_decision(&i),
+            AutoResume::Send { reason: "usage_reset", key: format!("reset:{}", now - 120) }
+        );
+        // Once per reset: the stamped key ends it.
+        let key = format!("reset:{}", now - 120);
+        let again = AutoResumeInputs { last_key: &key, ..resume_inputs(Some(&limited), None) };
+        assert_eq!(auto_resume_decision(&again), AutoResume::Nothing);
+        // Inside the grace Claude's own auto-continue gets the first chance.
+        let fresh = ClaudeLimitObservation { menu: false, kind: "auto-resume", reset_at: now - 10 };
+        assert_eq!(auto_resume_decision(&resume_inputs(Some(&fresh), None)), AutoResume::Nothing);
+        // Before the reset, nothing.
+        let future = ClaudeLimitObservation { menu: false, kind: "transcript", reset_at: now + 3600 };
+        assert_eq!(auto_resume_decision(&resume_inputs(Some(&future), None)), AutoResume::Nothing);
+        // CONTROL: a credit cap has no clock and is never auto-continued, even
+        // with an account switch on record.
+        let cap = ClaudeLimitObservation { menu: false, kind: "credit-banner", reset_at: 0 };
+        let i = AutoResumeInputs {
+            limited_since: now - 900,
+            account_changed_at: now - 60,
+            ..resume_inputs(Some(&cap), None)
+        };
+        assert_eq!(auto_resume_decision(&i), AutoResume::Nothing);
+        // CONTROL: the menu itself is not typed into.
+        let menu = ClaudeLimitObservation { menu: true, kind: "menu", reset_at: now - 120 };
+        assert_eq!(auto_resume_decision(&resume_inputs(Some(&menu), None)), AutoResume::Nothing);
+    }
+
+    #[test]
+    fn an_account_switch_resumes_only_lanes_limited_before_it() {
+        let now = 1_790_000_000;
+        // Weekly limit, reset a week out: only the switch can resume it.
+        let weekly = ClaudeLimitObservation { menu: false, kind: "transcript", reset_at: now + 5 * 86_400 };
+        let before = AutoResumeInputs {
+            limited_since: now - 4_800,
+            account_changed_at: now - 60,
+            ..resume_inputs(Some(&weekly), None)
+        };
+        assert_eq!(
+            auto_resume_decision(&before),
+            AutoResume::Send { reason: "account_changed", key: format!("account:{}", now - 60) }
+        );
+        // Limited AFTER the switch (the new account is limited too): waits for
+        // its own reset, so a switch cannot loop.
+        let after = AutoResumeInputs { limited_since: now - 30, ..before };
+        assert_eq!(auto_resume_decision(&after), AutoResume::Nothing);
+        // Not yet stamped this tick: not provably before the switch.
+        let unstamped = AutoResumeInputs { limited_since: 0, ..resume_inputs(Some(&weekly), None) };
+        assert_eq!(auto_resume_decision(&unstamped), AutoResume::Nothing);
+    }
+
+    #[test]
+    fn a_retryable_api_error_is_retried_after_two_idle_minutes() {
+        let now = 1_790_000_000;
+        let base = |since: i64| AutoResumeInputs {
+            api_error_since: since,
+            ..resume_inputs(None, Some("server_error"))
+        };
+        assert_eq!(auto_resume_decision(&base(now - 60)), AutoResume::Nothing, "under two minutes");
+        assert_eq!(
+            auto_resume_decision(&base(now - 130)),
+            AutoResume::Send { reason: "api_error", key: format!("api:{}", now - 130) }
+        );
+        // Deduped on api_error_since.
+        let key = format!("api:{}", now - 130);
+        assert_eq!(auto_resume_decision(&AutoResumeInputs { last_key: &key, ..base(now - 130) }), AutoResume::Nothing);
+        // A human-only error is not retried.
+        let auth = AutoResumeInputs { api_error_since: now - 600, ..resume_inputs(None, Some("authentication_failed")) };
+        assert_eq!(auto_resume_decision(&auth), AutoResume::Nothing);
+        // CONTROL: a working lane is held, never nudged.
+        let busy = AutoResumeInputs { idle: false, ..base(now - 600) };
+        assert!(matches!(auto_resume_decision(&busy), AutoResume::Hold { why: "lane_busy", .. }));
+        // Kill switch.
+        let off = AutoResumeInputs { enabled: false, ..base(now - 600) };
+        assert!(matches!(auto_resume_decision(&off), AutoResume::Hold { why: "disabled", .. }));
+        // An outage that fails every retry stops after the cap.
+        let capped = AutoResumeInputs { api_window_start: now - 600, api_count: AUTO_RESUME_API_MAX, ..base(now - 130) };
+        assert!(matches!(auto_resume_decision(&capped), AutoResume::Hold { why: "api_retry_cap", .. }));
+        let window_over = AutoResumeInputs { api_window_start: now - AUTO_RESUME_API_WINDOW_S, api_count: 9, ..base(now - 130) };
+        assert!(matches!(auto_resume_decision(&window_over), AutoResume::Send { .. }));
+        // The live stream-abort transcript record feeds this with its kind.
+        let rec = json!({"type":"assistant","error":"server_error","isApiErrorMessage":true,
+            "message":{"role":"assistant","content":[{"type":"text",
+                "text":"API Error: The response stopped arriving. The response above may be incomplete."}]}});
+        assert!(api_error_is_retryable(&transcript_api_error(&[rec]).unwrap()));
+    }
+
+    #[test]
+    fn the_account_fingerprint_and_its_change_rule() {
+        let v = json!({"oauthAccount":{"accountUuid":"a1","organizationUuid":"o1","emailAddress":"x@y.z"}});
+        assert_eq!(claude_account_fingerprint(&v).as_deref(), Some("a1/o1"));
+        assert_eq!(claude_account_fingerprint(&json!({"oauthAccount":{}})), None);
+        // First reading records without calling it a change.
+        assert_eq!(next_account_state("", 0, Some("a1/o1"), 100), ("a1/o1".into(), 0, false));
+        assert_eq!(next_account_state("a1/o1", 0, Some("a1/o1"), 200), ("a1/o1".into(), 0, false));
+        // A switch of account or of organization is a change.
+        assert_eq!(next_account_state("a1/o1", 0, Some("a2/o2"), 300), ("a2/o2".into(), 300, true));
+        assert_eq!(next_account_state("a1/o1", 0, Some("a1/o9"), 300), ("a1/o9".into(), 300, true));
+        // Logged out or mid-write keeps the last known account.
+        assert_eq!(next_account_state("a1/o1", 50, None, 400), ("a1/o1".into(), 50, false));
+    }
+
+    #[test]
+    fn the_auto_resume_switch_defaults_on_and_resolves_by_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::create_dir_all(home.join("env")).unwrap();
+        std::fs::write(home.join("sessions/w.env"), "CC_TAGS=\"ops\"\n").unwrap();
+        assert!(auto_resume_enabled_in(home, "w", None), "default on");
+        std::fs::write(home.join("amux.env"), "AMUX_AUTO_RESUME=0\n").unwrap();
+        assert!(!auto_resume_enabled_in(home, "w", None), "global off");
+        std::fs::write(home.join("env/ops.env"), "AMUX_AUTO_RESUME=1\n").unwrap();
+        assert!(auto_resume_enabled_in(home, "w", None), "group beats global");
+        std::fs::write(home.join("sessions/w.env"), "CC_TAGS=\"ops\"\nAMUX_AUTO_RESUME=off\n").unwrap();
+        assert!(!auto_resume_enabled_in(home, "w", None), "worker beats group");
+        assert!(auto_resume_enabled_in(home, "w", Some("1")), "process env wins");
     }
 
     #[test]
