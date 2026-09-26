@@ -29,7 +29,10 @@ TICK_CMD=${AMUX_CLEANUP_FALLBACK_TICK:-}
 
 # A tick in progress holds this lock (mac-cleanup-tick.sh, tick_lock).
 LOCK="${AMUX_CLEANUP_STATE_DIR:-$HOME/.amux/logs/mac-cleanup}/tick.lock"
-if [ -d "$LOCK" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+# Held only while its PID is alive (a SIGKILLed tick leaves the directory behind);
+# with no PID recorded, fall back to the 30-minute age rule the tick uses.
+lock_pid=$(cat "$LOCK/pid" 2>/dev/null)
+if [ -d "$LOCK" ] && { { [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; } || { [ -z "$lock_pid" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; }; }; then
   echo "mac-cleanup-fallback: $(date '+%F %T') a tick is running (lock held), nothing to do"
   exit 0
 fi

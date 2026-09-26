@@ -55,18 +55,22 @@ out=$(run)
 check "it says the last tick did not finish"  "yes" "$(has "$out" 'did not finish: no done line and no tick running')"
 check "and runs the tick"                     "4"   "$(ticks)"
 printf "mac-cleanup: measured=true\n" > "$FIX/last"; mkdir -p "$FIX/state/tick.lock"
+sleep 60 & holder=$!; echo "$holder" > "$FIX/state/tick.lock/pid"
 out=$(run)
 check "control: with a tick running (lock held) it waits" "yes" "$(has "$out" 'a tick is running (lock held)')"
 check "and runs nothing"                      "4"   "$(ticks)"
-touch -t 202001010000 "$FIX/state/tick.lock"
+kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
 out=$(run)
-check "a lock older than 30m is a dead run: it runs" "5" "$(ticks)"
-rmdir "$FIX/state/tick.lock"
+check "a lock whose PID is dead does not block: it runs" "5" "$(ticks)"
+rm -f -- "${FIX:?}/state/tick.lock/pid"; touch -t 202001010000 "$FIX/state/tick.lock"
+out=$(run)
+check "a PID-less lock older than 30m does not block either" "6" "$(ticks)"
+rmdir "${FIX:?}/state/tick.lock"
 
 echo "5. the staleness window is a knob"
 printf "mac-cleanup: done elapsed=1s\n" > "$FIX/last"; touch -t 202001010000 "$FIX/last"
 out=$(AMUX_CLEANUP_FALLBACK_STALE_MIN=99999999 run)
-check "a window longer than the file's age does nothing" "5" "$(ticks)"
+check "a window longer than the file's age does nothing" "6" "$(ticks)"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "PASS: mac-cleanup-fallback — all checks passed"; exit 0; fi

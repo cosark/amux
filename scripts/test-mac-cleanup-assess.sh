@@ -103,11 +103,18 @@ if [ "$(uname)" = Darwin ]; then
   check "a normal run prints no timing WARN"           "no"  "$(has "$out" 'WARN tick took')"
   out=$(AMUX_CLEANUP_TICK_WARN_S=0 tick 0 "$REC")
   check "control: past the warn line it says so"       "yes" "$(has "$out" 'WARN tick took [0-9]*s, over 0s')"
-  mkdir -p "$FIX/tick/tick.lock"
+  sleep 60 & holder=$!
+  mkdir -p "$FIX/tick/tick.lock"; echo "$holder" > "$FIX/tick/tick.lock/pid"
   out=$(tick 999999 "$REC")
   check "a held lock stops a second tick"              "yes" "$(has "$out" 'previous tick still running')"
   check "and that tick sends nothing"                  "no"  "$([ -f "$FIX/sent.log" ] && echo yes || echo no)"
   check "and leaves the other run's lock alone"        "yes" "$([ -d "$FIX/tick/tick.lock" ] && echo yes || echo no)"
+  kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+  out=$(tick 0 "$REC")
+  check "a lock whose PID is dead is taken over AT ONCE (a SIGKILLed tick)" "yes" "$(has "$out" 'constraints none')"
+  mkdir -p "$FIX/tick/tick.lock"
+  out=$(tick 0 "$REC")
+  check "a lock with no PID and under 30m still blocks" "yes" "$(has "$out" 'previous tick still running')"
   touch -t 202001010000 "$FIX/tick/tick.lock"
   out=$(tick 0 "$REC")
   check "control: a stale lock is taken over"          "yes" "$(has "$out" 'constraints none')"

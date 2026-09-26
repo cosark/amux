@@ -64,13 +64,26 @@ done
 
 # One tick at a time. A run the scheduler timed out keeps going, and the next fire
 # started beside it (two ticks were measured running at once on 2026-09-26).
-# mkdir is atomic, so it is the lock; one older than the stale window is a dead run.
+# mkdir is atomic, so it is the lock, and it holds the owner's PID. A lock whose
+# PID is not alive belongs to a dead run and is taken over at once: the server
+# restarts on every deploy and SIGKILLs a tick in progress, which never runs its
+# exit trap, and an age-only rule would then block every tick for the whole
+# stale window. The age rule stays as the backstop for a lock with no PID.
+lock_live() { # <lock_dir> <stale_min> -> 0 if a live tick holds it
+  local pid
+  [ -d "$1" ] || return 1
+  pid=$(cat "$1/pid" 2>/dev/null)
+  if [ -n "$pid" ]; then kill -0 "$pid" 2>/dev/null; return; fi
+  [ -z "$(find "$1" -maxdepth 0 -mmin "+$2" 2>/dev/null)" ]
+}
 tick_lock() { # <lock_dir> <stale_min>
-  if mkdir "$1" 2>/dev/null; then return 0; fi
-  if [ -n "$(find "$1" -maxdepth 0 -mmin "+$2" 2>/dev/null)" ]; then
-    rmdir "$1" 2>/dev/null; mkdir "$1" 2>/dev/null && return 0
+  local d=${1:?}
+  if ! mkdir "$d" 2>/dev/null; then
+    lock_live "$d" "$2" && return 1
+    rm -f -- "${d:?}/pid"; rmdir "${d:?}" 2>/dev/null
+    mkdir "$d" 2>/dev/null || return 1
   fi
-  return 1
+  echo $$ > "$d/pid"
 }
 
 # ── knobs ────────────────────────────────────────────────────────────────────
@@ -651,10 +664,10 @@ file_card() { # <state_file> <key> <title> <desc>
 # ── measure ──────────────────────────────────────────────────────────────────
 LOCK="$STATE_DIR/tick.lock"; mkdir -p "$STATE_DIR"
 if ! tick_lock "$LOCK" "$LOCK_STALE_MIN"; then
-  echo "mac-cleanup: previous tick still running (lock $LOCK under ${LOCK_STALE_MIN}m old), not starting a second one"
+  echo "mac-cleanup: previous tick still running (pid $(cat "$LOCK/pid" 2>/dev/null || echo unknown) holds $LOCK), not starting a second one"
   exit 0
 fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+trap 'rm -f -- "${LOCK:?}/pid"; rmdir "${LOCK:?}" 2>/dev/null' EXIT
 measured=true
 level=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
 case "$level" in ''|*[!0-9]*) level=-1; measured=false ;; esac
