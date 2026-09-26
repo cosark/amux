@@ -953,6 +953,12 @@ pub fn integration_followup_needed(state: &crate::api::AppState, name: &str) -> 
 pub async fn queue_integration(state: &crate::api::AppState, name: &str) -> bool {
     use serde_json::json;
     use std::sync::{Arc, OnceLock};
+    // Integration runs merge + verify commands (builds, tests). Not queued
+    // while the host is critical; board drive calls this again every tick, and
+    // nothing is recorded for a call that did not run.
+    if !crate::runtime_jobs::host_guard::admit_automation("fanout-integration") {
+        return false;
+    }
     let Ok((board, card, rev)) = ready_board(state, name) else {
         return false;
     };

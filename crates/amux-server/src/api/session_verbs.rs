@@ -14933,6 +14933,17 @@ fn provider_command_in_workspace(work_dir: &str, command: &str, isolated: bool) 
 /// restart behavior—including Codex's self-update relaunch—stays in the one
 /// provider-aware launcher rather than a board-specific copy.
 pub(crate) async fn start_for_board_dispatch(state: &AppState, name: &str) -> Result<(), String> {
+    // HOST GUARD. Every automated start (board dispatch, project executors)
+    // comes through here, and none should add a process to a host that is
+    // already critical. The prefix is the one project execution already
+    // treats as a retryable spawn refusal (planner.rs), so a deferred
+    // executor waits and is re-claimed when the host eases, never parked.
+    if !crate::runtime_jobs::host_guard::admit_automation("automated-start") {
+        return Err(format!(
+            "refusing to spawn a worker: host is critical ({}); retried when it eases",
+            crate::runtime_jobs::host_guard::critical_now().unwrap_or_default()
+        ));
+    }
     if session_is_isolated(name) {
         return Err("isolated workers never receive board automation".into());
     }

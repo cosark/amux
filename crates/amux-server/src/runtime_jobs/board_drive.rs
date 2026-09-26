@@ -6672,7 +6672,13 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     report.promoted_due = promoted_due;
     report.unblocked_blocked = unblock_resolved_blocked(state).await;
     report.revisit_due_total = revisit_due_total;
-    for lane in fleet.lanes() {
+    // HOST GUARD: the reconcilers above are cheap board writes and keep
+    // running; the lane loop is what hands out work and wakes workers, so it
+    // is what waits while the host is critical. Skipping the whole loop (not
+    // gating inside drive_lane) matters: the idle-drain arm stamps its nudge
+    // backoff BEFORE sending, so a mid-lane skip would advance it for nothing.
+    let lanes = if crate::runtime_jobs::host_guard::admit_automation("board-dispatch") { fleet.lanes() } else { Vec::new() };
+    for lane in lanes {
         let trace = drive_lane(state, fleet, &lane).await;
         match trace.outcome.as_str() {
             "assigned" => report.assigned += 1,
@@ -6749,6 +6755,12 @@ pub async fn drive_session(state: &AppState, lane: &str) -> LaneTrace {
     let _ = promote_ready_backlog(state).await;
     let _ = unblock_resolved_blocked(state).await;
     let _ = promote_due_backlog(state).await;
+    if !crate::runtime_jobs::host_guard::admit_automation("board-dispatch") {
+        // The periodic tick drives this lane again once the host eases.
+        let trace = LaneTrace::skip(lane, "host-critical", "host pressure is critical; dispatch waits for the next tick");
+        publish_lane(trace.clone());
+        return trace;
+    }
     let trace = drive_lane(state, &fleet, lane).await;
     publish_lane(trace.clone());
     trace

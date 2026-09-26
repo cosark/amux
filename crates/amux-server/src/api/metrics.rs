@@ -18,6 +18,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", axum::routing::get(metrics))
         .route("/host", axum::routing::get(host))
         .route("/host/history", axum::routing::get(host_history))
+        .route("/host/pressure", axum::routing::get(host_pressure))
         .route("/fleet", axum::routing::get(fleet))
         .route("/replay", axum::routing::get(replay))
 }
@@ -122,6 +123,24 @@ pub struct HistoryQuery {
 /// contract the live endpoint carries (ethos rule 4). `interval_secs` travels
 /// with the answer so an empty window reads as "nothing sampled yet, samples
 /// land every N seconds" rather than as a flat zero.
+/// GET /api/metrics/host/pressure — the host guard's latest sample: level
+/// (ok/strained/critical) with its reasons and raw readings, worker tool
+/// processes judged runaways (and whether each was reniced), and how many
+/// automated ticks each loop skipped at critical. `measured:false` with
+/// `why_unmeasured` before the first tick or when every probe failed.
+async fn host_pressure() -> Response {
+    match crate::runtime_jobs::host_guard::current() {
+        Some(p) => Json(serde_json::to_value(&p).unwrap_or_default()).into_response(),
+        None => Json(json!({
+            "measured": false,
+            "n_considered": 0,
+            "why_unmeasured": "the host guard has not completed a tick yet (or is disabled by AMUX_HOST_GUARD_SECS=0)",
+            "level": null,
+        }))
+        .into_response(),
+    }
+}
+
 async fn host_history(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<HistoryQuery>,

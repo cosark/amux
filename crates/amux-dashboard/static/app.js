@@ -8194,6 +8194,42 @@ function updateRateLimitPill() {
   pill.title = blocked.concat(credit).map(s => s.name).join(', ') + ' (tap to jump)';
   pill.classList.add('show');
 }
+// HOST PRESSURE CHIP. Reads the host guard's level (GET
+// /api/metrics/host/pressure) once a minute and on resume. Hidden while the
+// host is ok or the guard has not measured; amber when strained, red at
+// critical, when automated work is being held back.
+let _hostPressure = null;
+async function refreshHostPressure() {
+  try {
+    const r = await fetch(API + '/api/metrics/host/pressure', { headers: _authHeaders() });
+    if (!r.ok) return;
+    _hostPressure = await r.json();
+  } catch (e) { return; }
+  const pill = document.getElementById('host-pressure-pill');
+  const txt = document.getElementById('host-pressure-pill-text');
+  if (!pill || !txt) return;
+  const p = _hostPressure || {};
+  const level = p.measured ? p.level : null;
+  if (!level || level === 'ok') { pill.classList.remove('show', 'strained'); return; }
+  const reniced = (p.runaways || []).filter(x => x.action === 'reniced' || x.action === 'already_low').length;
+  txt.textContent = 'Host ' + level + (reniced ? ' · ' + reniced + ' slowed' : '');
+  pill.classList.toggle('strained', level === 'strained');
+  pill.title = (p.reasons || []).join('\n') + (level === 'critical' ? '\nAutomated dispatch and schedules are paused until it eases.' : '');
+  pill.setAttribute('aria-label', 'Host ' + level + ': ' + (p.reasons || []).join(', '));
+  pill.classList.add('show');
+}
+function showHostPressure() {
+  const p = _hostPressure || {};
+  const lines = [(p.level || 'unknown').toUpperCase() + ': ' + ((p.reasons || []).join('; ') || 'no pressure')];
+  const run = p.runaways || [];
+  if (run.length) lines.push(run.length + ' long-running worker process' + (run.length === 1 ? '' : 'es') + ': '
+    + run.slice(0, 3).map(x => x.worker + ' ' + (x.command || '').split('/').pop() + ' (' + x.avg_cores + ' cores, ' + x.action + ')').join(', '));
+  const held = Object.entries(p.deferred || {}).map(([k, v]) => k + ' ' + v).join(', ');
+  if (held) lines.push('Deferred ticks: ' + held);
+  showToast(lines.join(' · '));
+}
+setInterval(refreshHostPressure, 60000);
+setTimeout(refreshHostPressure, 3000);
 function _scrollToFirstRateLimited() {
   const target = sessions.find(s => s.rate_limited_until) || sessions.find(s => s.credit_limited);
   if (!target) return;
@@ -12142,7 +12178,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1128';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1129';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

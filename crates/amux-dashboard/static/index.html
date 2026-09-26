@@ -221,6 +221,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <span id="rate-limit-pill-text">0 limited</span>
       <span id="rate-limit-pill-count" aria-hidden="true">0</span>
     </button>
+    <button class="btn-rate-limit btn-host-pressure" id="host-pressure-pill" title="Host pressure" onclick="event.stopPropagation();showHostPressure()">
+      <span id="host-pressure-pill-text">Host</span>
+      <span id="host-pressure-pill-count" aria-hidden="true">!</span>
+    </button>
     <div class="active-wrap" style="display:none;">
       <button class="btn-active" id="active-btn" onclick="event.stopPropagation();toggleActiveDropdown()">
         <span class="active-dot"></span>

@@ -579,7 +579,9 @@ pub fn plan(conn: &Connection, project: &store::Project) -> anyhow::Result<Vec<C
         } else if state.suspended {
             Some("executor_suspended".into())
         } else if spawn_refused {
-            if crate::backend::tmux_health::spawn_allowed_here().is_err() {
+            if crate::backend::tmux_health::spawn_allowed_here().is_err()
+                || crate::runtime_jobs::host_guard::critical_now().is_some()
+            {
                 state.waiting.clone()
             } else if let Some(reason) = &budget_wait {
                 Some(reason.clone())

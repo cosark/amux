@@ -93,6 +93,7 @@ pub mod ids {
     pub const INVARIANTS: &str = "invariants-monitor";
     pub const SCHEDULER: &str = "scheduler";
     pub const HOST_METRICS: &str = "host-metrics";
+    pub const HOST_GUARD: &str = "host-guard";
     pub const ORCH_RUNTIME: &str = "orchestrator-runtime";
     pub const PROJECT_EXECUTION: &str = "project-execution";
     pub const EVENT_PROCESSORS: &str = "event-processors";
@@ -167,6 +168,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::CONTEXT_HEALTH,
     ids::DISK_WATCH,
     ids::HOST_METRICS,
+    ids::HOST_GUARD,
     ids::STATUS_HISTORY,
     ids::TOKEN_LEDGER,
     ids::BOARD_HYGIENE,
@@ -637,6 +639,23 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: Some("/api/metrics/host/history"),
+    },
+    Doc {
+        id: ids::HOST_GUARD,
+        name: "Host guard",
+        purpose: "Every 30s computes one host pressure level (ok/strained/critical) from load per core, memory pressure and free disk. At critical, automated loops that start work (board dispatch, schedule fires, automated worker starts) skip their tick and retry on the next; owner actions never wait on it. While strained or worse, a worker's tool process that has averaged most of a core for 15+ minutes is reniced, never killed.",
+        env: &[
+            EnvControl { var: "AMUX_HOST_GUARD_SECS", effect: "0 disables the guard (no level, nothing deferred, nothing reniced)", off: Some("0") },
+            EnvControl { var: "AMUX_HOST_LOAD_STRAINED", effect: "load per core (5-min avg) that is strained, default 1.5", off: None },
+            EnvControl { var: "AMUX_HOST_LOAD_CRITICAL", effect: "load per core (5-min avg) that is critical, default 2.5", off: None },
+            EnvControl { var: "AMUX_HOST_DISK_STRAINED_GB", effect: "free GiB on the amux home volume that is strained, default 40", off: None },
+            EnvControl { var: "AMUX_HOST_DISK_CRITICAL_GB", effect: "free GiB that is critical, default 10", off: None },
+            EnvControl { var: "AMUX_RUNAWAY_MIN_SECS", effect: "age before a worker tool process can be a runaway, default 900", off: None },
+            EnvControl { var: "AMUX_RUNAWAY_AVG_CORES", effect: "lifetime average cores that makes it a runaway, default 0.8", off: None },
+            EnvControl { var: "AMUX_RUNAWAY_RENICE", effect: "0 reports runaways without renicing them", off: None },
+        ],
+        pref: None,
+        detail: Some("/api/metrics/host/pressure"),
     },
     Doc {
         id: ids::STATUS_HISTORY,

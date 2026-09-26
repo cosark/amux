@@ -2184,6 +2184,9 @@ pub struct TickReport {
     /// occurrence (in-memory dedupe hit).
     pub deduped: usize,
     pub errors: usize,
+    /// Due fires held back because the host was critical. They stay due
+    /// (`next_run` untouched) and fire on a later tick.
+    pub deferred: usize,
 }
 
 /// One scheduler pass. `firing=false` is SHADOW MODE (see module docs):
@@ -2254,6 +2257,16 @@ pub async fn scheduler_tick(
                     tracing::warn!(schedule = %id, error = %e, "shadow event write failed");
                 }
             }
+            continue;
+        }
+
+        // HOST GUARD, BEFORE fire_one. fire_one advances next_run and records a
+        // run inside its claim transaction before delivering, so a gate any
+        // later would record a refused run instead of deferring one. Here the
+        // row simply stays due. A deferral long enough to cross another
+        // occurrence is reported by the existing missed-run note, honestly.
+        if !crate::runtime_jobs::host_guard::admit_automation("schedules") {
+            report.deferred += 1;
             continue;
         }
 
@@ -4088,6 +4101,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(next, "2020-01-01T00:00");
+    }
+
+    #[tokio::test]
+    async fn a_critical_host_defers_a_fire_without_recording_or_advancing_it() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                insert_schedule(conn, &make_row("SCHED-1", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let mut seen = HashMap::new();
+        crate::runtime_jobs::host_guard::set_level_for_test(Some(crate::runtime_jobs::host_guard::Level::Critical));
+        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
+        assert_eq!((r.due, r.fired, r.deferred, r.errors), (1, 0, 1, 0));
+        {
+            let conn = store.read().unwrap();
+            let runs: i64 = conn.query_row("SELECT COUNT(*) FROM schedule_runs", [], |r| r.get(0)).unwrap();
+            let next: String = conn.query_row("SELECT next_run FROM schedules WHERE id='SCHED-1'", [], |r| r.get(0)).unwrap();
+            assert_eq!(runs, 0, "a deferral must not be recorded as a run");
+            assert_eq!(next, "2020-01-01T00:00", "a deferral must leave the schedule due");
+        }
+        // Strained is not critical: it fires.
+        crate::runtime_jobs::host_guard::set_level_for_test(Some(crate::runtime_jobs::host_guard::Level::Strained));
+        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
+        assert_eq!((r.fired, r.deferred), (1, 0));
+        crate::runtime_jobs::host_guard::set_level_for_test(None);
     }
 
     #[tokio::test]
