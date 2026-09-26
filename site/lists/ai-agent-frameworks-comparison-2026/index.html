@@ -40,13 +40,13 @@
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/lists/">Lists</a> <span class="sep">›</span> <span>AI Agent Frameworks Comparison 2026</span></div>
 
     <h1>AI Agent Frameworks Compared 2026</h1>
-    <p class="subtitle">Developer guide — architecture, language, multi-agent support, state management, and honest when-to-use. Last updated August 2026.</p>
+    <p class="subtitle">Developer guide — architecture, language, multi-agent support, state management, and honest when-to-use. Last updated September 2026.</p>
 
     <!-- EXP-028: top-of-page CTA — ai-agent-frameworks-comparison-2026, started 2026-08-11 -->
     <div style="background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);border-radius:8px;padding:1.2rem 1.6rem;margin:1.8rem 0;display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
       <div>
         <div style="font-weight:600;margin-bottom:4px;">Building a coding agent fleet? Skip the framework code.</div>
-        <div style="font-size:0.875rem;color:var(--dim);">amux orchestrates Claude Code, Codex, and Gemini CLI without writing a line of Python. Web dashboard, shared kanban board, self-healing, mobile monitoring. Open source, 338 stars.</div>
+        <div style="font-size:0.875rem;color:var(--dim);">amux orchestrates Claude Code, Codex, and Gemini CLI without writing a line of Python. Web dashboard, shared kanban board, self-healing, mobile monitoring. Open source, 503 stars.</div>
       </div>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:linear-gradient(135deg,#10b981,#059669);color:#fff;text-decoration:none;padding:.6rem 1.25rem;border-radius:6px;font-weight:600;font-size:.875rem;white-space:nowrap;flex-shrink:0;" onclick="typeof posthog!=='undefined'&&posthog.capture('exp028_frameworks_topofpage_cta_click')">View amux on GitHub ★</a>
     </div>
@@ -75,8 +75,8 @@
     </table>
 
     <h2>amux — Orchestrator, not a framework</h2>
-    <p>amux differs from the others on this list: it is not a coding framework. You don't write Python to define agents. Instead, you configure tmux-based Claude Code, Codex, or Gemini CLI sessions via a web UI, queue tasks on a shared kanban board, and let agents claim and execute them. Self-healing watchdog, mobile monitoring, zero code to write for standard coding workflows. New in August 2026: amux IaC lets you define your entire team in a single YAML file (<code>amux iac apply team.yaml</code>), declaratively provisioning workers, groups, schedules, and skills.</p>
-    <p><strong>Multi-agent:</strong> Fleet model — 10-50 coding agents sharing one kanban board. Atomic SQLite claiming prevents duplicate work. 338 stars on GitHub. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">Get amux →</a></p>
+    <p>amux differs from the others on this list: it is not a coding framework. You don't write Python to define agents. Instead, you configure tmux-based Claude Code, Codex, or Gemini CLI sessions via a web UI, queue tasks on a shared kanban board, and let agents claim and execute them. Self-healing watchdog, mobile monitoring, zero code to write for standard coding workflows. New in September 2026: deploy-wake auto-resumes workers when their commits go live, named clearance signals coordinate across agents without polling, and the host pressure guard stabilizes overnight automation under load.</p>
+    <p><strong>Multi-agent:</strong> Fleet model — 10-50 coding agents sharing one kanban board. Atomic SQLite claiming prevents duplicate work. 503 stars on GitHub. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">Get amux →</a></p>
 
     <h2>LangGraph</h2>
     <p>The most mature Python framework for stateful multi-agent systems (47k+ GitHub stars as of August 2026). Agents are nodes in a directed graph; edges define the transitions. Supports cycles (for retry and reflection loops), conditional routing, and parallel fan-out. Streams token output. LangGraph Cloud provides hosted checkpointing and deployment.</p>
