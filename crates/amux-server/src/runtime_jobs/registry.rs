@@ -126,6 +126,7 @@ pub mod ids {
     pub const BOARD_HYGIENE: &str = "board-hygiene";
     pub const RECORDINGS_TRANSCRIBE: &str = "recordings-transcribe";
     pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
+    pub const CAPTURE_RECONCILE: &str = "capture-reconcile";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -170,6 +171,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::BOARD_HYGIENE,
     ids::RECORDINGS_TRANSCRIBE,
     ids::MODEL_CATALOG_REFRESH,
+    ids::CAPTURE_RECONCILE,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -700,6 +702,33 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: Some("/api/models"),
+    },
+    Doc {
+        id: ids::CAPTURE_RECONCILE,
+        name: "Capture-card reconciliation",
+        purpose: "Closes an auto-captured intake card as done when a landed commit names its MSG id \
+                  (evidence written onto the card), and tags capture cards still open 24h after \
+                  capture as `unreconciled`. Board notes, turn-end text and cards marked done that \
+                  cite the MSG id close them immediately; this tick covers commits. AMUX-5238.",
+        env: &[
+            EnvControl {
+                var: "AMUX_CAPTURE_RECONCILE_TICK_S",
+                effect: "seconds between passes (floor 60)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_CAPTURE_RECONCILE_SECS",
+                effect: "0 disables the job",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_CAPTURE_RECONCILE",
+                effect: "scoped per lane; 0 stops closing and tagging that lane's capture cards",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: None,
     },
 ];
 

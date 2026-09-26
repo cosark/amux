@@ -368,7 +368,9 @@ const NEEDSYOU_VIEW_CAP: usize = 10;
 /// Rules (in priority order; first match wins):
 ///   1. status=needsyou AND entered_state_at older than 14 days: "aged-needsyou"
 ///   2. status=doing AND assigned session is not active for >1h: "stalled"
-///   3. source=capture AND status=todo AND age > 72h AND no log activity: "stale"
+///   3. source=capture AND status=todo AND age > 72h AND no log activity: "stale";
+///      then an open card tagged `unreconciled` by capture-reconcile: "unreconciled";
+///      then an open epic whose children are all terminal (some done): "awaiting-verify"
 ///   4. status=done AND evidence IS NOT NULL: "verified-candidate"
 ///   5. depends_on non-empty AND all resolved: "unblocked"
 ///   6. otherwise: the stored status itself
@@ -409,16 +411,17 @@ async fn derived_board(State(state): State<AppState>) -> Response {
             "total": items.len(),
             "note": "display_status is computed from durable facts, never stored. \
                      Rules: aged-needsyou (>14d), stalled (doing + session idle >1h), \
-                     stale (auto-captured todo >72h, no log), verified-candidate \
-                     (done + evidence), unblocked (all deps resolved). Otherwise \
-                     the stored status.",
+                     stale (auto-captured todo >72h, no log), unreconciled \
+                     (capture card tagged open >24h), awaiting-verify (open epic, all \
+                     children closed), verified-candidate (done + evidence), \
+                     unblocked (all deps resolved). Otherwise the stored status.",
         }),
         items.len(),
     ))
     .into_response()
 }
 
-fn derive_display_status(
+pub(crate) fn derive_display_status(
     row: &IssueRow,
     now: i64,
     working: &std::collections::BTreeSet<String>,
@@ -461,6 +464,27 @@ fn derive_display_status(
         }
     }
 
+    // 3b. Unreconciled capture (AMUX-5238): an auto-captured intake card the
+    // capture-reconcile job tagged because it was still open 24h after the
+    // owner's message. Stored as a tag so `amux board ls` shows it too.
+    if !bs::is_terminal_status(status)
+        && row
+            .tags
+            .iter()
+            .any(|t| t == crate::runtime_jobs::capture_reconcile::UNRECONCILED_TAG)
+    {
+        return "unreconciled".into();
+    }
+
+    // 3c. Awaiting verify (AMUX-5238): an OPEN epic whose children are all
+    // resolved. LV-109 read "Closed" in its children while its own status sat
+    // in backlog, which on the board looked exactly like untouched work.
+    // `board_drive::complete_finished_epics` only closes an epic once code
+    // children are VERIFIED; this names the ones sitting between the two.
+    if row.item_type == "epic" && !bs::is_terminal_status(status) && epic_children_all_resolved(conn, row) {
+        return "awaiting-verify".into();
+    }
+
     // 4. Verified candidate: done with evidence recorded.
     if status == "done" && row.evidence.is_some() {
         return "verified-candidate".into();
@@ -481,6 +505,45 @@ fn derive_display_status(
 
     // 6. Passthrough: the stored status.
     status.to_string()
+}
+
+/// Every child of `epic` (cards whose `epic` is it, plus its `depends_on`)
+/// is terminal and at least one reached done/verified.
+///
+/// DELIBERATELY LOOSER than epic completion. `complete_finished_epics` closes
+/// an epic only when each child is `bs::dependency_resolved`, which for a
+/// code card means VERIFIED. So an epic whose code children are all `done`
+/// stays open indefinitely, and before this state it rendered as ordinary
+/// backlog. "Children finished, nobody has verified them" is the fact a reader
+/// needs, so that is what this names.
+fn epic_children_all_resolved(conn: &Connection, epic: &IssueRow) -> bool {
+    let mut children: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL AND COALESCE(archived,0)=0",
+        )
+        .and_then(|mut st| {
+            st.query_map([&epic.id], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    for d in &epic.depends_on {
+        if !children.contains(d) {
+            children.push(d.clone());
+        }
+    }
+    let statuses: Vec<String> = children
+        .iter()
+        .map(|id| {
+            bs::get_issue(conn, id)
+                .ok()
+                .flatten()
+                .map(|c| c.status)
+                .unwrap_or_else(|| "missing".into())
+        })
+        .collect();
+    !statuses.is_empty()
+        && statuses.iter().all(|s| bs::is_terminal_status(s))
+        && statuses.iter().any(|s| matches!(s.as_str(), "done" | "verified"))
 }
 
 /// Why a candidate is NOT on the ready frontier, or `None` if it is ready.
@@ -10269,6 +10332,14 @@ pub async fn patch_item(
     let slot_w = slot.clone();
     let id_w = id.clone();
     let caller_for_notify = caller_lane.clone();
+    // AMUX-5238: the prose this PATCH adds, kept for capture reconciliation
+    // after the write lands. Read before `map` moves into the closure.
+    let capture_note: String = ["desc_append", "evidence"]
+        .iter()
+        .filter_map(|k| map.get(*k).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let capture_author = caller_lane.clone();
 
     let write = state
         .store
@@ -14390,6 +14461,34 @@ pub async fn patch_item(
                         body["rev"] = latest.snapshot()["rev"].clone();
                     }
                 }
+            }
+            // CAPTURE RECONCILIATION (AMUX-5238). Off the response path: a
+            // note citing `MSG-<n>` with a landed sha, or this card reaching
+            // done/verified while citing `MSG-<n>`, closes the lane's matching
+            // auto-captured intake card with that evidence. Both halves are
+            // no-ops unless the text names a MSG id.
+            let reached_done = status_transition
+                .as_ref()
+                .is_some_and(|(_, _, to)| matches!(to.as_str(), "done" | "verified"));
+            if capture_note.contains("MSG-") || reached_done {
+                let st = state.clone();
+                let (card, note) = (id.clone(), capture_note.clone());
+                let author = if capture_author.is_empty() {
+                    body.get("session").and_then(Value::as_str).unwrap_or("").to_string()
+                } else {
+                    capture_author.clone()
+                };
+                crate::db::interactions::spawn(async move {
+                    if note.contains("MSG-") {
+                        crate::runtime_jobs::capture_reconcile::on_text(
+                            &st, &author, &note, "board note",
+                        )
+                        .await;
+                    }
+                    if reached_done {
+                        crate::runtime_jobs::capture_reconcile::on_card_done(&st, &card).await;
+                    }
+                });
             }
             // REACTIVE DRIVE through the same gates as the periodic sweep.
             if let Some((session, _from, to)) = status_transition {

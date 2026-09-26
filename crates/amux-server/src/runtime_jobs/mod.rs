@@ -52,6 +52,7 @@ pub mod board_drain;
 pub mod board_drive;
 pub mod board_hygiene;
 pub mod browser_reaper;
+pub mod capture_reconcile;
 pub mod cdc_poller;
 pub mod codex_ledger;
 pub mod commit_mention_notes;

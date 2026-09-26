@@ -28161,6 +28161,17 @@ pub(crate) async fn report_post(
                 });
             if became_idle {
                 record_turn_end_without_outcome(state, name).await;
+                // AMUX-5238: a turn that ends citing `MSG-<n>` with a landed
+                // sha closes the lane's auto-captured intake card for it. The
+                // transcript is read only when the lane has an open capture.
+                let (st_cap, lane) = (state.clone(), name.to_string());
+                crate::db::interactions::spawn(async move {
+                    let reader = lane.clone();
+                    crate::runtime_jobs::capture_reconcile::on_turn_end(&st_cap, &lane, move || {
+                        last_assistant_message(&reader, 20_000)
+                    })
+                    .await;
+                });
             }
             // REACTIVE STEERING DELIVERY: if the session just went idle and has
             // queued steering, deliver the oldest one NOW rather than waiting up

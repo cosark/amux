@@ -27309,6 +27309,9 @@ const _DERIVED_STATUS_STYLE = {
   'stale':              {bg:'rgba(139,148,158,0.15)',color:'rgba(139,148,158,0.7)',border:'rgba(139,148,158,0.35)',dot:'rgba(139,148,158,0.5)'},
   'verified-candidate': {bg:'rgba(45,212,191,0.12)',color:'#2dd4bf',border:'rgba(45,212,191,0.35)',dot:'#2dd4bf'},
   'unblocked':          {bg:'rgba(88,166,255,0.18)',color:'var(--accent)',border:'rgba(88,166,255,0.45)',dot:'var(--accent)'},
+  // AMUX-5238: capture cards open >24h, and open epics whose children are all resolved.
+  'unreconciled':       {bg:'rgba(255,140,80,0.16)',color:'#ff8c50',border:'rgba(255,140,80,0.45)',dot:'#ff8c50'},
+  'awaiting-verify':    {bg:'rgba(188,140,255,0.15)',color:'#bc8cff',border:'rgba(188,140,255,0.4)',dot:'#bc8cff'},
 };
 const _DERIVED_STATUS_STYLE_LIGHT = {
   'aged-needsyou':      {bg:'rgba(207,34,46,0.12)',color:'#cf222e',border:'rgba(207,34,46,0.4)',dot:'#cf222e'},
@@ -27316,6 +27319,8 @@ const _DERIVED_STATUS_STYLE_LIGHT = {
   'stale':              {bg:'rgba(101,109,118,0.12)',color:'#57606a',border:'rgba(101,109,118,0.3)',dot:'#57606a'},
   'verified-candidate': {bg:'rgba(13,148,136,0.12)',color:'#0d9488',border:'rgba(13,148,136,0.35)',dot:'#0d9488'},
   'unblocked':          {bg:'rgba(9,105,218,0.12)',color:'#0550ae',border:'rgba(9,105,218,0.35)',dot:'#0550ae'},
+  'unreconciled':       {bg:'rgba(200,80,20,0.1)',color:'#bc4c00',border:'rgba(200,80,20,0.3)',dot:'#bc4c00'},
+  'awaiting-verify':    {bg:'rgba(130,80,255,0.1)',color:'#6639ba',border:'rgba(130,80,255,0.3)',dot:'#6639ba'},
 };
 const _DERIVED_STATUS_LABELS = {
   'aged-needsyou': 'Aged Needs-You (>14d)',
@@ -27323,6 +27328,8 @@ const _DERIVED_STATUS_LABELS = {
   'stale': 'Stale (auto, no activity >72h)',
   'verified-candidate': 'Verified Candidate (has evidence)',
   'unblocked': 'Unblocked (deps resolved)',
+  'unreconciled': 'Unreconciled capture (open >24h)',
+  'awaiting-verify': 'Epic awaiting verify (children done)',
 };
 
 function derivedStatusStyle(id) {
@@ -31689,7 +31696,7 @@ function _renderSmartBoard(container, visibleStored) {
 
   // Derived status groups in priority display order: attention-needing first
   const derivedOrder = [
-    'aged-needsyou', 'stalled', 'stale', 'unblocked', 'verified-candidate',
+    'aged-needsyou', 'stalled', 'stale', 'unreconciled', 'awaiting-verify', 'unblocked', 'verified-candidate',
     'doing', 'review', 'needsyou', 'todo', 'backlog', 'done', 'verified', 'discarded'
   ];
   const groups = {};
@@ -31700,7 +31707,7 @@ function _renderSmartBoard(container, visibleStored) {
 
   let html = '';
   // Show derived-only statuses with a highlight header
-  const derivedSpecial = new Set(['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked']);
+  const derivedSpecial = new Set(['aged-needsyou', 'stalled', 'stale', 'unreconciled', 'awaiting-verify', 'verified-candidate', 'unblocked']);
   derivedOrder.concat(Object.keys(groups).filter(k => !derivedOrder.includes(k))).forEach(ds => {
     const g = groups[ds];
     if (!g || !g.length) return;
@@ -31729,7 +31736,7 @@ function _renderSmartBoard(container, visibleStored) {
 function _smartBoardStatsHTML() {
   if (!_smartBoardData || !_smartBoardData.counts) return '';
   const c = _smartBoardData.counts;
-  const special = ['aged-needsyou', 'stalled', 'stale', 'verified-candidate', 'unblocked'];
+  const special = ['aged-needsyou', 'stalled', 'stale', 'unreconciled', 'awaiting-verify', 'verified-candidate', 'unblocked'];
   let pills = '';
   for (const key of special) {
     const n = c[key] || 0;
