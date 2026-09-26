@@ -132,6 +132,12 @@ ESCALATE_COOLDOWN_H=${AMUX_CLEANUP_ESCALATE_COOLDOWN_H:-6}
 # Seam: FILE is replaced with the message path. The test points this at a recorder.
 ESCALATE_CMD=${AMUX_CLEANUP_ESCALATE_CMD:-amux send TARGET --file FILE}
 RUNBOOK=docs/runbooks/mac-resource-rca.md
+# Seam: FILE is replaced with a JSON body. The test points this at a recorder.
+# Not written as ${AMUX_CLEANUP_CARD_CMD:-curl ...}: the `}` in curl's %{http_code}
+# would close that expansion early and run the rest of the line as a command.
+if [ -n "${AMUX_CLEANUP_CARD_CMD:-}" ]; then CARD_CMD=$AMUX_CLEANUP_CARD_CMD
+else CARD_CMD="curl -sk --max-time 20 -o /dev/null -w %{http_code} -X POST -H Content-Type:application/json -H X-Amux-Session:desktop --data @FILE $(amux url 2>/dev/null || echo https://localhost:8824)/api/board"; fi
+SENDFAIL_CARD_AFTER=${AMUX_CLEANUP_SENDFAIL_CARD_AFTER:-2}
 # Seams: the tests point these at a recorder so an action can be observed
 # without running it. Defaults are what the scheduler actually runs.
 PURGE_CMD=${AMUX_CLEANUP_PURGE_CMD:-sudo -n /usr/sbin/purge}
@@ -579,6 +585,48 @@ lane_for_pid() { # <pid> [pane map text]
   printf 'no lane'
 }
 
+# The hand-off prompt (DESKT-58). Rounds 1-3 sent a four-line pointer, and the
+# model did good work with it, but every escalation started cold: nothing said
+# what the previous one for this class concluded, whether its fix held, or what
+# "done" is. This carries all three, and a card-file handshake so the NEXT
+# escalation can quote the card this one produces.
+escalation_message() { # <cls> <verdict> <bundle> <card_file> <now_snapshot> <prev_age_h|-> <prev_card|-> <prev_snapshot|->
+  local cls=$1 v=$2 bundle=$3 cardf=$4 nowsnap=$5 page=$6 pcard=$7 psnap=$8
+  echo "Ask: find and fix the ROOT CAUSE of this Mac $cls constraint, then prove it cleared. The cleanup tick already applied every safe symptom fix, so a symptom fix alone is not done."
+  echo
+  echo "Constraint: $v"
+  echo "Measured now: $nowsnap"
+  if [ "$page" = "-" ]; then
+    echo "History: first $cls escalation on record."
+  else
+    echo "History: this RECURRED. The previous $cls escalation was ${page}h ago (card: $pcard; measured then: $psnap). Start from that card: say whether its fix landed, why it did not hold, or what new cause this is."
+  fi
+  echo "Evidence: $bundle (top memory and CPU with owner and lane, what the tick did, disk writers)"
+  echo "Runbook: git -C ${AMUX_REPO_DIR:-$HOME/Dev/amux} show origin/main:$RUNBOOK"
+  echo
+  echo "Done means all four:"
+  echo "1. The cause named with its owner (lane, launchd agent, app, or macOS) and the measurement that shows it."
+  echo "2. A fix at the cause: a commit with a test and a log signal, a config change, or one message to the owning lane with the evidence and one ask. Say which."
+  echo "3. The constraint re-measured after the fix, cleared or not, with the number."
+  echo "4. A card on your board with the above, and its id written to $cardf (just the id, e.g. MO-1234), so the next escalation for $cls can start from it."
+  echo
+  echo "Boundary: never delete another lane's uncommitted work, a repo, .git, credentials or a database; never kill a live lane's workload; spending money or anything outside the company needs Ethan."
+}
+
+# One board card for a failure nobody would otherwise see. Deduped by key for 24h
+# in the state file, so a broken path files one card, not one per tick.
+file_card() { # <state_file> <key> <title> <desc>
+  local st=$1 key=$2 last now body cmd code
+  now=$(date +%s); last=$(state_get "$st" "card_$key")
+  if [ -n "$last" ] && [ $(( now - last )) -lt 86400 ]; then echo "already filed within 24h"; return 0; fi
+  body=$(mktemp "${TMPDIR:-/tmp}/mac-card.XXXXXX")
+  python3 -c 'import json,sys; print(json.dumps({"title":sys.argv[1],"desc":sys.argv[2],"session":"desktop","status":"todo","type":"escalation","next_action":"Read the tick output named in the description and restore the broken path.","acceptance_criteria":"The next scheduled tick runs and its escalation path reports no failure."}))' "$3" "$4" > "$body"
+  cmd=${CARD_CMD//FILE/$body}
+  code=$($cmd 2>/dev/null) || code=failed
+  rm -f -- "${body:?}"
+  case "$code" in 2??|ok) state_put "$st" "card_$key=$now"; echo "filed ($code)" ;; *) echo "card POST failed ($code)" ;; esac
+}
+
 [ "${AMUX_CLEANUP_LIB_ONLY:-0}" = "1" ] && return 0 2>/dev/null
 
 # ── measure ──────────────────────────────────────────────────────────────────
@@ -825,21 +873,30 @@ else
     if ! escalation_due "$STATE" "$cls" "$now" "$ESCALATE_COOLDOWN_H"; then
       echo "mac-cleanup: constraint $v — escalation suppressed (last $cls escalation under ${ESCALATE_COOLDOWN_H}h ago)"; continue
     fi
-    msg="$STATE_DIR/rca/$stamp.$cls.msg"
-    {
-      echo "Ask: RCA and fix the root cause of this Mac $cls constraint; the tick has already fixed what it can."
-      echo "Constraint: $v"
-      echo "Evidence: $bundle"
-      echo "Runbook: git -C ${AMUX_REPO_DIR:-$HOME/Dev/amux} show origin/main:$RUNBOOK (the committed copy; a checkout may be behind)"
-    } > "$msg"
+    msg="$STATE_DIR/rca/$stamp.$cls.msg"; cardf="$STATE_DIR/rca/$stamp.$cls.card"
+    nowsnap="disk=${disk_now}G burn=${burn_txt} load15=${load15}/${ncpu} pressure=${level_now} swap_free=${swap_free_now}MB"
+    plast=$(state_get "$STATE" "esc_$cls"); pstamp=$(state_get "$STATE" "esc_${cls}_stamp"); psnap=$(state_get "$STATE" "esc_${cls}_snap")
+    page=-; pcard=-
+    if [ -n "$plast" ]; then
+      page=$(awk -v a="$now" -v b="$plast" 'BEGIN{printf "%.1f", (a-b)/3600}')
+      pcard=$(tr -d '[:space:]' < "$STATE_DIR/rca/$pstamp.$cls.card" 2>/dev/null); [ -n "$pcard" ] || pcard="none written (the previous turn did not record one)"
+      [ -n "$psnap" ] || psnap="not recorded"
+    fi
+    escalation_message "$cls" "$v" "$bundle" "$cardf" "$nowsnap" "$page" "$pcard" "$psnap" > "$msg"
     cmd=${ESCALATE_CMD//TARGET/$ESCALATE_TO}; cmd=${cmd//FILE/$msg}
     if sendout=$($cmd 2>&1); then
-      state_put "$STATE" "esc_$cls=$now"; escalated=$((escalated+1))
-      echo "mac-cleanup: constraint $v — escalated to $ESCALATE_TO (bundle $bundle)"
+      state_put "$STATE" "esc_$cls=$now" "esc_${cls}_stamp=$stamp" "esc_${cls}_snap=$nowsnap" "sendfail_$cls=0"; escalated=$((escalated+1))
+      echo "mac-cleanup: constraint $v — escalated to $ESCALATE_TO$( [ "$page" = - ] || echo " (recurrence, previous ${page}h ago, card $pcard)") (bundle $bundle)"
     else
       # The reason, not just the word: round 1 printed FAILED and the cause (an
       # isolated target) was only findable by re-running the send by hand.
-      echo "mac-cleanup: constraint $v — escalation to $ESCALATE_TO FAILED: $(printf '%s' "$sendout" | tail -1 | cut -c1-160) (bundle $bundle)"
+      reason=$(printf '%s' "$sendout" | tail -1 | cut -c1-160)
+      fails=$(( $(state_get "$STATE" "sendfail_$cls" || true) + 1 )); state_put "$STATE" "sendfail_$cls=$fails"
+      echo "mac-cleanup: constraint $v — escalation to $ESCALATE_TO FAILED ($fails in a row): $reason (bundle $bundle)"
+      # A failed send is otherwise visible only in a file nobody reads (DESKT-58).
+      if [ "$fails" -ge "$SENDFAIL_CARD_AFTER" ]; then
+        echo "mac-cleanup:   send-failure card: $(file_card "$STATE" "sendfail" "Mac cleanup tick cannot reach $ESCALATE_TO: $cls escalations failing" "SCHED-465 failed to send $fails $cls escalation(s) in a row to $ESCALATE_TO. Last error: $reason. Constraint: $v. Bundle: $bundle. Full output: ~/.amux/logs/mac-cleanup-tick.last")"
+      fi
     fi
   done <<EOF
 $verdicts

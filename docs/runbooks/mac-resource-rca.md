@@ -62,7 +62,20 @@ The symptom fix buys time. The cause fix is what stops the next message:
 - Never kill a live lane's workload to reclaim memory. Report it to its owner.
 - Spending money, and anything outside the company, needs Ethan.
 
-## 5. Record it
+## 5. Record it, and hand the next escalation your card
 
-Put a card on the desktop board with the constraint, the cause, the owner, the
-fix and its commit, so the next escalation for the same class starts from it.
+Put a card on your board with the constraint, the cause, the owner, the fix and
+its commit, and the constraint re-measured after the fix. Then write just the
+card id into the `.card` file the message names. The tick reads it back: if the
+same class is constrained again after the cooldown, the next message says
+"this RECURRED", quotes your card and the numbers measured then, and asks why
+the fix did not hold. Without the id, that message can only say none was written.
+
+## If the tick itself breaks
+
+- Two failed sends in a row to mac-ops file one card on the desktop board per
+  24h, with the send error.
+- If the amux scheduler stops firing SCHED-465, launchd runs
+  `scripts/mac-cleanup-fallback.sh` every 15 minutes. It runs the committed tick
+  when the last output is over 45 minutes old, and files one card per 24h
+  saying the scheduler went quiet. Log: `~/.amux/logs/mac-cleanup-fallback.log`.

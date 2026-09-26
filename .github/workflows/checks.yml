@@ -373,6 +373,10 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-mac-cleanup-assess.sh
+      - name: launchd runs the cleanup tick when the scheduler goes quiet, and says so once a day (DESKT-58)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-fallback.sh
       # AF-677. AF-346's ratchet (above) recorded 31 harnesses as unwired rather
       # than wiring them blind, because that decision belongs to each one's
       # owner (ethos rule 8). This is that decision, made for 28 of the 31:

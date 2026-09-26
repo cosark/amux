@@ -61,6 +61,19 @@ check "inside the cooldown it is not due"             "no"  "$(escalation_due "$
 check "control: past the cooldown it is due again"    "yes" "$(escalation_due "$S" disk 31600 6 && echo yes || echo no)"
 check "the cooldown is per class"                     "yes" "$(escalation_due "$S" cpu 20000 6 && echo yes || echo no)"
 
+echo "3b. the hand-off prompt (DESKT-58)"
+first=$(escalation_message cpu "cpu load 40" /b.md /c.card "disk=600G load15=40/28" - - -)
+check "the first line is the ask, and says symptom fixes are not done" "yes" "$(printf '%s\n' "$first" | head -1 | grep -q '^Ask: find and fix the ROOT CAUSE.*a symptom fix alone is not done' && echo yes || echo no)"
+check "a first escalation says so"                    "yes" "$(has "$first" 'History: first cpu escalation on record')"
+check "it carries the numbers measured now"           "yes" "$(has "$first" 'Measured now: disk=600G load15=40/28')"
+check "it states four done criteria"                  "4"   "$(printf '%s\n' "$first" | grep -c '^[1-4]\. ')"
+check "it names where to write the card id"           "yes" "$(has "$first" 'its id written to /c.card')"
+check "it carries the boundary"                       "yes" "$(has "$first" "never kill a live lane's workload")"
+again=$(escalation_message cpu "cpu load 40" /b.md /c.card "disk=600G load15=40/28" 6.5 MO-3622 "load15=46.6/28")
+check "a recurrence says RECURRED with its age"       "yes" "$(has "$again" 'this RECURRED. The previous cpu escalation was 6.5h ago')"
+check "and quotes the previous card and its numbers"  "yes" "$(has "$again" 'card: MO-3622; measured then: load15=46.6/28')"
+check "control: the first-time line is absent then"   "no"  "$(has "$again" 'first cpu escalation')"
+
 echo "4. lane attribution walks the parent chain to a pane"
 bash -c 'sleep 30 & wait' & shell=$!
 sleep 0.5; child=$(pgrep -P "$shell" sleep | head -1)
@@ -77,10 +90,11 @@ echo "5. end to end: escalation, cooldown, failure, dry run (macOS only)"
 if [ "$(uname)" = Darwin ]; then
   REC="$FIX/rec.sh"; printf '#!/bin/bash\necho "to=$1 file=$2" >> %s/sent.log\n' "$FIX" > "$REC"; chmod +x "$REC"
   FAILCMD="$FIX/fail.sh"; printf '#!/bin/bash\necho "target is an isolated worker" >&2; exit 1\n' > "$FAILCMD"; chmod +x "$FAILCMD"
+  CARDREC="$FIX/card.sh"; printf '#!/bin/bash\nf="${@: -1}"; cat "${f#@}" >> %s/cards.log; echo >> %s/cards.log; printf 201\n' "$FIX" "$FIX" > "$CARDREC"; chmod +x "$CARDREC"
   tick() { AMUX_CLEANUP_STATE_DIR="$FIX/tick" AMUX_CLEANUP_TARGET_ROOTS="$FIX/none" AMUX_CLEANUP_PURGE_CMD=true \
            AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=0 \
            AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 AMUX_CLEANUP_CPU_SHARE=99 AMUX_CLEANUP_SWAP_FREE_FLOOR_MB=0 \
-           AMUX_CLEANUP_DISK_FLOOR_GB="$1" AMUX_CLEANUP_HISTORY_CMD="cat $FIX/hist.json" AMUX_CLEANUP_ESCALATE_TO=mac-ops-test AMUX_CLEANUP_ESCALATE_CMD="$2 TARGET FILE" \
+           AMUX_CLEANUP_DISK_FLOOR_GB="$1" AMUX_CLEANUP_HISTORY_CMD="cat $FIX/hist.json" AMUX_CLEANUP_CARD_CMD="$CARDREC --data @FILE" AMUX_CLEANUP_ESCALATE_TO=mac-ops-test AMUX_CLEANUP_ESCALATE_CMD="$2 TARGET FILE" \
            bash "$TICK" ${3:-} 2>&1; }
   mkhist 13 0 > "$FIX/hist.json"      # a flat disk: the trend must not fire, only the floor knob
   out=$(tick 0 "$REC"); rm -f "$FIX/sent.log"
@@ -88,8 +102,15 @@ if [ "$(uname)" = Darwin ]; then
   check "with nothing constrained it says none"        "yes" "$(has "$out" 'constraints none')"
   check "and sends nothing"                            "no"  "$([ -f "$FIX/sent.log" ] && echo yes || echo no)"
   out=$(tick 999999 "$FAILCMD")
-  check "a refused send is reported with its reason"   "yes" "$(has "$out" 'FAILED: target is an isolated worker')"
+  check "a refused send is reported with its reason"   "yes" "$(has "$out" 'FAILED (1 in a row): target is an isolated worker')"
   check "and does not start the cooldown"              ""    "$(state_get "$FIX/tick/state" esc_disk)"
+  check "one failure files no card yet"                 "no"  "$([ -f "$FIX/cards.log" ] && echo yes || echo no)"
+  out=$(tick 999999 "$FAILCMD")
+  check "the second failure in a row files a card"      "yes" "$(has "$out" 'send-failure card: filed (201)')"
+  check "the card names the target and the error"       "yes" "$(grep -q 'cannot reach mac-ops-test' "$FIX/cards.log" && grep -q 'isolated worker' "$FIX/cards.log" && echo yes || echo no)"
+  out=$(tick 999999 "$FAILCMD")
+  check "a third failure inside 24h files no second card" "yes" "$(has "$out" 'already filed within 24h')"
+  check "exactly one card was filed"                    "1"   "$(grep -c 'cannot reach mac-ops-test' "$FIX/cards.log" | tr -d ' ')"
   out=$(tick 999999 "$REC" --dry-run)
   check "dry run says it would escalate"               "yes" "$(has "$out" 'would escalate (dry run)')"
   check "and sends nothing"                            "no"  "$([ -f "$FIX/sent.log" ] && echo yes || echo no)"
@@ -97,8 +118,8 @@ if [ "$(uname)" = Darwin ]; then
   check "control: a constrained disk escalates"        "yes" "$(has "$out" 'escalated to mac-ops-test')"
   check "to the configured target"                     "1"   "$(grep -c 'to=mac-ops-test' "$FIX/sent.log" | tr -d ' ')"
   msg=$(sed -n 's/.*file=//p' "$FIX/sent.log" | head -1)
-  check "the message's first line is the ask"          "yes" "$(head -1 "$msg" | grep -q '^Ask: RCA and fix the root cause' && echo yes || echo no)"
-  bundle=$(sed -n 's/^Evidence: //p' "$msg")
+  check "the message's first line is the ask"          "yes" "$(head -1 "$msg" | grep -q '^Ask: find and fix the ROOT CAUSE' && echo yes || echo no)"
+  bundle=$(sed -n 's/^Evidence: \([^ ]*\).*/\1/p' "$msg")
   check "the bundle it names exists"                   "yes" "$([ -f "$bundle" ] && echo yes || echo no)"
   check "the bundle has the disk-writer section"       "yes" "$(grep -q 'written in the last hour' "$bundle" && echo yes || echo no)"
   check "the bundle attributes processes to lanes"     "yes" "$(grep -q 'lane: ' "$bundle" && echo yes || echo no)"
@@ -106,6 +127,14 @@ if [ "$(uname)" = Darwin ]; then
   out=$(tick 999999 "$REC")
   check "a second tick inside the cooldown is suppressed" "yes" "$(has "$out" 'escalation suppressed')"
   check "and sends nothing more"                       "1"   "$(grep -c 'to=mac-ops-test' "$FIX/sent.log" | tr -d ' ')"
+  # Recurrence: the model turn wrote its card id; the cooldown lapses; the next
+  # escalation must quote that card. The cooldown is shortened, not faked.
+  echo MO-9999 > "${msg%.msg}.card"
+  state_put "$FIX/tick/state" "esc_disk=$(( $(date +%s) - 7*3600 ))"
+  out=$(tick 999999 "$REC")
+  check "after the cooldown a recurrence escalates"     "yes" "$(has "$out" 'recurrence, previous 7.0h ago, card MO-9999')"
+  msg2=$(sed -n 's/.*file=//p' "$FIX/sent.log" | tail -1)
+  check "and the prompt quotes the previous card"       "yes" "$(grep -q 'card: MO-9999; measured then: disk=' "$msg2" && echo yes || echo no)"
 else
   echo "  skip macOS-only cells (the tick's probes are macOS commands): not run on $(uname)"
 fi
