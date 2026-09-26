@@ -1204,7 +1204,14 @@ sys.exit(0 if any(line.startswith("n/") and os.path.realpath(line[1:].strip().sp
   fi
   local launch="$cmd"
   if [[ -n "$resume_fallback" ]]; then
-    launch="$cmd || { echo '[amux] nothing to resume here; starting a new conversation' >&2; $resume_fallback; }"
+    # ONLY A RESUME THAT FAILS AT ONCE FALLS BACK. `||` also fires when a
+    # resumed lane that ran for hours is stopped, because a killed claude exits
+    # non-zero. Measured 2026-09-26: stopping eight idle CLI-launched lanes
+    # through the server relaunched every one of them into a FRESH conversation
+    # via this line, the server then adopted the new conversation id, and each
+    # lane lost its context until it was pointed back by hand. "Nothing to
+    # resume" exits within a second or two; 30s separates the two cleanly.
+    launch="_amux_t0=\$SECONDS; $cmd || { if (( SECONDS - _amux_t0 < 30 )); then echo '[amux] nothing to resume here; starting a new conversation' >&2; $resume_fallback; fi; }"
   fi
   tmux ${tmux_start_flag:+-N} new-session -d -s "$tname" -n "$name" -c "$dir" \
     -e "AMUX_SESSION=$name" -e "AMUX_WORKER=$name" -e "AMUX_URL=$AMUX_API" \
