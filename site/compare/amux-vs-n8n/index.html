@@ -45,7 +45,7 @@
     "description": "n8n connects SaaS APIs and webhooks in a visual node editor. amux orchestrates AI coding agents (Claude Code, Codex, Gemini CLI) that write, test, and ship software. They serve different jobs — here is when to use each, and how to compose them.",
     "url": "https://amux.io/compare/amux-vs-n8n/",
     "datePublished": "2026-07-13",
-    "dateModified": "2026-08-19",
+    "dateModified": "2026-09-26",
     "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io"},
     "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io", "logo": {"@type": "ImageObject", "url": "https://amux.io/icon.png"}},
     "image": "https://amux.io/og-image.png"
@@ -117,8 +117,13 @@
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/compare/">Compare</a> <span class="sep">›</span> <span>amux vs n8n</span></div>
 
+    <div style="background:#0d7c42;color:#fff;border-radius:8px;padding:1rem 1.4rem;margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span><strong>amux</strong> &mdash; open-source AI agent control plane. Orchestrate coding agents, browser automation, kanban, email, and scheduler from one dashboard or your phone. 503+ stars.</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#fff;color:#0d7c42;font-weight:600;padding:0.45rem 1rem;border-radius:6px;white-space:nowrap;text-decoration:none" onclick="posthog.capture('exp092_n8n_compare_topofpage_cta_click')">&#11088; Star on GitHub</a>
+    </div>
+
     <h1>amux vs n8n</h1>
-    <p class="subtitle">n8n is the leading open-source workflow automation platform — connect SaaS APIs, webhooks, and data pipelines in a visual editor. amux is an open-source control plane for AI coding agents — run and monitor dozens of Claude Code, Codex, and Gemini CLI sessions from your phone. These tools serve different jobs. Here is the honest comparison. <em>Updated August 2026.</em></p>
+    <p class="subtitle">n8n is the leading open-source workflow automation platform — connect SaaS APIs, webhooks, and data pipelines in a visual editor. amux is an open-source control plane for AI coding agents — run and monitor dozens of Claude Code, Codex, and Gemini CLI sessions from your phone. These tools serve different jobs. Here is the honest comparison. <em>Updated September 2026.</em></p>
 
     <!-- EXP-007: compare pages GitHub CTA -->
     <div style="display:flex;align-items:center;gap:1rem;background:var(--bg-2,#1a1f2e);border:1px solid var(--line,#2a3040);border-radius:8px;padding:0.875rem 1.125rem;margin:1.5rem 0;flex-wrap:wrap">
@@ -291,6 +296,15 @@ GET https://localhost:8824/api/board?status=done&amp;since=yesterday
       <summary style="cursor:pointer;font-weight:600;">What is cheaper — amux or n8n?</summary>
       <p style="margin:0.8rem 0 0;">Both are free to self-host. amux's only paid piece is the tunnel relay ($20/month or $200/year). n8n cloud starts at approximately $24/month for 2,500 workflow executions. For pure local use, both cost nothing beyond the machine they run on.</p>
     </details>
+
+    <h2 id="whats-new-sept-2026">What&rsquo;s new in amux &mdash; September 2026</h2>
+    <p>Recent amux releases expand the coding agent workflow loop:</p>
+    <ul>
+      <li><strong>Deploy-wake (AMUX-5239).</strong> amux now notifies the worker sessions that authored each commit the moment that commit goes live. Agents automatically pick up a verification task without any human follow-up. See the <a href="/guides/ai-agent-deploy-notifications/">deploy notifications guide</a> for setup and workflow patterns.</li>
+      <li><strong>Named clearance signals (AMUX-5237).</strong> A board card can now wait on a named signal (<code>amux signal wait &lt;CARD&gt; &lt;name&gt;</code>), and any lane can raise it (<code>amux signal raise &lt;name&gt;</code>). This replaces polling loops and manual check-ins for cross-agent coordination &mdash; the waiting session wakes automatically when the dependency clears.</li>
+      <li><strong>Host pressure guard.</strong> When the host machine is under CPU or memory pressure, amux backs off automation and renices runaway processes. Overnight runs on shared hardware are more stable without throttling adjacent coding agents.</li>
+      <li><strong>Grounded browser observe &rarr; act &rarr; verify.</strong> Browser automation actions now confirm their effect (navigated, dom_mutations, none_observed) rather than returning OK on dispatch alone. Makes browser tasks in n8n-adjacent workflows more reliable. See the <a href="/guides/ai-agent-live-browser-automation/">browser automation guide</a>.</li>
+    </ul>
 
     <h2>How amux Fits Into the Bigger Picture</h2>
     <p>amux is an open-source control plane for running an AI engineering team from a single dashboard or your phone. It launches, monitors, and self-heals dozens of parallel Claude Code, Codex, or Gemini CLI sessions, with built-in kanban, notes, CRM, email, browser automation, and a scheduler. Self-healing, single Rust binary, zero external dependencies, MIT licensed.</p>
