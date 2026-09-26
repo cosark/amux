@@ -5647,6 +5647,37 @@ Requires an active amux cloud subscription; set AMUX_TUNNEL_TOKEN in
 EOF
 }
 
+cmd_pin() {
+  local file="${1:-}"
+  if [[ -z "$file" || "$file" == "-h" || "$file" == "--help" ]]; then
+    echo "Usage: amux pin <file> [--opacity 0.85] [--x 800] [--y 200] [--width 400] [--height 500]"
+    echo "Float a file as an always-on-top macOS overlay window."
+    echo "Supports full markdown rendering with interactive checkboxes and editing."
+    return 0
+  fi
+
+  # Resolve relative paths
+  [[ "$file" = /* ]] || file="$(pwd)/$file"
+
+  if [[ ! -f "$file" ]]; then
+    die "File not found: $file"
+  fi
+
+  local overlay
+  overlay="$(dirname "$(command -v amux 2>/dev/null || echo "$0")")/pinned-overlay"
+  if [[ ! -x "$overlay" ]]; then
+    overlay="$(cd "$(dirname "$0")" && pwd)/scripts/pinned-overlay"
+  fi
+  if [[ ! -x "$overlay" ]]; then
+    die "pinned-overlay binary not found. Compile with: swiftc -O -parse-as-library -o scripts/pinned-overlay scripts/pinned-overlay.swift -framework Cocoa -framework WebKit"
+  fi
+
+  shift
+  "$overlay" "$file" "$@" &
+  disown
+  echo "Pinned: $(basename "$file")"
+}
+
 cmd_alert() {
   # NEVER fire on help/empty (the 38-SMS night, 2026-08-03): a session ran
   # `amux alert --help` to LEARN the command and each probe sent Ethan a real
@@ -6111,6 +6142,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     whoami)           cmd_whoami ;;
     fresh)            shift; cmd_fresh "$@" ;;
     url)              shift; cmd_url "$@" ;;
+    pin)              shift; cmd_pin "$@" ;;
     help|--help|-h)   cmd_help ;;
     version|--version|-v) echo "amux v${CC_VERSION}" ;;
     "")               cmd_dashboard ;;

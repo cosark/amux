@@ -617,6 +617,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-torrents" onclick="switchView('torrents')"><span class="tab-ico">↓</span><span class="tab-lbl">Torrents</span></button>
   <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
   <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
+  <button id="tab-pinned" onclick="switchView('pinned')"><span class="tab-ico">📌</span><span class="tab-lbl">Pinned</span></button>
 </div>
 <div class="tab-customize-wrap">
   <button class="tab-customize-btn" onclick="event.stopPropagation();toggleTabCustomizer()" title="Show/hide tabs">&#x229E;</button>
@@ -1574,6 +1575,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div>Pick <b>Local Shell</b> or enter <b>user@host</b>, then <b>Connect</b>.</div>
     </div>
   </div>
+</div>
+
+<div id="pinned-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;">
+  <div id="pinned-content" style="padding:12px;"></div>
 </div>
 
 <div id="browser-view" style="display:none;flex:1;min-height:0;">

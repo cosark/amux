@@ -67,6 +67,7 @@ pub mod orchestrate;
 pub mod orchestrations;
 pub mod org;
 pub(crate) mod pane_prompts;
+pub mod pinned;
 pub mod planning;
 pub mod policy;
 pub mod prefs;
@@ -288,6 +289,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/crm", crm::routes())
         .nest("/api/speedtest", speedtest::routes())
         .nest("/api/layout-presets", layout_presets::routes())
+        .nest("/api/pinned", pinned::routes())
         // The New Worker / Connect modals' supporting reads (AMUX-2871).
         .merge(worker_create::routes())
         .merge(worker_exec::routes())

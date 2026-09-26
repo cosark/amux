@@ -12190,7 +12190,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1130';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1131';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -27621,7 +27621,7 @@ function switchView(view) {
     ['logs', 'logs', 'flex'], ['messages', 'messages', 'flex'], ['skills', 'skills', 'flex'],
     ['sql', 'sql', 'flex'], ['map', 'map', 'flex'], ['metrics', 'metrics', 'flex'],
     ['cost', 'cost', 'flex'], ['disk', 'disk', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', ''],
-    ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
+    ['browser', 'browser', 'flex'], ['pinned', 'pinned', 'flex'], ['graph', 'graph', 'flex'],
     ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'],
   ];
   for (const [domId, name, display] of _svViews) {
@@ -27641,6 +27641,7 @@ function switchView(view) {
   if (view === 'cost') _costLoad();
   if (view === 'disk') _reclaimLoad(); else if (typeof _reclaimStopPolling === 'function') _reclaimStopPolling();
   if (view === 'browser') _bwInit(); else if (typeof _bwStopLive === 'function') _bwStopLive();
+  if (view === 'pinned') _pinnedLoad();
   if (view === 'journal') _journalInit();
   if (view === 'habits') _habitsLoad();
   if (view === 'skills') _skillsTabLoad();
@@ -47322,4 +47323,150 @@ async function _projectRetry(id,verification=false) {
   try {await _projectRequest('/'+encodeURIComponent(name)+'/tasks/'+encodeURIComponent(id)+'/retry','POST',body);_projectStorage(key,'');}
   catch(e){if(e.status===409)_projectStorage(key,'');_projectError(e);}
   finally{_projectIntakeRetries.delete(key);await _projectsLoad();}
+}
+
+// ── Pinned notes tab ──────────────────────────────────────────────────
+let _pinnedNotes = [];
+
+async function _pinnedLoad() {
+  try {
+    const r = await fetch('/api/pinned');
+    if (r.ok) _pinnedNotes = await r.json();
+  } catch (e) { _pinnedNotes = []; }
+  _pinnedRender();
+}
+
+function _pinnedRender() {
+  const el = document.getElementById('pinned-content');
+  if (!el) return;
+  let html = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">'
+    + '<h2 style="margin:0;font-size:1.1rem;">Pinned Notes</h2>'
+    + '<button class="btn btn-sm" onclick="_pinnedShowAdd()" style="font-size:.82rem;">+ Pin a file</button>'
+    + '</div>';
+
+  html += '<div id="pinned-add-form" style="display:none;margin-bottom:16px;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;">'
+    + '<div style="margin-bottom:8px;font-weight:500;">Select a file to pin</div>'
+    + '<div style="display:flex;gap:8px;align-items:center;">'
+    + '<input type="text" id="pinned-file-input" class="input" placeholder="/path/to/file.md" '
+    + 'style="flex:1;font-size:.85rem;padding:6px 10px;" autocomplete="off">'
+    + '<button class="btn" onclick="_pinnedBrowse()" style="font-size:.82rem;">Browse</button>'
+    + '</div>'
+    + '<div id="pinned-browse-list" style="display:none;margin-top:8px;max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;"></div>'
+    + '<div style="display:flex;gap:8px;margin-top:10px;">'
+    + '<button class="btn btn-sm" onclick="_pinnedCreate()" style="font-size:.82rem;background:var(--accent);color:var(--on-accent);">Pin</button>'
+    + '<button class="btn btn-sm" onclick="document.getElementById(\'pinned-add-form\').style.display=\'none\'" style="font-size:.82rem;">Cancel</button>'
+    + '</div>'
+    + '</div>';
+
+  if (_pinnedNotes.length === 0) {
+    html += '<div style="color:var(--dim);padding:20px;text-align:center;">No pinned notes yet. Pin a markdown file to float it on your desktop.</div>';
+  } else {
+    for (const n of _pinnedNotes) {
+      const name = n.title || n.file_path.split('/').pop();
+      const opPct = Math.round((n.opacity || 0.6) * 100);
+      html += '<div class="pinned-card" style="padding:12px;margin-bottom:8px;background:var(--surface);border:1px solid var(--border);border-radius:8px;">'
+        + '<div style="display:flex;align-items:center;justify-content:space-between;">'
+        + '<div>'
+        + '<div style="font-weight:600;font-size:.95rem;">📌 ' + _escHtml(name) + '</div>'
+        + '<div style="font-size:.78rem;color:var(--dim);margin-top:2px;">' + _escHtml(n.file_path) + '</div>'
+        + '</div>'
+        + '<div style="display:flex;gap:6px;align-items:center;">'
+        + '<span style="font-size:.75rem;color:var(--dim);">' + opPct + '% opacity</span>'
+        + '<input type="range" min="20" max="100" value="' + opPct + '" style="width:60px;accent-color:var(--accent);" '
+        + 'onchange="_pinnedUpdateOpacity(' + n.id + ',this.value)">'
+        + '<button class="btn btn-sm" onclick="_pinnedLaunch(' + n.id + ')" style="font-size:.78rem;" title="Launch floating overlay">▶ Float</button>'
+        + '<button class="btn btn-sm" onclick="_pinnedDelete(' + n.id + ')" style="font-size:.78rem;color:var(--danger);" title="Remove">✕</button>'
+        + '</div>'
+        + '</div>'
+        + '</div>';
+    }
+  }
+  el.innerHTML = html;
+}
+
+function _pinnedShowAdd() {
+  const f = document.getElementById('pinned-add-form');
+  if (f) f.style.display = '';
+}
+
+async function _pinnedBrowse() {
+  const input = document.getElementById('pinned-file-input');
+  const dir = input.value.trim() || (typeof _filesPath !== 'undefined' ? _filesPath : '~');
+  const list = document.getElementById('pinned-browse-list');
+  list.style.display = '';
+  list.innerHTML = '<div style="padding:8px;color:var(--dim);">Loading...</div>';
+  try {
+    const r = await fetch('/api/ls?path=' + encodeURIComponent(dir));
+    const data = await r.json();
+    const entries = data.entries || data || [];
+    let html = '';
+    if (dir !== '/' && dir !== '~') {
+      const parent = dir.replace(/\/[^/]+\/?$/, '') || '/';
+      html += '<div class="pinned-browse-item" style="padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border);" '
+        + 'onclick="_pinnedPickPath(\'' + _escJs(parent) + '\',true)">'
+        + '<span style="color:var(--dim);">↑ ..</span></div>';
+    }
+    for (const e of entries) {
+      const name = e.name || e;
+      const isDir = e.is_dir || name.endsWith('/');
+      const full = dir.replace(/\/$/, '') + '/' + name.replace(/\/$/, '');
+      html += '<div class="pinned-browse-item" style="padding:6px 10px;cursor:pointer;border-bottom:1px solid var(--border);" '
+        + 'onmouseover="this.style.background=\'var(--hover)\'" onmouseout="this.style.background=\'\'" '
+        + 'onclick="_pinnedPickPath(\'' + _escJs(full) + '\',' + isDir + ')">'
+        + (isDir ? '📁 ' : '📄 ') + _escHtml(name) + '</div>';
+    }
+    list.innerHTML = html || '<div style="padding:8px;color:var(--dim);">Empty directory</div>';
+  } catch (e) {
+    list.innerHTML = '<div style="padding:8px;color:var(--danger);">Error listing: ' + _escHtml(e.message) + '</div>';
+  }
+}
+
+function _pinnedPickPath(path, isDir) {
+  const input = document.getElementById('pinned-file-input');
+  input.value = path;
+  if (isDir) _pinnedBrowse();
+  else document.getElementById('pinned-browse-list').style.display = 'none';
+}
+
+function _escJs(s) { return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+
+async function _pinnedCreate() {
+  const input = document.getElementById('pinned-file-input');
+  const fp = input.value.trim();
+  if (!fp) return;
+  try {
+    const r = await fetch('/api/pinned', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_path: fp }),
+    });
+    if (r.ok) {
+      input.value = '';
+      document.getElementById('pinned-add-form').style.display = 'none';
+      await _pinnedLoad();
+    }
+  } catch (e) { console.error('pinned create:', e); }
+}
+
+async function _pinnedLaunch(id) {
+  try {
+    await fetch('/api/pinned/' + id + '/launch', { method: 'POST' });
+  } catch (e) { console.error('pinned launch:', e); }
+}
+
+async function _pinnedUpdateOpacity(id, val) {
+  try {
+    await fetch('/api/pinned/' + id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ opacity: parseInt(val, 10) / 100 }),
+    });
+  } catch (e) { console.error('pinned update opacity:', e); }
+}
+
+async function _pinnedDelete(id) {
+  try {
+    await fetch('/api/pinned/' + id, { method: 'DELETE' });
+    await _pinnedLoad();
+  } catch (e) { console.error('pinned delete:', e); }
 }

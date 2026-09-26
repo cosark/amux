@@ -518,6 +518,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0091_cmd_history_repeat_of",
         sql: include_str!("../../migrations/0091_cmd_history_repeat_of.sql"),
     },
+    Migration {
+        version: 92,
+        name: "0092_pinned_notes",
+        sql: include_str!("../../migrations/0092_pinned_notes.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
