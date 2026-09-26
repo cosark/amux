@@ -1,0 +1,18 @@
+-- 0088: exit code and output tail on a shell schedule run (AMUX-5241).
+--
+-- ADDITIVE ONLY (shared live DB).
+--
+-- WHY: mvs-infra's SCHED-494 preflight errored three hours running and every
+-- run row said only "/Users/ethan/.bash_profile: line 32: ... No such file or
+-- directory". The note kept the first 480 chars of STDERR whenever stderr was
+-- non-empty, and a `bash -lc` command writes its login-shell noise there
+-- first, so the real failure (on stdout, or later on stderr) was cut off and
+-- the exit code was not recorded at all.
+--
+-- `exit_code` is the process's exit status. `output_tail` is the last few KB
+-- of stdout+stderr in arrival order, with known shell-startup noise lines
+-- removed. Both are NULL for tmux deliveries and for every row written before
+-- this migration: NULL means "not recorded", never "exit 0".
+
+-- ADDCOL: schedule_runs exit_code INTEGER
+-- ADDCOL: schedule_runs output_tail TEXT

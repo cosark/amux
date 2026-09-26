@@ -508,6 +508,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0089_board_signals",
         sql: include_str!("../../migrations/0089_board_signals.sql"),
     },
+    Migration {
+        version: 89,
+        name: "0089_schedule_run_shell_output",
+        sql: include_str!("../../migrations/0089_schedule_run_shell_output.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

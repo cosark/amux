@@ -1742,7 +1742,7 @@ pub async fn recent_runs(
         let conn = store.read()?;
         let sql = format!(
             "SELECT sr.id, sr.schedule_id, sr.ran_at, sr.status, sr.note, sr.source,
-                    sr.delivery, sr.submission, s.title
+                    sr.delivery, sr.submission, s.title, sr.exit_code, sr.output_tail
              FROM schedule_runs sr LEFT JOIN schedules s ON s.id = sr.schedule_id
              {} ORDER BY sr.ran_at DESC LIMIT ?1",
             if sched_filter.is_some() {
@@ -1770,6 +1770,11 @@ pub async fn recent_runs(
                 "delivery": r.get::<_, Option<String>>(6)?,
                 "submission": r.get::<_, Option<String>>(7)?,
                 "title": r.get::<_, Option<String>>(8)?,
+                // AMUX-5241: shell runs only. NULL for tmux deliveries and for
+                // every row before migration 0088, which means "not recorded",
+                // never "exit 0".
+                "exit_code": r.get::<_, Option<i64>>(9)?,
+                "output_tail": r.get::<_, Option<String>>(10)?,
             }))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -2391,6 +2396,60 @@ mod tests {
             .unwrap();
         assert_eq!(manual["status"], json!("delivered"));
         assert_eq!(manual["submission"], json!("confirmed"));
+    }
+
+    /// AMUX-5241: a shell run's exit code and output tail reach the runs list.
+    /// A tmux row keeps NULL in both, which is "not recorded", not "exit 0".
+    #[tokio::test]
+    async fn runs_endpoint_shows_shell_exit_code_and_tail() {
+        let (app, dir) = app();
+        let (_, created) = send(
+            &app,
+            "POST",
+            "/api/schedules",
+            Some(json!({ "title": "pf", "schedule_expr": "every 1h", "kind": "shell", "command": "true" })),
+            &SES,
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("sched-api-test.db")).unwrap();
+            scheduler::insert_run(
+                &conn,
+                &id,
+                chrono::Utc::now().timestamp(),
+                &RunOutcome::ShellError {
+                    note: "exit 3: FAIL: gate 7".into(),
+                    output: Some(scheduler::ShellOutput {
+                        exit_code: 3,
+                        tail: "== preflight\nFAIL: gate 7".into(),
+                    }),
+                },
+                "cron-rs",
+                None,
+            )
+            .unwrap();
+            scheduler::insert_run(
+                &conn,
+                &id,
+                chrono::Utc::now().timestamp() + 1,
+                &RunOutcome::Queued {
+                    queue_id: "steer-1".into(),
+                    detail: "queued".into(),
+                },
+                "cron-rs",
+                None,
+            )
+            .unwrap();
+        }
+        let (st, runs) = send(&app, "GET", "/api/schedules/runs", None, &[]).await;
+        assert_eq!(st, StatusCode::OK);
+        let rows = runs.as_array().unwrap();
+        let shell = rows.iter().find(|r| r["delivery"] == json!("shell")).unwrap();
+        assert_eq!(shell["exit_code"], json!(3));
+        assert_eq!(shell["output_tail"], json!("== preflight\nFAIL: gate 7"));
+        let tmux = rows.iter().find(|r| r["delivery"] == json!("queued")).unwrap();
+        assert!(tmux["exit_code"].is_null() && tmux["output_tail"].is_null());
     }
 
     #[tokio::test]

@@ -110,9 +110,25 @@ pub enum RunOutcome {
     /// Delivery was attempted and failed.
     Failed { reason: String },
     /// A `kind=shell` command ran to completion.
-    ShellOk { note: Option<String> },
+    ShellOk {
+        note: Option<String>,
+        output: Option<ShellOutput>,
+    },
     /// A `kind=shell` command failed (non-zero exit, or an exit_actions alert).
-    ShellError { note: String },
+    ShellError {
+        note: String,
+        output: Option<ShellOutput>,
+    },
+}
+
+/// What a finished shell run leaves on its run row (AMUX-5241): the exit code
+/// and the tail of stdout+stderr in arrival order, shell-startup noise removed.
+/// `None` on the outcome means the process never produced one (spawn failure,
+/// or an outcome built by a caller that has no subprocess).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOutput {
+    pub exit_code: i32,
+    pub tail: String,
 }
 
 impl RunOutcome {
@@ -163,8 +179,8 @@ impl RunOutcome {
             }
             RunOutcome::Refused { reason } => Some(format!("refused: {reason}")),
             RunOutcome::Failed { reason } => Some(format!("delivery failed: {reason}")),
-            RunOutcome::ShellOk { note } => note.clone(),
-            RunOutcome::ShellError { note } => Some(note.clone()),
+            RunOutcome::ShellOk { note, .. } => note.clone(),
+            RunOutcome::ShellError { note, .. } => Some(note.clone()),
         }
     }
 
@@ -186,10 +202,20 @@ impl RunOutcome {
     pub fn refusal_reason(&self) -> Option<String> {
         match self {
             RunOutcome::Refused { reason } | RunOutcome::Failed { reason } => Some(reason.clone()),
-            RunOutcome::ShellError { note } => Some(note.clone()),
+            RunOutcome::ShellError { note, .. } => Some(note.clone()),
             RunOutcome::Delivered { .. }
             | RunOutcome::Queued { .. }
             | RunOutcome::ShellOk { .. } => None,
+        }
+    }
+
+    /// The shell run's exit code and output tail, for the run row.
+    pub fn shell_output(&self) -> Option<&ShellOutput> {
+        match self {
+            RunOutcome::ShellOk { output, .. } | RunOutcome::ShellError { output, .. } => {
+                output.as_ref()
+            }
+            _ => None,
         }
     }
 
@@ -1188,8 +1214,9 @@ pub fn insert_run(
     }
     .map(|s| s.chars().take(500).collect());
     conn.execute(
-        "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source, delivery, submission)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source, delivery, submission,
+                                    exit_code, output_tail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             schedule_id,
             ran_at,
@@ -1197,7 +1224,9 @@ pub fn insert_run(
             note,
             source,
             outcome.delivery(),
-            outcome.submission()
+            outcome.submission(),
+            outcome.shell_output().map(|o| o.exit_code),
+            outcome.shell_output().map(|o| o.tail.as_str()),
         ],
     )?;
     Ok(())
@@ -1414,6 +1443,131 @@ fn days_in_month(y: i32, mo: u32) -> Option<u32> {
 /// `subprocess.run(..., timeout=600)`.
 pub const SHELL_TIMEOUT_S: u64 = 600;
 
+/// How much of a shell run's output the run ROW keeps (AMUX-5241). The full
+/// stream is in `~/.amux/shell-runs/<schedule>/`; the row keeps enough to read a
+/// failure from `/api/schedules/runs` without opening a file.
+pub const SHELL_OUTPUT_TAIL_BYTES: usize = 4096;
+/// How much combined output is held in memory while the run is live, so the
+/// tail survives noise filtering. Older bytes are counted, not kept.
+const SHELL_COMBINED_KEEP: usize = 64 * 1024;
+
+/// The rc files a login or interactive shell sources before the command runs.
+const SHELL_STARTUP_FILES: &[&str] = &[
+    ".bash_profile",
+    ".bashrc",
+    ".bash_login",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+];
+
+/// Is this line a shell-startup complaint rather than the command's output?
+///
+/// SCHED-494's command is `bash -lc "..."`, so a login shell sources
+/// ~/.bash_profile first and prints "/Users/ethan/.bash_profile: line 32:
+/// /Users/ethan/google-cloud-sdk/path.bash.inc: No such file or directory" to
+/// stderr on EVERY run. The note kept stderr's head, so three hours of preflight
+/// failures all read as that one line (AMUX-5241). The command owns `-l`, so
+/// the spawn cannot drop it; the fix is to recognise the noise.
+///
+/// Narrow on purpose: the line must START with a path ending in a known rc
+/// file, followed by bash's `: line N:` or zsh's `:N:`. A command that prints
+/// the word ".bashrc" in its own output is not matched.
+pub fn is_shell_startup_noise(line: &str) -> bool {
+    let line = line.trim_start_matches(['-']).trim_start();
+    let line = line
+        .strip_prefix("bash: ")
+        .or_else(|| line.strip_prefix("zsh: "))
+        .unwrap_or(line);
+    if !(line.starts_with('/') || line.starts_with('~')) {
+        return false;
+    }
+    let Some(colon) = line.find(':') else {
+        return false;
+    };
+    let (path, rest) = (&line[..colon], &line[colon + 1..]);
+    if !SHELL_STARTUP_FILES
+        .iter()
+        .any(|f| path.ends_with(&format!("/{f}")))
+    {
+        return false;
+    }
+    let rest = rest.strip_prefix(" line ").unwrap_or(rest);
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with(':')
+}
+
+/// The run row's `output_tail`: the last `max` bytes of combined output with
+/// startup noise removed. Every cut is SAID in the text (no silent caps): the
+/// number of noise lines dropped and whether earlier output was truncated.
+pub fn shell_output_tail(raw: &[u8], dropped_front: usize, max: usize) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let mut noise = 0usize;
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let n = is_shell_startup_noise(l);
+            noise += n as usize;
+            !n
+        })
+        .collect();
+    let body = kept.join("\n");
+    let body = body.trim_end();
+    let mut truncated = dropped_front > 0;
+    let body = if body.len() > max {
+        truncated = true;
+        let mut start = body.len() - max;
+        while !body.is_char_boundary(start) {
+            start += 1;
+        }
+        // Start on a line boundary when one is near, so the first line is whole.
+        match body[start..].find('\n') {
+            Some(nl) if nl < 200 => &body[start + nl + 1..],
+            _ => &body[start..],
+        }
+    } else {
+        body
+    };
+    let mut out = String::new();
+    if truncated {
+        out.push_str("[earlier output not kept here; full log under ~/.amux/shell-runs/]\n");
+    }
+    if noise > 0 {
+        out.push_str(&format!("[{noise} shell-startup noise line(s) removed]\n"));
+    }
+    out.push_str(body);
+    out
+}
+
+/// The note's failure excerpt: the END of the filtered output, because that is
+/// where a failing command says why. The old code kept stderr's HEAD, which for
+/// a `bash -lc` command is the login noise.
+fn failure_excerpt(stdout: &str, stderr: &str, code: i32, chars: usize) -> String {
+    let clean = |t: &str| -> String {
+        t.lines()
+            .filter(|l| !is_shell_startup_noise(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    };
+    let (e, o) = (clean(stderr), clean(stdout));
+    let raw = if !e.is_empty() { e } else { o };
+    let n = raw.chars().count();
+    let raw: String = if n <= chars {
+        raw
+    } else {
+        raw.chars().skip(n - chars).collect()
+    };
+    if raw.is_empty() {
+        format!("exit {code}")
+    } else {
+        format!("exit {code}: {raw}")
+    }
+}
+
 /// Result of atomically claiming a manual shell run. A second tap while the
 /// first process is alive returns the existing row instead of launching the
 /// same side effect twice.
@@ -1545,7 +1699,8 @@ pub fn finish_manual_shell_run(
         .note()
         .map(|s| s.chars().take(500).collect::<String>());
     conn.execute(
-        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4
+        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4,
+                exit_code=?6, output_tail=?7
          WHERE id=?5 AND status='running'",
         rusqlite::params![
             outcome.status(),
@@ -1553,6 +1708,8 @@ pub fn finish_manual_shell_run(
             outcome.delivery(),
             outcome.submission(),
             run_id,
+            outcome.shell_output().map(|o| o.exit_code),
+            outcome.shell_output().map(|o| o.tail.as_str()),
         ],
     )
 }
@@ -1576,7 +1733,8 @@ pub fn finish_cron_run(
     }
     .map(|s| s.chars().take(500).collect());
     conn.execute(
-        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4 \
+        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4, \
+                exit_code=?6, output_tail=?7 \
          WHERE id=?5 AND status='running'",
         rusqlite::params![
             outcome.status(),
@@ -1584,6 +1742,8 @@ pub fn finish_cron_run(
             outcome.delivery(),
             outcome.submission(),
             run_id,
+            outcome.shell_output().map(|o| o.exit_code),
+            outcome.shell_output().map(|o| o.tail.as_str()),
         ],
     )
 }
@@ -1678,7 +1838,10 @@ impl LiveDeliverer {
                         .spawn()
                         .map_err(|e| format!("could not spawn /bin/bash: {e}"))?;
                     let log = std::sync::Arc::new(std::sync::Mutex::new(ShellRunLog::open(path.as_deref())));
-                    let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, log: std::sync::Arc<std::sync::Mutex<ShellRunLog>>| async move {
+                    // Both streams in ARRIVAL order, bounded, for the run row's
+                    // tail (AMUX-5241). (bytes kept, bytes dropped off the front)
+                    let combined = std::sync::Arc::new(std::sync::Mutex::new((Vec::<u8>::new(), 0usize)));
+                    let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, log: std::sync::Arc<std::sync::Mutex<ShellRunLog>>, combined: std::sync::Arc<std::sync::Mutex<(Vec<u8>, usize)>>| async move {
                         let mut all = Vec::new();
                         let mut buf = [0u8; 8192];
                         loop {
@@ -1687,6 +1850,14 @@ impl LiveDeliverer {
                                 Ok(n) => {
                                     all.extend_from_slice(&buf[..n]);
                                     if let Ok(mut l) = log.lock() { l.write(&buf[..n]); }
+                                    if let Ok(mut c) = combined.lock() {
+                                        c.0.extend_from_slice(&buf[..n]);
+                                        if c.0.len() > SHELL_COMBINED_KEEP {
+                                            let cut = c.0.len() - SHELL_COMBINED_KEEP;
+                                            c.0.drain(..cut);
+                                            c.1 += cut;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1695,13 +1866,17 @@ impl LiveDeliverer {
                     let out = child.stdout.take().map(|o| Box::new(o) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
                     let err = child.stderr.take().map(|o| Box::new(o) as Box<dyn tokio::io::AsyncRead + Unpin + Send>);
                     let (o, e) = tokio::join!(
-                        async { match out { Some(r) => pump(r, log.clone()).await, None => Vec::new() } },
-                        async { match err { Some(r) => pump(r, log.clone()).await, None => Vec::new() } },
+                        async { match out { Some(r) => pump(r, log.clone(), combined.clone()).await, None => Vec::new() } },
+                        async { match err { Some(r) => pump(r, log.clone(), combined.clone()).await, None => Vec::new() } },
                     );
                     let status = child.wait().await.map_err(|e| format!("wait failed: {e}"))?;
                     let code = status.code().unwrap_or(-1);
                     if let Ok(mut l) = log.lock() { l.write(format!("\n[exit {code}]\n").as_bytes()); }
-                    Ok::<_, String>((code, String::from_utf8_lossy(&o).into_owned(), String::from_utf8_lossy(&e).into_owned()))
+                    let tail = combined
+                        .lock()
+                        .map(|c| shell_output_tail(&c.0, c.1, SHELL_OUTPUT_TAIL_BYTES))
+                        .unwrap_or_default();
+                    Ok::<_, String>((code, String::from_utf8_lossy(&o).into_owned(), String::from_utf8_lossy(&e).into_owned(), tail))
                 };
                 match tokio::time::timeout(std::time::Duration::from_secs(SHELL_TIMEOUT_S), fut).await {
                     Ok(r) => r,
@@ -1713,7 +1888,7 @@ impl LiveDeliverer {
             }
         };
 
-        let (mut code, mut stdout, mut stderr) = match run_once(command.clone()).await {
+        let (mut code, mut stdout, mut stderr, mut tail) = match run_once(command.clone()).await {
             Ok(t) => t,
             Err(e) => return RunOutcome::Failed { reason: e },
         };
@@ -1725,7 +1900,7 @@ impl LiveDeliverer {
         if act == "retry_once_then_alert" && code != 0 {
             match run_once(command).await {
                 Ok(t) => {
-                    (code, stdout, stderr) = t;
+                    (code, stdout, stderr, tail) = t;
                     act = if code != 0 {
                         "alert".into()
                     } else {
@@ -1735,31 +1910,38 @@ impl LiveDeliverer {
                 Err(e) => return RunOutcome::Failed { reason: e },
             }
         }
-        let reason = |s: usize| -> String {
-            let raw = if !stderr.trim().is_empty() {
-                &stderr
-            } else {
-                &stdout
-            };
-            let raw = if raw.trim().is_empty() {
-                format!("exit {code}")
-            } else {
-                raw.clone()
-            };
-            raw.chars().take(s).collect()
-        };
+        let reason = |s: usize| -> String { failure_excerpt(&stdout, &stderr, code, s) };
+        let output = Some(ShellOutput {
+            exit_code: code,
+            tail: tail.clone(),
+        });
+        tracing::info!(
+            schedule = %sched.id(),
+            exit_code = code,
+            tail_bytes = tail.len(),
+            verdict = if code == 0 { "shell_run_output_recorded" } else { "shell_run_failed_output_recorded" },
+            "shell schedule finished; exit code and filtered output tail stored on the run row (AMUX-5241)"
+        );
         if act == "alert" || (act.is_empty() && code != 0 && !actions.is_empty()) {
             let why = reason(400);
-            self.wake_owner(sched, code, &why).await;
+            // `why` already leads with "exit N"; keep the action tag beside it.
+            let detail = why
+                .strip_prefix(&format!("exit {code}"))
+                .unwrap_or(&why)
+                .trim_start_matches(':')
+                .trim_start()
+                .to_string();
+            self.wake_owner(sched, code, &detail).await;
             return RunOutcome::ShellError {
                 note: format!(
-                    "exit {code} [{}] {why}",
+                    "exit {code} [{}] {detail}",
                     if act.is_empty() {
                         "alert-default"
                     } else {
                         &act
                     }
                 ),
+                output,
             };
         }
         if act == "noop" || act == "log" || (!actions.is_empty() && code == 0) {
@@ -1769,14 +1951,19 @@ impl LiveDeliverer {
                     "exit {code} [{}] {body}",
                     if act.is_empty() { "ok" } else { &act }
                 )),
+                output,
             };
         }
         if code != 0 {
-            return RunOutcome::ShellError { note: reason(480) };
+            return RunOutcome::ShellError {
+                note: reason(480),
+                output,
+            };
         }
         RunOutcome::ShellOk {
             note: Some(stdout.chars().take(480).collect::<String>())
                 .filter(|s| !s.trim().is_empty()),
+            output,
         }
     }
 
@@ -2514,6 +2701,96 @@ pub async fn run_scheduler(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod shell_output_tests {
+    use super::*;
+
+    /// The exact stderr SCHED-494 stored as its whole run record on 2026-09-26.
+    const BASH_PROFILE_NOISE: &str = "/Users/ethan/.bash_profile: line 32: /Users/ethan/google-cloud-sdk/path.bash.inc: No such file or directory\n/Users/ethan/.bash_profile: line 33: /Users/ethan/google-cloud-sdk/completion.bash.inc: No such file or directory\n";
+
+    #[test]
+    fn startup_noise_is_recognised_narrowly() {
+        for l in BASH_PROFILE_NOISE.lines() {
+            assert!(is_shell_startup_noise(l), "{l}");
+        }
+        assert!(is_shell_startup_noise("/Users/x/.zshrc:12: command not found: nvm"));
+        assert!(is_shell_startup_noise("bash: /Users/x/.bashrc: line 4: foo: command not found"));
+        // A command's own output that merely mentions an rc file is kept.
+        for keep in [
+            "sourcing ~/.bashrc failed earlier",
+            "FAIL: gate 7 (shard metrics)",
+            "/Users/x/project/.bashrc.example: line 3: not an rc file",
+            "/Users/x/.bash_profile has been updated",
+        ] {
+            assert!(!is_shell_startup_noise(keep), "{keep}");
+        }
+    }
+
+    /// The pre-fix shape: stderr is ONLY the noise, the real failure is on
+    /// stdout. The old note kept stderr's head and showed only the noise.
+    #[test]
+    fn the_sched_494_shape_yields_the_real_failure() {
+        let stdout = "== preflight (seed 1)\n== FAIL: 14 of 15 gates passed; gate 7 timed out\n";
+        let note = failure_excerpt(stdout, BASH_PROFILE_NOISE, 1, 480);
+        assert!(note.starts_with("exit 1: "), "{note}");
+        assert!(note.contains("gate 7 timed out"), "{note}");
+        assert!(!note.contains(".bash_profile"), "{note}");
+
+        let combined = format!("{BASH_PROFILE_NOISE}{stdout}");
+        let tail = shell_output_tail(combined.as_bytes(), 0, SHELL_OUTPUT_TAIL_BYTES);
+        assert!(tail.contains("[2 shell-startup noise line(s) removed]"), "{tail}");
+        assert!(tail.ends_with("gate 7 timed out"), "{tail}");
+        assert!(!tail.contains("google-cloud-sdk"), "{tail}");
+        // Nothing at all: the exit code alone, never an empty note.
+        assert_eq!(failure_excerpt("", BASH_PROFILE_NOISE, 2, 480), "exit 2");
+    }
+
+    /// Bounded, and the cut is SAID rather than silent.
+    #[test]
+    fn the_tail_is_bounded_and_says_when_it_cut() {
+        let big: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+        let tail = shell_output_tail(big.as_bytes(), 0, 4096);
+        assert!(tail.len() <= 4096 + 100, "{}", tail.len());
+        assert!(tail.starts_with("[earlier output not kept here"), "{}", &tail[..80]);
+        assert!(tail.ends_with("line 1999"));
+        // Bytes dropped while the run was live are also announced.
+        let small = shell_output_tail(b"ok\n", 10, 4096);
+        assert!(small.starts_with("[earlier output not kept here"));
+        // A short clean run is stored verbatim.
+        assert_eq!(shell_output_tail(b"all good\n", 0, 4096), "all good");
+        // A multi-byte boundary cannot panic.
+        let wide = "\u{00e9}".repeat(5000);
+        let _ = shell_output_tail(wide.as_bytes(), 0, 4097);
+    }
+
+    /// Exit code and tail land in the row, through the real insert.
+    #[test]
+    fn insert_run_stores_exit_code_and_tail() {
+        let d = tempfile::tempdir().unwrap();
+        // Store::open runs the real migrations (0088 included); then write
+        // through a plain connection, the way the API test does.
+        let _store = crate::db::Store::open(&d.path().join("t.db")).unwrap();
+        let conn = rusqlite::Connection::open(d.path().join("t.db")).unwrap();
+        let out = RunOutcome::ShellError {
+            note: "exit 1: boom".into(),
+            output: Some(ShellOutput {
+                exit_code: 1,
+                tail: "boom".into(),
+            }),
+        };
+        insert_run(&conn, "SCHED-1", 1, &out, "cron-rs", None).unwrap();
+        let (code, tail): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT exit_code, output_tail FROM schedule_runs WHERE schedule_id='SCHED-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(code, Some(1));
+        assert_eq!(tail.as_deref(), Some("boom"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// AMUX-3546: a cadence has a number, and it is the number nobody saw.
     ///
@@ -2665,7 +2942,8 @@ mod tests {
         );
         assert_eq!(
             RunOutcome::ShellError {
-                note: "exit 1".into()
+                note: "exit 1".into(),
+                output: None,
             }
             .refusal_reason(),
             Some("exit 1".to_string())
@@ -2686,7 +2964,7 @@ mod tests {
             .refusal_reason(),
             None
         );
-        assert_eq!(RunOutcome::ShellOk { note: None }.refusal_reason(), None);
+        assert_eq!(RunOutcome::ShellOk { note: None, output: None }.refusal_reason(), None);
     }
 
     fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
@@ -3237,6 +3515,7 @@ mod tests {
                     run_id,
                     &RunOutcome::ShellOk {
                         note: Some("exit 0; anomaly relayed".into()),
+                        output: None,
                     },
                 )?;
                 Ok(WriteOutcome {
@@ -3983,6 +4262,7 @@ mod tests {
             },
             RunOutcome::ShellError {
                 note: "exit 1".into(),
+                output: None,
             },
         ];
         for o in &undelivered {
@@ -4008,9 +4288,9 @@ mod tests {
             detail: String::new()
         }
         .landed());
-        assert!(RunOutcome::ShellOk { note: None }.landed());
+        assert!(RunOutcome::ShellOk { note: None, output: None }.landed());
         // ...and only ShellOk yields the word `ok`, from a finished subprocess.
-        assert_eq!(RunOutcome::ShellOk { note: None }.status(), "ok");
+        assert_eq!(RunOutcome::ShellOk { note: None, output: None }.status(), "ok");
         assert_eq!(
             RunOutcome::Delivered {
                 submission: "confirmed".into(),
@@ -4063,6 +4343,7 @@ mod tests {
             },
             RunOutcome::ShellError {
                 note: "exit 1".into(),
+                output: None,
             },
         ] {
             assert!(o.lost(), "{o:?} reached nobody and is not pending");
