@@ -27,13 +27,24 @@ REPO=${AMUX_REPO_DIR:-$HOME/Dev/amux}
 # observed without a real multi-minute cleanup run.
 TICK_CMD=${AMUX_CLEANUP_FALLBACK_TICK:-}
 
-if [ -f "$LAST" ] && [ -z "$(find "$LAST" -mmin "+$STALE_MIN" 2>/dev/null)" ]; then
+# A tick in progress holds this lock (mac-cleanup-tick.sh, tick_lock).
+LOCK="${AMUX_CLEANUP_STATE_DIR:-$HOME/.amux/logs/mac-cleanup}/tick.lock"
+if [ -d "$LOCK" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+  echo "mac-cleanup-fallback: $(date '+%F %T') a tick is running (lock held), nothing to do"
+  exit 0
+fi
+# FRESH IS NOT ENOUGH: IT HAS TO HAVE FINISHED. The scheduler runs the tick as a
+# child of the amux server, which restarts on every deploy, and on 2026-09-26 a
+# restart killed a tick after its cargo arm. Its output was 10 lines, a minute
+# old, and read as "the scheduler ran" to a check that only looked at the age.
+if [ -f "$LAST" ] && [ -z "$(find "$LAST" -mmin "+$STALE_MIN" 2>/dev/null)" ] && grep -q '^mac-cleanup: done' "$LAST"; then
   echo "mac-cleanup-fallback: $(date '+%F %T') scheduler ran within ${STALE_MIN}m, nothing to do"
   exit 0
 fi
 if [ -f "$LAST" ]; then
   age_min=$(( ( $(date +%s) - $(stat -f %m "$LAST" 2>/dev/null || stat -c %Y "$LAST") ) / 60 ))
-  why="last tick output is ${age_min}m old (over ${STALE_MIN}m)"
+  if grep -q '^mac-cleanup: done' "$LAST"; then why="last tick output is ${age_min}m old (over ${STALE_MIN}m)"
+  else why="the last tick (${age_min}m ago) did not finish: no done line and no tick running, so it was killed"; fi
 else
   why="no tick output at $LAST"
 fi
@@ -64,6 +75,6 @@ if [ -z "${AMUX_CLEANUP_FALLBACK_TICK:-}" ] || [ -n "${AMUX_CLEANUP_FALLBACK_LIB
   # shellcheck source=/dev/null
   AMUX_CLEANUP_LIB_ONLY=1 . "$L"
   rm -f -- "${L:?}"
-  echo "mac-cleanup-fallback: scheduler-silent card: $(file_card "$STATE_DIR/state" "scheduler_silent" "SCHED-465 did not run: launchd ran the Mac cleanup tick instead" "The fallback found that $why, so the amux scheduler (inside the server) is not firing SCHED-465. launchd ran the tick; its output is $LAST. Check amux server health and the scheduler.")"
+  echo "mac-cleanup-fallback: scheduler-silent card: $(file_card "$STATE_DIR/state" "scheduler_silent" "SCHED-465 did not complete: launchd ran the Mac cleanup tick instead" "The fallback found that $why, so the amux scheduler (inside the server) is not firing SCHED-465. launchd ran the tick; its output is $LAST. Check amux server health and the scheduler.")"
 fi
 exit "$rc"
