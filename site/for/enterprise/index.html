@@ -45,7 +45,7 @@
     "description": "Enterprise engineering teams use amux to run parallel AI coding agents at scale — self-hosted, audit-logged, no vendor lock-in. Claude Code, Codex CLI, and Gemini CLI on your own infrastructure.",
     "url": "https://amux.io/for/enterprise/",
     "datePublished": "2026-07-17",
-    "dateModified": "2026-07-17",
+    "dateModified": "2026-09-26",
     "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io"},
     "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io", "logo": {"@type": "ImageObject", "url": "https://amux.io/icon.png"}},
     "image": "https://amux.io/og-image.png",
@@ -118,14 +118,19 @@
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/for/">For Developers</a> <span class="sep">›</span> <span>Enterprise</span></div>
 
+    <div style="background:#0d7c42;color:#fff;border-radius:8px;padding:1rem 1.4rem;margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span><strong>amux</strong> &mdash; self-hosted AI agent control plane for enterprise teams. Audit logs, CLAUDE.md enforcement, multi-runtime, zero external deps. 503+ stars.</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#fff;color:#0d7c42;font-weight:600;padding:0.45rem 1rem;border-radius:6px;white-space:nowrap;text-decoration:none" onclick="posthog.capture('exp093_enterprise_topofpage_cta_click')">&#11088; Star on GitHub</a>
+    </div>
+
     <h1>amux for Enterprise Engineering Teams</h1>
-    <p class="subtitle">Run a parallel AI engineering team on your own infrastructure. Self-hosted, audit-logged, no vendor lock-in — Claude Code, Codex, and Gemini CLI agents working from a shared task board across all your repositories. <em>Published July 2026.</em></p>
+    <p class="subtitle">Run a parallel AI engineering team on your own infrastructure. Self-hosted, audit-logged, no vendor lock-in — Claude Code, Codex, and Gemini CLI agents working from a shared task board across all your repositories. <em>Updated September 2026.</em></p>
 
     <div class="answer-box" style="border-left:4px solid var(--accent);background:var(--card);padding:1rem 1.25rem;border-radius:0 6px 6px 0;margin:1.5rem 0;">
       <strong>Quick answer:</strong> amux is a self-hosted, single-binary control plane that gives enterprise engineering teams a shared dashboard for running dozens of parallel AI coding agents (Claude Code, Codex CLI, Gemini CLI) with atomic task coordination, per-repo CLAUDE.md style enforcement, append-only audit logs, and zero external dependencies. It deploys on any Linux server your team controls. Code never leaves your network.
     </div>
 
-    <p>amux is an open-source control plane for AI agent teams. It launches, monitors, and self-heals simultaneous AI coding sessions across every repository your team owns — with a shared kanban board for task coordination, event-sourced execution logs for compliance, and CLAUDE.md–enforced code quality standards. One Rust binary. Zero external services. Deploy on a VM inside your VPC. 300 GitHub stars, MIT + Commons Clause licensed.</p>
+    <p>amux is an open-source control plane for AI agent teams. It launches, monitors, and self-heals simultaneous AI coding sessions across every repository your team owns — with a shared kanban board for task coordination, event-sourced execution logs for compliance, and CLAUDE.md&ndash;enforced code quality standards. One Rust binary. Zero external services. Deploy on a VM inside your VPC. 503+ GitHub stars, MIT + Commons Clause licensed.</p>
 
     <h2>What enterprise engineering teams are solving with AI agents in 2026</h2>
     <p>The question most engineering leaders are navigating right now is not whether to use AI coding agents — it is how to use them at team scale without losing code quality, introducing security risk, or creating an ungoverned shadow-IT situation where individual engineers run agents however they prefer.</p>
@@ -263,7 +268,7 @@ amux board add "Write integration tests for PaymentProcessor class"
           <tr>
             <td style="padding:10px 16px;">Ops overhead</td>
             <td style="padding:10px 16px;">None (but ungoverned)</td>
-            <td style="padding:10px 16px;">Single Rust binary, no Docker, auto-restarts on file save</td>
+            <td style="padding:10px 16px;">Single Rust binary, no Docker, auto-restarts on new commits</td>
           </tr>
         </tbody>
       </table>
