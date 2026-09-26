@@ -9745,13 +9745,21 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     if let Some(inner) = m.strip_prefix("auto-wake failed: ") {
         return send_failure_status(inner);
     }
-    // --- 409: the target exists and is deliberately closed to this caller.
+    // --- 403: the target exists and is deliberately closed to this caller.
     //     An isolated lane refuses amux automation and takes the owner's send
     //     (AMUX-3764), so this is a policy refusal with an obvious next step,
     //     not a fault. 500 would file it as a bug and send someone debugging.
-    if m.starts_with("target is an isolated (raw-agent) worker") {
+    //
+    //     403, NOT 409 (AMUX-5241). The peer-send gate (`isolated_peer_refusal`)
+    //     already answered 403 with `code: isolated_target`, while this arm,
+    //     reached by every automated producer that goes through the send path,
+    //     answered 409 like a transient state. desktop's scheduled escalation
+    //     into an isolated lane read as "retry later" and the first scoring
+    //     round was lost. One refusal, one status, one code: see
+    //     `send_failure_code`.
+    if m.starts_with(ISOLATED_REFUSAL_PREFIX) {
         return (
-            StatusCode::CONFLICT,
+            StatusCode::FORBIDDEN,
             Some(
                 "this lane is isolated: amux automation is not delivered into it. Send as the \
                  owner, or clear CC_ISOLATED on the lane if it should take automation.",
@@ -9885,6 +9893,24 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     (StatusCode::INTERNAL_SERVER_ERROR, None)
 }
 
+/// The literal every isolation refusal starts with. Shared by the classifier
+/// and `send_failure_code` so the status and the code cannot drift apart.
+pub(crate) const ISOLATED_REFUSAL_PREFIX: &str = "target is an isolated (raw-agent) worker";
+
+/// A machine-readable code for a send refusal, beside the HTTP status.
+///
+/// Only isolation has one today, and it is the SAME `isolated_target` code the
+/// peer gate (`isolated_peer_refusal`) has always returned, so a caller can
+/// branch on one field no matter which layer refused (AMUX-5241). The
+/// "auto-wake failed: " wrapper is unwrapped the same way
+/// `send_failure_status` unwraps it.
+pub(crate) fn send_failure_code(msg: &str) -> Option<&'static str> {
+    let m = msg.trim();
+    let m = m.strip_prefix("auto-wake failed: ").unwrap_or(m);
+    m.starts_with(ISOLATED_REFUSAL_PREFIX)
+        .then_some("isolated_target")
+}
+
 /// A verb's `(ok, msg)` rendered as its HTTP answer, classified by
 /// [`send_failure_status`]. Shared by `archive`/`wake`/`reset` so they cannot
 /// disagree with `send` about what "session is blocked" costs — all three used
@@ -9898,6 +9924,9 @@ fn verb_resp(ok: bool, msg: String) -> Response {
     let mut body = json!({"ok": ok, "message": msg});
     if let Some(fix) = fix {
         body["fix"] = json!(fix);
+    }
+    if let Some(c) = (!ok).then(|| send_failure_code(&msg)).flatten() {
+        body["code"] = json!(c);
     }
     jresp(code, body)
 }
@@ -23267,14 +23296,21 @@ pub(crate) async fn steer_mutate(
             Ok(id) => id,
             Err(reason) => {
                 send_dedup_forget(state, name, &dedup_id).await;
+                // Isolation answers 403 isolated_target here too, the same as
+                // the peer gate and `send_failure_status` (AMUX-5241).
+                let code = send_failure_code(reason);
+                let mut body = json!({
+                    "ok": false,
+                    "error": block_reason_refused(reason, name),
+                    "blocked_reason": reason,
+                    "deliverable": false,
+                });
+                if let Some(c) = code {
+                    body["code"] = json!(c);
+                }
                 return jresp(
-                    StatusCode::CONFLICT,
-                    json!({
-                        "ok": false,
-                        "error": block_reason_refused(reason, name),
-                        "blocked_reason": reason,
-                        "deliverable": false,
-                    }),
+                    if code.is_some() { StatusCode::FORBIDDEN } else { StatusCode::CONFLICT },
+                    body,
                 );
             }
         };
@@ -25310,6 +25346,9 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     }
     if let Some(fix) = fix {
         resp["fix"] = json!(fix);
+    }
+    if let Some(c) = (!ok).then(|| send_failure_code(&msg)).flatten() {
+        resp["code"] = json!(c);
     }
     if no_effect {
         resp["effect"] = json!("none");
@@ -46122,6 +46161,40 @@ mod refusal_status_tests {
             assert_eq!(code, StatusCode::CONFLICT, "{msg}");
             assert!(fix.is_some(), "{msg} must carry a next step");
         }
+    }
+
+    /// AMUX-5241: an isolation refusal from the SEND PATH answers 403 with
+    /// `code: isolated_target`, the same pair the peer gate returns. The pre-fix
+    /// shape was 409 with no code, which a caller reads as "retry later".
+    /// Both literals are the ones the two refusing sites actually produce, and
+    /// the auto-wake wrapper must not hide the code.
+    #[test]
+    fn an_isolation_refusal_is_403_isolated_target_at_every_layer() {
+        let queue = "target is an isolated (raw-agent) worker: amux automation is not \
+                    delivered into it. The owner's own send still works.";
+        let direct = isolation_refusal_literal_for_test();
+        for msg in [queue.to_string(), direct.to_string(), format!("auto-wake failed: {queue}")] {
+            let (code, fix) = send_failure_status(&msg);
+            assert_eq!(code, StatusCode::FORBIDDEN, "{msg}");
+            assert!(fix.is_some(), "{msg} must carry a next step");
+            assert_eq!(send_failure_code(&msg), Some("isolated_target"), "{msg}");
+        }
+        // Not everything grows a code: a paused lane is a different refusal.
+        assert_eq!(send_failure_code("target is paused: amux automation"), None);
+        assert_eq!(send_failure_code("not running"), None);
+    }
+
+    fn isolation_refusal_literal_for_test() -> &'static str {
+        // The literal `isolation_refusal` returns, read from the source so a
+        // reworded refusal cannot silently fall out of the classifier.
+        let src = include_str!("session_verbs.rs");
+        let at = src
+            .find("pub(crate) fn isolation_refusal(")
+            .expect("isolation_refusal exists");
+        let lit = &src[at..];
+        let open = lit.find("\"target is an isolated").expect("literal") + 1;
+        let close = lit[open..].find('\\').expect("continuation") + open;
+        Box::leak(lit[open..close].to_string().into_boxed_str())
     }
 
     /// The non-409 cells, so "everything became a 409" cannot pass either.

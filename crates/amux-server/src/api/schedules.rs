@@ -661,6 +661,61 @@ fn cadence_note(expr: &str, kind: &str) -> Option<Value> {
     Some(json!(note))
 }
 
+/// A warning for a schedule whose target lane is isolated (AMUX-5241).
+///
+/// desktop's scheduled escalation into an isolated lane was refused and nothing
+/// said so at the one moment it was cheap to hear: creation. Since 2c1d5481 a
+/// schedule's OWN command is delivered into an isolated worker as owner input,
+/// so the schedule itself works. What does not is everything it sets in motion
+/// that is not the schedule: a peer relay, a board nudge or a callback into that
+/// lane answers 403 `isolated_target`. That boundary is what the caller needs to
+/// know before relying on the schedule for an escalation chain.
+///
+/// STATES, NEVER REFUSES, like `cadence_note`: isolated workers are allowed
+/// schedules (Ethan, 2026-09-26). Pure on `isolated` so the wording is
+/// testable without an AMUX_HOME.
+fn isolated_target_note(session: &str, kind: &str, isolated: bool) -> Option<Value> {
+    if !isolated || session.trim().is_empty() {
+        return None;
+    }
+    let what = if kind == "shell" {
+        "A shell schedule runs on the host and only reaches the lane to report a failure, \
+         which is delivered."
+    } else {
+        "This schedule's own command IS delivered, as owner input (a schedule is standing \
+         configuration of the worker)."
+    };
+    Some(json!({
+        "code": "isolated_target",
+        "session": session,
+        "message": format!(
+            "target '{session}' is an isolated (raw-agent) worker. {what} Anything else aimed \
+             at it is refused with 403 code isolated_target: peer sends (amux send from \
+             another lane), board nudges and task callbacks. If this schedule is meant to \
+             start a chain that messages '{session}' from another lane, that step will fail; \
+             clear CC_ISOLATED on the lane or deliver from the owner instead."
+        ),
+    }))
+}
+
+/// Attach [`isolated_target_note`] to a create/PATCH response, with its log line.
+fn attach_isolated_note(o: &mut serde_json::Map<String, Value>, verb: &str) {
+    let session = o.get("session").and_then(Value::as_str).unwrap_or("").to_string();
+    let kind = o.get("kind").and_then(Value::as_str).unwrap_or("tmux").to_string();
+    let isolated = !session.trim().is_empty()
+        && crate::api::session_verbs::session_is_isolated(&session);
+    if let Some(n) = isolated_target_note(&session, &kind, isolated) {
+        let id = o.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        tracing::info!(
+            schedule = %id,
+            session = %session, kind = %kind, verb,
+            verdict = "schedule_target_isolated",
+            "schedule targets an isolated worker; warned in the response (AMUX-5241)"
+        );
+        o.insert("isolated_target".into(), n);
+    }
+}
+
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -876,6 +931,7 @@ pub async fn create(
                 if let Some(n) = cadence_note(&expr, &kind) {
                     o.insert("cadence_note".into(), n);
                 }
+                attach_isolated_note(o, "create");
             }
             if kind_defaulted {
                 if let Value::Object(o) = &mut body {
@@ -1158,6 +1214,7 @@ pub async fn patch(
                     if let Some(n) = cadence_note(&expr, &kind) {
                         o.insert("cadence_note".into(), n);
                     }
+                    attach_isolated_note(o, "patch");
                 }
                 Json(v).into_response()
             }
@@ -1841,6 +1898,20 @@ mod tests {
     ///
     /// `every 15m` is the card's own specimen: eleven characters, 96 turns a
     /// day, five of them enabled on the machine that motivated this.
+    #[test]
+    fn an_isolated_target_is_warned_and_an_ordinary_one_is_not() {
+        // AMUX-5241. The pre-fix response carried no such field at all, so the
+        // absent case is the old shape and must stay absent for normal lanes.
+        assert!(super::isolated_target_note("desktop", "tmux", false).is_none());
+        assert!(super::isolated_target_note("", "tmux", true).is_none());
+        let n = super::isolated_target_note("random", "tmux", true).expect("warned");
+        assert_eq!(n["code"], "isolated_target");
+        let m = n["message"].as_str().unwrap();
+        assert!(m.contains("'random'") && m.contains("403") && m.contains("IS delivered"), "{m}");
+        let sh = super::isolated_target_note("random", "shell", true).expect("warned");
+        assert!(sh["message"].as_str().unwrap().contains("runs on the host"));
+    }
+
     #[test]
     fn a_cadence_note_states_the_rate_and_never_refuses() {
         let n = super::cadence_note("every 15m", "tmux").expect("countable");
