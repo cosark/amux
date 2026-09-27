@@ -96,6 +96,10 @@ AMUX_RS_PORT=8824 ~/.local/bin/amux-server-rs
 
 > **License:** [MIT + Commons Clause](LICENSE) — free to use, modify, and self-host. Commercial resale requires a separate license.
 
+## ☁️ One-Click Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/AMUX/)
+
 ## Which server is real?
 
 **The Rust server (`crates/amux-server`, port 8824).** That is what `./install.sh` installs, what the dashboard talks to, and where all new work lands. Every `/api` family answers natively; the live proof is `GET /api/debug/boundary`, which reports `proxied: []`. If you are reading code, start in `crates/` — it is the only server code in the tree. The same binary also answers the retired port 8822 while a compatibility bind survives (see [Legacy](#legacy-the-python-server)), so there is no second server to reason about; the Python predecessor is gone.
