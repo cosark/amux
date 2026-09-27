@@ -12190,7 +12190,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1132';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1136';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -26423,6 +26423,7 @@ document.addEventListener('keydown', (e) => {
 
 // ═══════ LAYOUT MODES (list / grid) ═══════
 let layoutMode = localStorage.getItem('amux_layout') || 'grid';
+let _workersPerRow = localStorage.getItem('amux_workers_per_row') || 'auto';
 let sortMode = localStorage.getItem('amux_sort_mode') || 'status';
 // A mode persisted by an older build (or hand-edited) must not leave the
 // list sorting by a comparator that no longer exists.
@@ -26577,7 +26578,31 @@ function setLayoutMode(mode) {
   if (cards) cards.classList.toggle('grid-mode', mode === 'grid');
   if (mode === 'group') destroySortable();
   render();
+  _applyWorkersPerRow();
   _updateResetBtn();
+}
+
+function _applyWorkersPerRow() {
+  const cards = document.querySelector('.cards');
+  if (!cards) return;
+  if (_workersPerRow === 'auto' || !_workersPerRow) {
+    cards.style.removeProperty('grid-template-columns');
+  } else {
+    const n = parseInt(_workersPerRow, 10);
+    if (n >= 1 && n <= 6) cards.style.gridTemplateColumns = 'repeat(' + n + ', 1fr)';
+  }
+}
+
+function saveWorkersPerRow(val) {
+  _workersPerRow = val || 'auto';
+  if (_workersPerRow === 'auto') {
+    localStorage.removeItem('amux_workers_per_row');
+  } else {
+    localStorage.setItem('amux_workers_per_row', _workersPerRow);
+  }
+  _applyWorkersPerRow();
+  const label = document.getElementById('settings-wpr-current');
+  if (label) label.textContent = _workersPerRow === 'auto' ? 'Auto' : _workersPerRow + ' per row';
 }
 
 // Sort options. 'human' exists because "last activity" is dominated by
@@ -26705,6 +26730,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if (layoutMode === 'group' || (layoutMode === 'grid' && window.innerWidth < 900)) layoutMode = 'list';
     setTimeout(initSortable, 200);
   }
+  _applyWorkersPerRow();
   const sortBtn = document.getElementById('tile-sort-btn');
   if (sortBtn) sortBtn.classList.toggle('active', sortMode !== 'natural');
   const freezeBtn = document.getElementById('tile-freeze-btn');
@@ -37714,6 +37740,11 @@ function toggleSettings() {
       else if (/Linux/.test(ua)) auto = 'Linux';
       inp.placeholder = custom ? 'Override (' + auto + ')' : auto + ' (auto-detected)';
     }
+    // Workers per row
+    const wprSel = document.getElementById('settings-wpr-select');
+    if (wprSel) wprSel.value = _workersPerRow || 'auto';
+    const wprLbl = document.getElementById('settings-wpr-current');
+    if (wprLbl) wprLbl.textContent = (!_workersPerRow || _workersPerRow === 'auto') ? 'Auto' : _workersPerRow + ' per row';
     // Render connections
     _renderInstanceSwitcher();
     // Owner access link — only shown to the owner (who has _authToken)
