@@ -616,7 +616,25 @@
   .chat-meta { font-size: 0.7rem; color: var(--dim); margin-top: 3px; padding: 0 4px; }
   .chat-msg.is-error .chat-bubble { border-color: var(--red, #f85149); }
   .chat-error { display: block; color: var(--red, #f85149); font-weight: 600; margin-bottom: 4px; white-space: pre-wrap; }
-  .chat-tool { font-size: 0.75rem; color: var(--dim); margin-top: 6px; font-style: italic; }
+  .chat-tools { margin-bottom: 6px; }
+  .chat-tools:last-child { margin-bottom: 0; }
+  .chat-tools-toggle {
+    display: flex; align-items: center; gap: 5px; width: 100%; text-align: left;
+    background: none; border: none; padding: 6px 4px; margin: -6px -4px 0; cursor: pointer;
+    font-size: 0.75rem; color: var(--dim); font-style: italic; min-height: 32px;
+    /* Full-width row, so a 32px hit area (not the 44px css-mobile.md asks for)
+       is a deliberate width-for-height trade in a narrow chat bubble, not an
+       oversight — same precedent as .sched-toggle-label above. */
+  }
+  .chat-tools-toggle:hover, .chat-tools-toggle:active { color: var(--text); }
+  .chat-tools-caret { flex-shrink: 0; font-size: 0.65rem; }
+  .chat-tools-list { margin-top: 4px; padding-left: 4px; border-left: 2px solid var(--border); }
+  .chat-tool-item {
+    font-size: 0.78rem; color: var(--dim); font-family: var(--font-mono, monospace);
+    padding: 2px 0 2px 8px; overflow-wrap: anywhere;
+  }
+  .chat-tool-item.is-active { color: var(--accent); }
+  .chat-tool-item.is-active::after { content: '\2026'; }
   .chat-empty, .chat-queued { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 16px 8px; }
   .chat-queued { padding: 4px; font-size: 0.75rem; }
   .chat-typing { display: inline-flex; gap: 4px; padding: 4px 0; }

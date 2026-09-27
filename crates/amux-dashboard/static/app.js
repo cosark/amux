@@ -12190,7 +12190,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1131';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1132';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -12476,6 +12476,7 @@ const _chat = { name: null, es: null, messages: [], streaming: null, loadedAt: 0
 function _chatUnmount() {
   if (_chat.es) { try { _chat.es.close(); } catch (e) {} }
   _chat.es = null; _chat.name = null; _chat.messages = []; _chat.streaming = null; _chat.gen++;
+  for (const k in _chatToolsOpen) delete _chatToolsOpen[k];
   const body = document.getElementById('peek-body');
   if (body) body.classList.remove('peek-chat');
 }
@@ -12517,7 +12518,7 @@ function _chatConnect(name) {
       if (!_chat.streaming || _chat.streaming.turn_id !== m.turn_id) _chat.streaming = { turn_id: m.turn_id, text: '' };
       _chat.streaming.text += m.text || '';
     } else if (m.type === 'tool') {
-      if (_chat.streaming) _chat.streaming.tool = m.name;
+      if (_chat.streaming) (_chat.streaming.tools = _chat.streaming.tools || []).push(m.name);
     } else if (m.type === 'done') {
       if (m.message) _chat.messages.push(Object.assign({ ts: Date.now() / 1000 }, m.message));
       _chat.streaming = null;
@@ -12569,6 +12570,30 @@ function _chatTime(ts) {
   return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
+// Expand/collapse state for the tool-call accordion, keyed by turn_id and
+// persisted across re-renders (_chatRender rebuilds the whole log's innerHTML
+// on every SSE event, so any native <details> open state would be discarded
+// without this). Explicit user choice always wins over the default.
+const _chatToolsOpen = {};
+function _chatToggleTools(turnId) {
+  const key = turnId || '';
+  const wasOpen = key in _chatToolsOpen ? _chatToolsOpen[key] : (_chat.streaming && _chat.streaming.turn_id === key);
+  _chatToolsOpen[key] = !wasOpen;
+  _chatRender();
+}
+function _chatToolsHtml(turnId, tools, active) {
+  if (!tools || !tools.length) return '';
+  const key = turnId || '';
+  const open = key in _chatToolsOpen ? _chatToolsOpen[key] : !!active;
+  const label = tools.length + ' tool call' + (tools.length > 1 ? 's' : '') + (active ? '…' : '');
+  const items = tools.map((t, i) => '<div class="chat-tool-item'
+    + (active && i === tools.length - 1 ? ' is-active' : '') + '">' + esc(t) + '</div>').join('');
+  return '<div class="chat-tools' + (open ? ' open' : '') + '">'
+    + '<button type="button" class="chat-tools-toggle" onclick="_chatToggleTools(&#39;' + escJs(key) + '&#39;)">'
+    + '<span class="chat-tools-caret">' + (open ? '&#x25be;' : '&#x25b8;') + '</span> ' + esc(label) + '</button>'
+    + (open ? '<div class="chat-tools-list">' + items + '</div>' : '') + '</div>';
+}
+
 function _chatRender(errorText) {
   const body = document.getElementById('peek-body');
   if (!body || peekSession !== _chat.name) return;
@@ -12589,13 +12614,14 @@ function _chatRender(errorText) {
       const shown = _hasSendTimeStamp(m.text) ? (m.text || '').replace(/^\[[^\]]*\]\s/, '') : (m.text || '');
       html += _chatBubble('user', esc(shown).replace(/\n/g, '<br>'), esc(who) + ' · ' + _chatTime(m.ts));
     } else if (m.error) {
-      html += _chatBubble('assistant', '<span class="chat-error">' + esc(m.error) + '</span>'
+      html += _chatBubble('assistant', _chatToolsHtml(m.turn_id, m.tools, false)
+        + '<span class="chat-error">' + esc(m.error) + '</span>'
         + (m.text ? renderMarkdown(m.text) : ''), 'failed · ' + _chatTime(m.ts), 'is-error');
     } else {
       const bits = [_chatTime(m.ts)];
-      if (m.tools && m.tools.length) bits.push(m.tools.length + ' tool call' + (m.tools.length > 1 ? 's' : ''));
       if (m.duration_ms) bits.push((m.duration_ms / 1000).toFixed(1) + 's');
-      html += _chatBubble('assistant', renderMarkdown(m.text || ''), esc(bits.filter(Boolean).join(' · ')));
+      html += _chatBubble('assistant', _chatToolsHtml(m.turn_id, m.tools, false) + renderMarkdown(m.text || ''),
+        esc(bits.filter(Boolean).join(' · ')));
     }
   }
   if (_chat.streaming) {
@@ -12605,8 +12631,8 @@ function _chatRender(errorText) {
     // of the bubble. remend (Streamdown's healing step) closes them for this
     // frame only; the finished message renders from its own complete text.
     const t = (typeof remend === 'function') ? remend(_chat.streaming.text) : _chat.streaming.text;
-    const tool = _chat.streaming.tool ? '<div class="chat-tool">using ' + esc(_chat.streaming.tool) + '…</div>' : '';
-    html += _chatBubble('assistant', (t ? renderMarkdown(t) : '<span class="chat-typing"><i></i><i></i><i></i></span>') + tool,
+    const tools = _chatToolsHtml(_chat.streaming.turn_id, _chat.streaming.tools, true);
+    html += _chatBubble('assistant', tools + (t ? renderMarkdown(t) : (tools ? '' : '<span class="chat-typing"><i></i><i></i><i></i></span>')),
       'responding…', 'is-streaming');
   }
   if (_chat.queued > 0) html += '<div class="chat-queued">' + _chat.queued + ' message' + (_chat.queued > 1 ? 's' : '') + ' queued</div>';
@@ -26015,8 +26041,11 @@ function _peekShowSelPopover() {
   const sel = window.getSelection();
   const text = sel ? sel.toString().trim() : '';
   const body = document.getElementById('peek-body');
-  // Only show when selection is inside peek body
-  if (!text || !body || !sel.anchorNode || !body.contains(sel.anchorNode)) {
+  // Only show when selection is inside peek body. The chat tab (_chatMount)
+  // reuses this same element (class 'peek-chat'), but this popover was built
+  // for raw terminal output — over a narrow chat bubble it just overlaps the
+  // text it's covering. Native selection already offers copy there.
+  if (!text || !body || !sel.anchorNode || !body.contains(sel.anchorNode) || body.classList.contains('peek-chat')) {
     _peekHideSelPopover();
     return;
   }
