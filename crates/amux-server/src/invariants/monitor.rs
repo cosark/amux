@@ -441,6 +441,13 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             checks::BUILDER_INTERVAL_S,
             checks::BUILDER_MAX_INTERVALS,
         ));
+        // RECOVER, NOT ONLY REPORT (second outage 2026-09-26 22:35 to 00:30,
+        // launchd's run count frozen at 4235 while the job read "pended
+        // nondemand spawn = interval"; a manual `launchctl kickstart` started
+        // it at once). The repo's harness rule treats a needed manual restart
+        // as an amux defect, so the same threshold that fails the invariant
+        // now asks launchd to start the job, bounded and logged.
+        builder_kickstart_if_stalled(builder_log_age_s).await;
         // The SECOND question, which the one above structurally cannot answer:
         // is anything actually landing? (AMUX-4957)
         out.extend(served_commit_check().await);
@@ -4704,5 +4711,56 @@ mod unrecorded_schedule_sql_tests {
         run(&c, 100.0, "error", Some("unknown"));
         run(&c, 150.0, "refused", Some("refused"));
         assert_eq!(recovered_at(&c), Some(150.0));
+    }
+}
+
+/// Whether a stalled builder should be kickstarted now. Pure: stalled means
+/// the log is older than the invariant's own threshold; `last_kick` bounds
+/// it to once per `min_gap_s`.
+pub(crate) fn builder_kick_due(log_age_s: Option<f64>, last_kick_age_s: Option<f64>, min_gap_s: f64) -> bool {
+    let stalled = log_age_s.is_some_and(|a| a > checks::BUILDER_INTERVAL_S * checks::BUILDER_MAX_INTERVALS);
+    stalled && last_kick_age_s.is_none_or(|k| k >= min_gap_s)
+}
+
+/// `launchctl kickstart` (no `-k`: it starts the scheduled job, it kills
+/// nothing). A job that is already running makes this a no-op. macOS only;
+/// elsewhere there is no launchd job to start and nothing happens.
+async fn builder_kickstart_if_stalled(log_age_s: Option<f64>) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let last_age = LAST.lock().ok().and_then(|g| g.map(|t| t.elapsed().as_secs_f64()));
+    if !builder_kick_due(log_age_s, last_age, 900.0) {
+        return;
+    }
+    if let Ok(mut g) = LAST.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/com.amux.server-rs-builder");
+    let out = tokio::process::Command::new("launchctl").args(["kickstart", &target]).output().await;
+    let (ok, detail) = match &out {
+        Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stderr).trim().chars().take(200).collect::<String>()),
+        Err(e) => (false, e.to_string()),
+    };
+    tracing::warn!(target: "amux::invariants", verdict = "builder_stalled_kickstarted", ok, %detail,
+        log_age_s = log_age_s.unwrap_or(-1.0), measured = true, n_considered = 1,
+        "builder log silent past the deploy threshold; asked launchd to start {target}");
+}
+
+#[cfg(test)]
+mod builder_kick_tests {
+    use super::builder_kick_due;
+
+    #[test]
+    fn kicks_only_a_stalled_builder_and_at_most_every_fifteen_minutes() {
+        assert!(!builder_kick_due(Some(120.0), None, 900.0), "a builder mid-cycle is not stalled");
+        assert!(!builder_kick_due(None, None, 900.0), "an unmeasured log is not a stall");
+        assert!(builder_kick_due(Some(7000.0), None, 900.0));
+        assert!(!builder_kick_due(Some(7000.0), Some(60.0), 900.0), "bounded");
+        assert!(builder_kick_due(Some(7000.0), Some(901.0), 900.0));
     }
 }
