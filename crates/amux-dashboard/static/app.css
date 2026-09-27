@@ -616,6 +616,7 @@
   .chat-meta { font-size: 0.7rem; color: var(--dim); margin-top: 3px; padding: 0 4px; }
   .chat-msg.is-error .chat-bubble { border-color: var(--red, #f85149); }
   .chat-error { display: block; color: var(--red, #f85149); font-weight: 600; margin-bottom: 4px; white-space: pre-wrap; }
+  .chat-retry-btn { display: block; margin-top: 8px; font-size: 0.78rem; padding: 6px 14px; }
   .chat-tools { margin-bottom: 6px; }
   .chat-tools:last-child { margin-bottom: 0; }
   .chat-tools-toggle {

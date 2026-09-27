@@ -12235,7 +12235,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1138';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1139';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -12603,6 +12603,15 @@ function _chatRefresh(name) {
   return Promise.resolve();
 }
 
+// Re-send the exact text an interrupted turn never got to answer (see the
+// `m.interrupted` branch in `_chatRender`). Plain `doSend` — the same path
+// the compose box uses — not a new endpoint.
+async function _chatRetryTurn(name, text) {
+  if (!text) return;
+  await doSend(name, text);
+  if (_chat.name === name) _chatLoad(name);
+}
+
 function _chatBubble(role, html, meta, cls) {
   return '<div class="chat-msg chat-' + role + (cls ? ' ' + cls : '') + '">'
     + '<div class="chat-bubble">' + html + '</div>'
@@ -12659,9 +12668,21 @@ function _chatRender(errorText) {
       const shown = _hasSendTimeStamp(m.text) ? (m.text || '').replace(/^\[[^\]]*\]\s/, '') : (m.text || '');
       html += _chatBubble('user', esc(shown).replace(/\n/g, '<br>'), esc(who) + ' · ' + _chatTime(m.ts));
     } else if (m.error) {
+      // A restart-interrupted turn (chat_worker.rs::recover) tells the user
+      // to resend, but the exact text they sent is already sitting right
+      // above this bubble in the transcript — making them retype it is the
+      // gap, not the recovery message itself. `_stampSendTime` is idempotent
+      // (see its own doc), so resending the ALREADY-stamped stored text
+      // cannot double-stamp it.
+      const original = m.interrupted
+        ? (_chat.messages.find(x => x.role === 'user' && x.turn_id === m.turn_id) || {}).text
+        : '';
+      const retryBtn = original
+        ? '<button type="button" class="btn chat-retry-btn" onclick="_chatRetryTurn(\'' + escJs(_chat.name) + '\',\'' + escJs(original) + '\')">Retry</button>'
+        : '';
       html += _chatBubble('assistant', _chatToolsHtml(m.turn_id, m.tools, false)
         + '<span class="chat-error">' + esc(m.error) + '</span>'
-        + (m.text ? renderMarkdown(m.text) : ''), 'failed · ' + _chatTime(m.ts), 'is-error');
+        + (m.text ? renderMarkdown(m.text) : '') + retryBtn, 'failed · ' + _chatTime(m.ts), 'is-error');
     } else {
       const bits = [_chatTime(m.ts)];
       if (m.duration_ms) bits.push((m.duration_ms / 1000).toFixed(1) + 's');
