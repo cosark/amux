@@ -56,10 +56,78 @@ pub(crate) fn owns_report(name: &str, report: &Value) -> bool {
         && report["run_id"] == generation(name)["run_id"]
 }
 fn generation(name: &str) -> Value {
-    std::fs::read_to_string(root().join(name).join("current.json"))
+    let launch = std::fs::read_to_string(root().join(name).join("current.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Null)
+        .unwrap_or(Value::Null);
+    if launch_predates_session(&launch, tmux_created(name)) {
+        warn_stale_generation_once(name, &launch);
+        return Value::Null;
+    }
+    launch
+}
+
+/// A launch record is only this process's if the server wrote it for the
+/// tmux session that is running now. `current.json` is written ONLY by the
+/// server's own start (`begin_launch`), after it creates the tmux session, so
+/// a record OLDER than the session means something else started the worker
+/// (the `amux start` CLI path launches Claude itself and sets no
+/// AMUX_STATUS_* vars). Honouring that record made the previous launch's
+/// last native report "own" the worker forever: every fresh hook report was
+/// discarded (`owns_report`), and `launch_started_at` judged "this life"
+/// against a start days old. Measured 2026-09-26: 22 of 32 running workers
+/// read status off the screen only, all holding a native SessionEnd from the
+/// 20:57 restart a day earlier. Unknown session time (no tmux) keeps the old
+/// behaviour.
+pub(crate) fn launch_predates_session(launch: &Value, session_created: Option<f64>) -> bool {
+    match (launch["started"].as_f64(), session_created) {
+        (Some(started), Some(created)) => started + 5.0 < created,
+        _ => false,
+    }
+}
+
+fn warn_stale_generation_once(name: &str, launch: &Value) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let key = format!("{name}:{}", launch["run_id"].as_str().unwrap_or(""));
+    let Ok(mut g) = SEEN.lock() else { return };
+    if g.get_or_insert_with(HashSet::new).insert(key) {
+        tracing::warn!(session = name, run_id = %launch["run_id"].as_str().unwrap_or(""),
+            verdict = "native_status_generation_stale", measured = true, n_considered = 1,
+            "native status launch record predates this worker's tmux session (started outside the \
+             server); ignoring it so hook reports decide status");
+    }
+}
+
+/// `#{session_created}` for `amux-<name>`, from one `tmux list-sessions`
+/// shared by every caller and refreshed at most every 10s (callers include
+/// every hook report and every sessions-list build).
+fn tmux_created(name: &str) -> Option<f64> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(f64, HashMap<String, f64>)>> = Mutex::new(None);
+    let now = crate::config::now_f64();
+    let mut g = CACHE.lock().ok()?;
+    if g.as_ref().is_none_or(|(at, _)| now - at > 10.0) {
+        let map = std::process::Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| {
+                        let (n, t) = l.trim().rsplit_once(' ')?;
+                        Some((n.to_string(), t.parse::<f64>().ok()?))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        *g = Some((now, map));
+    }
+    g.as_ref()?.1.get(&format!("amux-{name}")).copied()
 }
 
 /// Reject replay from an earlier launch/turn and transport reordering. Receipt
@@ -436,6 +504,21 @@ mod tests {
         assert!(!super::super::sessions_legacy::report_applies(
             "idle", 99.0, start, 105.0
         ));
+    }
+
+    #[test]
+    fn a_launch_record_older_than_the_session_is_not_this_process() {
+        let launch = json!({"run_id": "r1", "started": 1000.0});
+        // CLI start: tmux session created long after the server's last launch.
+        assert!(launch_predates_session(&launch, Some(90_000.0)));
+        // Server start: tmux session first, then begin_launch (same second or later).
+        assert!(!launch_predates_session(&launch, Some(1000.0)));
+        assert!(!launch_predates_session(&launch, Some(996.0)));
+        // A server restart inside an older tmux session keeps a newer launch.
+        assert!(!launch_predates_session(&launch, Some(500.0)));
+        // Unknown session time or no record: no change from before.
+        assert!(!launch_predates_session(&launch, None));
+        assert!(!launch_predates_session(&Value::Null, Some(90_000.0)));
     }
 
     #[test]
