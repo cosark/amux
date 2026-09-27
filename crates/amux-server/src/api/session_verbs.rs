@@ -3061,6 +3061,12 @@ pub const SESSION_SCOPED_FIELDS: &[(&str, RenameDisposition)] = &[
         RenameDisposition::KeepForAudit("a scan is a dated observation, not live state"),
     ),
     (
+        "standing_approval_uses",
+        RenameDisposition::KeepForAudit(
+            "a use records which lane an approval answered at the time (AMUX-5270)",
+        ),
+    ),
+    (
         "_amux_request_log.amux_session",
         RenameDisposition::KeepForAudit("the caller name records who made the request at the time"),
     ),
@@ -17885,7 +17891,15 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     // BEFORE the roster, deliberately. The comment above says the tail is what a
     // read ceiling drops and the roster is the re-derivable thing; a credential
     // gap is the more actionable of the two, so it sits above it (AF-372).
-    let composed = composed + &preserved + &credential_preflight() + &fleet_roster();
+    // Standing approvals sit with the credential gaps, above the roster, for
+    // the same reason: they change what a lane should DO before it escalates
+    // (AMUX-5270: two owner pages on 2026-09-27 for asks he had already
+    // approved, one of them approved only in another lane's terminal).
+    let composed = composed
+        + &preserved
+        + &credential_preflight()
+        + &super::standing_approvals::memory_section(name)
+        + &fleet_roster();
     let _ = std::fs::write(&claude_mem_file, &composed);
 }
 

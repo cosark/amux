@@ -55,6 +55,11 @@ pub trait AlertChannels: Send + Sync {
     /// and sms needs his phone, but a connected Gmail account already exists and
     /// its own inbox is a destination. `(ok, detail)`, detail names the account.
     async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String);
+    /// Low-priority owner FYI (AMUX-5270): an escalation a standing approval
+    /// answered. Deliberately NOT one of the three fire-alarm channels above.
+    /// Default is a no-op so a test double can never reach a device by
+    /// forgetting to override it; `RealChannels` sends a plain web push.
+    async fn fyi(&self, _state: &AppState, _session: &str, _text: &str) {}
 }
 
 /// The owner's inbox and whether it was PINNED: `AMUX_OWNER_EMAIL` if set,
@@ -94,6 +99,10 @@ impl AlertChannels for RealChannels {
 
     async fn sms(&self, phone: &str, text: &str) -> (bool, String) {
         send_sms(phone, text).await
+    }
+
+    async fn fyi(&self, state: &AppState, session: &str, text: &str) {
+        super::standing_approvals::send_fyi_push(state, session, text).await
     }
 
     async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String) {
@@ -727,6 +736,89 @@ async fn post_owner(
         );
     }
 
+    // STANDING APPROVALS (AMUX-5270), before the dedupe guard and before any
+    // channel. On 2026-09-27 two escalations paged Ethan for things he had
+    // already approved: a canary's paid lifecycle probe (approved the day
+    // before as gs-4 decision #7, visible only in gs-4's terminal) and a WAL
+    // reconciliation with both lineages preserved. "this shouldn't need my
+    // input". A covered ask is answered here: the lane gets the approval id and
+    // its limits (response + steer), the use is recorded, the owner gets a
+    // low-priority FYI, and nobody is paged.
+    //
+    // NOT written to `owner_alerts`: that ledger seeds the dedupe/storm guard,
+    // so a covered row would suppress the next real page of the same text
+    // (for example the one that fires when the per-day cap is spent). The
+    // uses table is the record for these.
+    let sa_session = if !origin.is_empty() {
+        origin.clone()
+    } else {
+        session.clone()
+    };
+    let mut sa_note: Option<Value> = None;
+    if let Some(v) = super::standing_approvals::evaluate(
+        &state,
+        "alert",
+        &sa_session,
+        &msg,
+        None,
+        "",
+        !dry_run,
+    )
+    .await
+    {
+        let now_i = now_f64() as i64;
+        if v.applied().is_some() {
+            if dry_run {
+                return Json(json!({
+                    "ok": true, "dry_run": true,
+                    "would": "auto-answer from a standing approval; the owner would NOT be paged",
+                    "standing_approval": v.to_json(now_i),
+                    "message": msg, "origin": origin, "claimed": session,
+                    "note": "no channel was contacted and no use was recorded",
+                }))
+                .into_response();
+            }
+            let instruction = v.instruction();
+            let mut steer = "not attempted (no caller identity)".to_string();
+            if !sa_session.is_empty() {
+                steer = match super::session_verbs::steer_enqueue(
+                    &state,
+                    &sa_session,
+                    &format!("[standing approval] {instruction}"),
+                    "standing-approval",
+                    "",
+                )
+                .await
+                {
+                    Ok(id) => format!("queued {id}"),
+                    Err(e) => {
+                        tracing::warn!(
+                            verdict = "standing_approval_steer_refused",
+                            session = %sa_session,
+                            error = %e,
+                            "could not steer the covered lane; it still has the response body"
+                        );
+                        format!("refused: {e}")
+                    }
+                };
+            }
+            if let Some(t) = super::standing_approvals::fyi_text(&v, &sa_session, "alert", &msg) {
+                channels.fyi(&state, &sa_session, &t).await;
+            }
+            return Json(json!({
+                // `delivered_any` stays false because nobody WAS paged; the CLI
+                // reads `standing_approval.applied` before it, so this is not
+                // reported as a failed alarm.
+                "ok": true, "paged": false, "delivered": 0, "delivered_any": false,
+                "channels": {}, "standing_approval": v.to_json(now_i), "steer": steer,
+                "message": msg, "origin": origin, "claimed": session,
+                "provenance_mismatch": mismatch,
+            }))
+            .into_response();
+        }
+        sa_note = Some(v.to_json(now_i));
+    }
+
     let key = {
         let mut h = sha2::Sha256::new();
         h.update(format!("{session}|{msg}"));
@@ -822,6 +914,7 @@ async fn post_owner(
             "storm_mute_s": STORM_MUTE,
             "key": key,
             "message": msg, "origin": origin, "claimed": session,
+            "standing_approval": sa_note,
             "note": "no channel was contacted and no ledger row was written",
         }))
         .into_response();
@@ -1026,6 +1119,11 @@ async fn post_owner(
         "origin": origin, "claimed": session, "provenance_mismatch": mismatch,
         "delivered": delivered, "delivered_any": delivered_any,
     });
+    if let Some(n) = sa_note {
+        // Why the owner WAS paged when an approval came close (cap spent, or
+        // no match): the lane can see it was checked.
+        resp["standing_approval"] = n;
+    }
     if !delivered_any {
         resp["fallback"] = json!(
             "no channel delivered — the owner was NOT paged; post to the board and say so in your turn output"
@@ -1370,6 +1468,7 @@ mod tests {
         pushes: Mutex<Vec<(String, String)>>,
         smses: Mutex<Vec<(String, String)>>,
         emails: Mutex<Vec<(String, String, String)>>,
+        fyis: Mutex<Vec<(String, String)>>,
         push_result: Result<(), String>,
         sms_result: (bool, String),
         email_result: (bool, String),
@@ -1381,6 +1480,7 @@ mod tests {
                 pushes: Mutex::new(vec![]),
                 smses: Mutex::new(vec![]),
                 emails: Mutex::new(vec![]),
+                fyis: Mutex::new(vec![]),
                 push_result: Ok(()),
                 sms_result: (true, "imessage".into()),
                 email_result: (true, "email via ethan@example.com".into()),
@@ -1416,6 +1516,12 @@ mod tests {
                 body.to_string(),
             ));
             self.email_result.clone()
+        }
+        async fn fyi(&self, _state: &AppState, session: &str, text: &str) {
+            self.fyis
+                .lock()
+                .unwrap()
+                .push((session.to_string(), text.to_string()));
         }
     }
 
@@ -1862,6 +1968,7 @@ mod tests {
             pushes: Mutex::new(vec![]),
             smses: Mutex::new(vec![]),
             emails: Mutex::new(vec![]),
+                fyis: Mutex::new(vec![]),
             push_result: Err("vapid: unreadable key".into()),
             sms_result: (false, "imessage error: -1743".into()),
             email_result: (false, "email error: not_connected".into()),
@@ -1906,6 +2013,7 @@ mod tests {
             pushes: Mutex::new(vec![]),
             smses: Mutex::new(vec![]),
             emails: Mutex::new(vec![]),
+                fyis: Mutex::new(vec![]),
             push_result: Ok(()),
             sms_result: (true, "imessage".into()),
             email_result: (true, "email via a@b.com".into()),
@@ -2005,5 +2113,61 @@ mod tests {
         assert_eq!(py_repr("--help"), "'--help'");
         assert_eq!(py_repr(""), "''");
         assert_eq!(py_repr("it's"), r"'it\'s'");
+    }
+
+    // ---- standing approvals (AMUX-5270) ------------------------------------
+
+    /// The 2026-09-27 pages, replayed: both are answered by a seeded standing
+    /// approval, neither reaches push/SMS/email, and a control still pages.
+    #[tokio::test]
+    async fn covered_escalations_are_answered_not_paged() {
+        use crate::api::standing_approvals::tests as sa;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        std::env::remove_var(crate::api::standing_approvals::KILL_SWITCH_KEY);
+        set_server_env_key(dir.path(), "AMUX_OWNER_PHONE", "+15550000001").unwrap();
+        let mock = MockChannels::ok();
+        let state = sa::test_state();
+        let app = Router::new()
+            .nest("/api/alert", routes_with(mock.clone()))
+            .merge(crate::api::standing_approvals::routes())
+            .with_state(state);
+        sa::seed(&app).await;
+
+        for (lane, text, id) in [
+            ("mixpeek-cicd", sa::CICD_ESCALATION, "SA-1"),
+            ("mvs-infra", sa::MVS_ESCALATION, "SA-2"),
+        ] {
+            let (st, v) = send(
+                &app,
+                "POST",
+                "/api/alert/owner",
+                &[("x-amux-session", lane)],
+                Some(json!({ "message": text, "session": lane })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["paged"], json!(false), "{v}");
+            assert_eq!(v["standing_approval"]["applied"], json!(true), "{v}");
+            assert_eq!(v["standing_approval"]["id"], json!(id), "{v}");
+            assert!(v["standing_approval"]["instruction"].as_str().unwrap().contains("report"));
+        }
+        assert!(mock.pushes.lock().unwrap().is_empty(), "no fire-alarm push");
+        assert!(mock.smses.lock().unwrap().is_empty(), "no SMS");
+        assert!(mock.emails.lock().unwrap().is_empty(), "no email");
+        assert_eq!(mock.fyis.lock().unwrap().len(), 2, "one low-priority FYI each");
+
+        // A control is paged exactly as before, and says it was checked.
+        let (_, v) = send(
+            &app,
+            "POST",
+            "/api/alert/owner",
+            &[("x-amux-session", "gtm-engine")],
+            Some(json!({ "message": "buy the $749 Advertising Week pass", "session": "gtm-engine" })),
+        )
+        .await;
+        assert!(v.get("paged").is_none(), "{v}");
+        assert_eq!(v["standing_approval"]["verdict"], json!("standing_approval_no_match"), "{v}");
+        assert_eq!(mock.pushes.lock().unwrap().len(), 1, "the control paged");
     }
 }

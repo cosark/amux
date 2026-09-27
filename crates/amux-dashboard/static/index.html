@@ -430,6 +430,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           <button onclick="sendTestAlert(this)" class="btn" style="width:100%;margin-top:6px;font-size:0.78rem;">Send test alert</button>
           <div id="alert-test-status" style="font-size:0.7rem;color:var(--dim);margin-top:4px;min-height:1em;"></div>
         </div>
+        <div class="settings-sep"></div>
+        <div class="settings-section" id="standing-approvals-section">
+          <div class="settings-section-label">Standing approvals</div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-bottom:8px;line-height:1.4;">Asks you already answered. A worker ask covered here is answered for you and never pages you; you get an FYI below instead. Add with <code>amux approvals add --stdin</code>.</div>
+          <div id="standing-approvals-list" style="font-size:0.78rem;">Loading…</div>
+          <div style="font-weight:600;font-size:0.8rem;margin:10px 0 6px;">Recent auto-answers</div>
+          <div id="standing-approvals-uses" style="font-size:0.74rem;color:var(--dim);"></div>
+        </div>
         </div>
         <div class="settings-tab-panel" id="stab-integrations" data-stab="integrations">
         <section class="settings-section" id="connection-security">

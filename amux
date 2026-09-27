@@ -3115,6 +3115,13 @@ if ok:
     sys.exit(0)
 sys.stderr.write(json.dumps(d) + "\n")
 e = err.lower()
+# AMUX-5270: the owner already answered this ask. Say what to do in one line
+# instead of leaving it inside the JSON dump. No apostrophes in this block.
+if isinstance(d, dict) and d.get("code") == "covered_by_standing_approval":
+    _sa = d.get("standing_approval") or {}
+    sys.stderr.write("\nALREADY APPROVED (" + str(_sa.get("id")) + "): " + str(_sa.get("instruction") or "") + "\n"
+                     "  If it does not really cover this ask, PATCH again with standing_approval_decline set to why.\n")
+    sys.exit(1)
 # Name the ATTRIBUTED command that gets past this refusal (AMUX-2325). The
 # server body explains the escape in HTTP terms (gate_ack / override_doing),
 # which is how a blocked agent ends up hand-rolling an unattributed curl.
@@ -5531,6 +5538,7 @@ ${BOLD}Tunnel (public HTTPS URL for any localhost port — needs amux cloud):${R
 
 ${BOLD}Urgent owner alert (USE SPARINGLY — push + iMessage to the owner):${RESET}
   amux alert "message" [reason]  Fire an immediate alert to the amux owner
+  amux approvals ls|add|revoke|uses  Standing approvals: asks the owner already answered
                                  Only for things needing attention NOW.
 
 ${BOLD}Claude Code flags (on register/exec):${RESET}
@@ -5745,6 +5753,15 @@ try: d = json.loads(raw)
 except ValueError: sys.exit('amux server not responding')
 if d.get('error'): sys.exit('alert failed: ' + str(d['error']))
 if d.get('deduped'): print('(deduped — an identical alert fired <60s ago)'); sys.exit(0)
+# STANDING APPROVAL (AMUX-5270): the owner already answered this ask, so the
+# server did not page him. Checked BEFORE delivered_any, which is false here
+# by design (nobody was paged) and must not read as a failed fire alarm.
+sa = d.get('standing_approval') or {}
+if sa.get('applied'):
+    print('NOT PAGED: covered by standing approval %s. %s' % (sa.get('id'), sa.get('instruction', '')))
+    sys.exit(0)
+if sa.get('verdict') == 'standing_approval_cap_reached':
+    sys.stderr.write('note: %s\n' % sa.get('instruction', ''))
 ch = d.get('channels', {})
 detail = ', '.join('%s: %s' % (k, v) for k, v in ch.items()) or '(no channels)'
 # KEY OFF THE SERVER'S EXPLICIT VERDICT, never the presence of a channels map
@@ -5786,6 +5803,122 @@ if unpinned:
                      % ', '.join(unpinned))
 print('alert delivered →', detail)
 "
+}
+
+_approvals_usage() {
+  cat <<USAGE
+${BOLD}amux approvals${RESET}: standing approvals, asks the owner has already answered (AMUX-5270)
+
+  amux approvals ls [--all] [--session <w>]   active approvals (resolved for <w>, default you)
+  amux approvals add --stdin                  OWNER ONLY: create one from a JSON object on stdin
+  amux approvals revoke <SA-n>                OWNER ONLY: revoke (kept on record, never erased)
+  amux approvals uses [--limit N]             every ask an approval answered (the owner's FYI feed)
+  amux approvals check "<ask text>"           would this ask be covered? records nothing
+
+  JSON fields: title, allowed (plain sentence), category (budget|customer_outbound|prod_data|
+  credential|access|decision), limits, max_per_day, max_amount_usd, require_terms (list),
+  scope (global|group:<g>|worker:<w>), source, expires_at (unix seconds).
+
+  An ask covered by one of these is already approved: act, then report on your card.
+  Kill switch: AMUX_STANDING_APPROVALS=0 (worker > group > global).
+USAGE
+}
+
+cmd_approvals() {
+  local sub="${1:-ls}"; shift 2>/dev/null || true
+  # Send the worker identity whenever there is one: the server refuses writes
+  # from a worker, and omitting the header would let a lane approve itself.
+  local me="${AMUX_WORKER:-${AMUX_SESSION:-}}"
+  local -a who=()
+  [[ -n "$me" ]] && who=(-H "X-Amux-Worker: $me")
+  case "$sub" in
+    ls|list)
+      local q="" all="" sess="$me"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --all)     all=1; shift ;;
+          --session) sess="${2:-}"; shift 2 ;;
+          *)         die "amux approvals ls: unknown argument '$1'" ;;
+        esac
+      done
+      q="?session=$(printf '%s' "$sess" | python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read()))')"
+      [[ -n "$all" ]] && q="$q&all=1"
+      _curl -sk ${who[@]+"${who[@]}"} "$AMUX_API/api/approvals/standing$q" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit("amux server not responding")
+if "approvals" not in d:
+    sys.exit("approvals: " + str(d.get("error") or d))
+rows = d["approvals"]
+scope = ("resolved for " + d["session"]) if d.get("session") else "all scopes"
+print("%d standing approval(s), %s (%d recorded in total)%s" % (
+    len(rows), scope, d.get("total_recorded", 0),
+    "" if d.get("enabled", True) else " -- SWITCHED OFF for this lane (AMUX_STANDING_APPROVALS=0)"))
+for a in rows:
+    state = "" if a.get("active") else " [revoked/expired]"
+    print("")
+    print("%s  %s  [%s, %s]%s" % (a["id"], a["title"], a["category"], a["scope"], state))
+    print("  allowed: " + a["allowed"])
+    print("  limits:  " + a["limits_line"])
+    if a.get("source"):
+        print("  source:  " + a["source"])
+'
+      ;;
+    add)
+      [[ "${1:-}" == "--stdin" ]] || die "Usage: amux approvals add --stdin  (JSON object on stdin)"
+      local body; body="$(cat)"
+      printf '%s' "$body" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null \
+        || die "amux approvals add: stdin is not a JSON object"
+      printf '%s' "$body" | _curl -sk -X POST -H 'Content-Type: application/json' ${who[@]+"${who[@]}"} \
+          -d @- "$AMUX_API/api/approvals/standing" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not d.get("ok"):
+    sys.exit("approvals add REFUSED: %s%s" % (d.get("error"), (" -- " + d["how"]) if d.get("how") else ""))
+a = d["approval"]
+print("created %s: %s [%s, %s] limits: %s" % (a["id"], a["title"], a["category"], a["scope"], a["limits_line"]))
+'
+      ;;
+    revoke|rm)
+      local id="${1:-}"
+      [[ -n "$id" ]] || die "Usage: amux approvals revoke <SA-n>"
+      _curl -sk -X DELETE ${who[@]+"${who[@]}"} "$AMUX_API/api/approvals/standing/$id" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not d.get("ok"):
+    sys.exit("approvals revoke REFUSED: " + str(d.get("error")))
+print("revoked " + d["approval"]["id"])
+'
+      ;;
+    uses|fyi)
+      local limit=20
+      [[ "${1:-}" == "--limit" ]] && limit="${2:-20}"
+      _curl -sk "$AMUX_API/api/approvals/standing/uses?limit=$limit" | python3 -c '
+import json, sys, time
+d = json.load(sys.stdin)
+print("%d of %d use(s)" % (d.get("shown", 0), d.get("total", 0)))
+for u in d.get("uses", []):
+    t = time.strftime("%Y-%m-%d %H:%M", time.localtime(u["ts"]))
+    print("%s  %s %-11s %-8s %s: %s" % (t, u["approval"], u["verdict"], u["door"], u["session"] or "-", u["ask"][:120]))
+'
+      ;;
+    check)
+      local text="${1:-}"
+      [[ -n "$text" ]] || die "Usage: amux approvals check \"<ask text>\""
+      TEXT="$text" SESS="$me" python3 -c 'import json,os; print(json.dumps({"text": os.environ["TEXT"], "session": os.environ["SESS"]}))' \
+        | _curl -sk -X POST -H 'Content-Type: application/json' -d @- "$AMUX_API/api/approvals/standing/check" \
+        | python3 -c '
+import json, sys
+d = json.load(sys.stdin).get("standing_approval", {})
+print(("COVERED by %s: " % d.get("id")) + d.get("instruction", "") if d.get("applied")
+      else "not covered (%s): %s" % (d.get("verdict"), d.get("reason") or d.get("instruction", "")))
+'
+      ;;
+    help|--help|-h) _approvals_usage ;;
+    *) _approvals_usage; return 1 ;;
+  esac
 }
 
 cmd_whoami() {
@@ -6173,6 +6306,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     crm)              shift; cmd_crm "$@" ;;
     tunnel|t)         shift; cmd_tunnel "$@" ;;
     alert)            shift; cmd_alert "$@" ;;
+    approvals)        shift; cmd_approvals "$@" ;;
     iac)              shift; cmd_config "$@" ;;
     whoami)           cmd_whoami ;;
     fresh)            shift; cmd_fresh "$@" ;;

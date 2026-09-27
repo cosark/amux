@@ -2619,6 +2619,23 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         path: "/api/grants/{id}/reject",
         methods: &["POST"],
     },
+    // AMUX-5270 standing approvals.
+    RouteEntry {
+        path: "/api/approvals/standing",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/approvals/standing/uses",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/approvals/standing/check",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/approvals/standing/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
     RouteEntry {
         path: "/api/connectors",
         methods: &["GET", "POST"],

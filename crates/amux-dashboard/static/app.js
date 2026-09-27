@@ -38253,6 +38253,7 @@ function toggleSettings() {
     loadCommitGuard();
     loadTaskGuard();
     loadAlertConfig();
+    _standingApprovalsLoad();
     loadUsage();
   }
 }
@@ -38513,6 +38514,60 @@ async function loadSpendAttribution() {
     // with an error.
     box.innerHTML = '';
   }
+}
+// AMUX-5270: standing approvals. Answers the owner already gave, which the
+// server applies to worker escalations instead of paging him (two such pages
+// on 2026-09-27 were for asks he had approved the day before). Revoke sends NO
+// worker header on purpose: the server reads its absence as the owner, the
+// same rule the grant buttons rely on. 44px targets (mobile-first).
+async function _standingApprovalsLoad() {
+  const list = document.getElementById('standing-approvals-list');
+  const usesEl = document.getElementById('standing-approvals-uses');
+  if (!list) return;
+  try {
+    const r = await fetch(API + '/api/approvals/standing', { headers: _authHeaders() });
+    const d = await r.json();
+    if (!r.ok || !Array.isArray(d.approvals)) { list.textContent = 'Could not load (' + (d.error || r.status) + ')'; return; }
+    if (!d.approvals.length) {
+      list.innerHTML = '<div style="color:var(--dim);">None recorded. Every worker ask still goes to you.</div>';
+    } else {
+      list.innerHTML = d.approvals.map(a =>
+        '<div style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-bottom:1px solid var(--border);">'
+        + '<div style="flex:1;min-width:0;">'
+        + '<div style="font-weight:600;">' + esc(a.id) + ' · ' + esc(a.title) + '</div>'
+        + '<div style="color:var(--dim);font-size:0.72rem;">' + esc(a.category) + ' · ' + esc(a.scope) + '</div>'
+        + '<div style="margin-top:2px;">' + esc(a.allowed) + '</div>'
+        + '<div style="color:var(--dim);font-size:0.72rem;margin-top:2px;">Limits: ' + esc(a.limits_line) + '</div>'
+        + (a.source ? '<div style="color:var(--dim);font-size:0.72rem;">Source: ' + esc(a.source) + '</div>' : '')
+        + '</div>'
+        + '<button class="btn" style="min-height:44px;min-width:64px;font-size:0.75rem;" '
+        + 'onclick="event.stopPropagation();_standingApprovalRevoke(\'' + escJs(a.id) + '\',this)">Revoke</button>'
+        + '</div>').join('');
+    }
+  } catch (e) { list.textContent = 'Could not load standing approvals'; }
+  if (!usesEl) return;
+  try {
+    const r = await fetch(API + '/api/approvals/standing/uses?limit=10', { headers: _authHeaders() });
+    const d = await r.json();
+    const uses = Array.isArray(d.uses) ? d.uses : [];
+    usesEl.innerHTML = !uses.length ? 'None yet.'
+      : uses.map(u => '<div style="padding:4px 0;border-bottom:1px solid var(--border);">'
+          + '<b>' + esc(u.approval) + '</b> ' + (u.verdict === 'applied' ? 'answered' : 'cap spent, you were asked')
+          + ' · ' + esc(u.door) + ' from ' + esc(u.session || '?') + ' · ' + _notifTimeAgo(u.ts * 1000)
+          + '<div style="color:var(--fg);">' + esc((u.ask || '').slice(0, 160)) + '</div></div>').join('')
+        + (d.total > uses.length ? '<div style="margin-top:4px;">' + uses.length + ' of ' + d.total + ' shown</div>' : '');
+  } catch (e) { usesEl.textContent = 'Could not load the FYI feed'; }
+}
+async function _standingApprovalRevoke(id, btn) {
+  if (!confirm('Revoke ' + id + '? Workers will escalate these asks to you again.')) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Revoking…'; }
+  try {
+    const r = await fetch(API + '/api/approvals/standing/' + encodeURIComponent(id), { method: 'DELETE' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) { showToast(d.error || ('revoke failed (' + r.status + ')')); if (btn) { btn.disabled = false; btn.textContent = 'Revoke'; } return; }
+    showToast('Revoked ' + id);
+  } catch (e) { showToast('revoke failed: ' + String(e)); }
+  _standingApprovalsLoad();
 }
 async function loadAlertConfig() {
   try {

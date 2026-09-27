@@ -96,6 +96,7 @@ pub mod settings;
 pub mod simple;
 pub mod skills;
 pub mod signals;
+pub mod standing_approvals;
 pub mod skin;
 pub mod speedtest;
 pub mod sql;
@@ -300,6 +301,8 @@ pub fn router(state: AppState) -> Router {
         .merge(connectors::routes())
         .nest("/api/telegram", telegram::routes())
         .merge(grants::routes())
+        // AMUX-5270: the owner's standing answers to escalations.
+        .merge(standing_approvals::routes())
         .merge(vault::routes())
         .merge(self_update::routes())
         .nest("/api/proxies", proxies::routes())

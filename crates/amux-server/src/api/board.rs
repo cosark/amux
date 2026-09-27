@@ -4741,6 +4741,72 @@ const VALID_STATUSES: [&str; 11] = [
 
 // ---- POST /api/board -----------------------------------------------------
 
+/// Everything a needsyou ask says, for standing-approval matching: the card's
+/// title and desc (from the body, else the stored card) plus the typed-ask
+/// fields.
+fn needsyou_ask_text(map: &serde_json::Map<String, Value>, stored: Option<[&str; 4]>) -> String {
+    let pick = |k: &str, fallback: &str| body_str(map, k).unwrap_or_else(|| fallback.to_string());
+    let [t, d, q, u] = stored.unwrap_or(["", "", "", ""]);
+    [
+        pick("title", t),
+        pick("desc", d),
+        pick("ask_question", q),
+        pick("ask_unblocks", u),
+    ]
+    .join("\n")
+}
+
+/// STANDING APPROVALS ON THE NEEDSYOU DOOR (AMUX-5270), both doors.
+///
+/// A needsyou card is an escalation to the owner in slow motion, and on
+/// 2026-09-27 the owner said of two asks he had already answered: "this
+/// shouldn't need my input". When a standing approval covers the ask, the park
+/// is REFUSED with the approval id and its limits, so the lane acts instead of
+/// waiting on a person who already said yes. The use is recorded (it counts
+/// toward the approval's per-day cap) and the owner gets a low-priority FYI.
+///
+/// The escape is explicit and logged: `standing_approval_decline: "<why this
+/// approval does not cover it>"`. Matching is conservative, but a lane that
+/// knows better must be able to say so rather than route around the gate.
+async fn standing_approval_refusal(
+    state: &AppState,
+    session: &str,
+    card: &str,
+    ask: &str,
+    ask_type: Option<&str>,
+    decline: Option<String>,
+) -> Option<Response> {
+    use super::standing_approvals as sa;
+    if let Some(why) = decline.filter(|w| !w.trim().is_empty()) {
+        tracing::info!(
+            verdict = "standing_approval_declined",
+            session,
+            card,
+            why = %why,
+            "lane declined standing-approval matching for this needsyou"
+        );
+        return None;
+    }
+    let v = sa::evaluate(state, "needsyou", session, ask, ask_type, card, true).await?;
+    v.applied()?;
+    if let Some(t) = sa::fyi_text(&v, session, "needsyou", ask) {
+        sa::send_fyi_push(state, session, &t).await;
+    }
+    Some(err(
+        StatusCode::CONFLICT,
+        json!({
+            "error": "this ask is already approved by a standing approval",
+            "code": "covered_by_standing_approval",
+            "item": card,
+            "standing_approval": v.to_json(chrono::Utc::now().timestamp()),
+            "how_to_fix": {
+                "do": v.instruction(),
+                "if_it_does_not_cover_this": "retry with standing_approval_decline: \"<why this approval does not cover the ask>\" (logged)",
+            },
+        }),
+    ))
+}
+
 /// The typed-ask refusal, for BOTH doors into `needsyou` (AMUX-3929).
 ///
 /// The transition gate shipped first and worked: `amux board status <id>
@@ -5457,6 +5523,21 @@ pub async fn create_item(
             json!({"error":"needsyou is reserved for the configured authorization categories","code":"needsyou_outside_approval_policy","allowed":bs::approval_types(Some(&session)),"how_to_fix":"Proceed with ordinary decisions. For a capability failure, record the concrete blocker and attempt an authorized remedy; do not invent an approval request."}),
         );
     }
+    if bs::parse_status(&status_in) == Some(TaskStatus::NeedsYou) {
+        let ask = needsyou_ask_text(&map, None);
+        if let Some(r) = standing_approval_refusal(
+            &state,
+            &session,
+            "(new card)",
+            &ask,
+            body_str(&map, "ask_type").as_deref(),
+            body_str(&map, "standing_approval_decline"),
+        )
+        .await
+        {
+            return r;
+        }
+    }
     // AMUX-2609: a status outside the typed vocabulary may still be a real
     // user-created column. The `statuses` table is the vocabulary for those —
     // see the long note in `patch_item` for why `TaskStatus` stays closed.
@@ -5696,6 +5777,8 @@ pub async fn create_item(
         // the lane idle. Same shape the ask_* fields were fixed for.
         "next_action",
         "acceptance_criteria",
+        // AMUX-5270 control key, consumed by the standing-approval gate.
+        "standing_approval_decline",
     ];
     let ignored: Vec<String> = map
         .keys()
@@ -9456,7 +9539,7 @@ fn patch_archived_value(value: &Value) -> i64 {
     ))
 }
 
-const PATCH_CONTROL: [&str; 13] = [
+const PATCH_CONTROL: [&str; 14] = [
     // Persisted in the attributed archive log, not a standalone column.
     "archive_outcome",
     // The lane ASSERTS that this card was folded into another. It is not read
@@ -9479,6 +9562,9 @@ const PATCH_CONTROL: [&str; 13] = [
     // Structured write spanning the callback_* columns. Kept as one public
     // contract so callers cannot manufacture half-armed callbacks.
     "callback",
+    // AMUX-5270: the lane's logged reason for parking in needsyou although a
+    // standing approval matched. Consumed by the gate, never a column.
+    "standing_approval_decline",
 ];
 
 /// One owner-notice per (owner, card, author, NOTE TEXT) per 10 minutes: a burst
@@ -10276,6 +10362,47 @@ pub async fn patch_item(
     } else {
         actor_name.clone()
     };
+
+    // AMUX-5270: the TRANSITION door into needsyou gets the same standing-
+    // approval check as the create door (one predicate, both doors, the
+    // AMUX-3929 lesson). Only on an actual move into needsyou, and `force`
+    // skips it like every other gate (it is already audited above).
+    if body_str(&map, "status").as_deref().and_then(bs::parse_status) == Some(TaskStatus::NeedsYou)
+        && !map.get("force").and_then(Value::as_bool).unwrap_or(false)
+    {
+        let lookup = id.clone();
+        if let Ok(Some(row)) = state
+            .store
+            .read_async(move |conn| Ok(bs::get_issue(conn, &lookup)?))
+            .await
+        {
+            if bs::parse_status(&row.status) != Some(TaskStatus::NeedsYou) {
+                let owner = row.session.clone().unwrap_or_default();
+                let ask = needsyou_ask_text(
+                    &map,
+                    Some([
+                        row.title.as_str(),
+                        row.desc.as_str(),
+                        row.ask_question.as_deref().unwrap_or(""),
+                        row.ask_unblocks.as_deref().unwrap_or(""),
+                    ]),
+                );
+                let declared = body_str(&map, "ask_type").or_else(|| row.ask_type.clone());
+                if let Some(r) = standing_approval_refusal(
+                    &state,
+                    &owner,
+                    &row.id,
+                    &ask,
+                    declared.as_deref(),
+                    body_str(&map, "standing_approval_decline"),
+                )
+                .await
+                {
+                    return r;
+                }
+            }
+        }
+    }
 
     let slot: Arc<Mutex<Option<PatchOut>>> = Arc::new(Mutex::new(None));
     // Measure integration outside the writer. The revision/owner check inside
@@ -18502,5 +18629,159 @@ mod delivery_note_tests {
         ] {
             assert!(!claims_delivery(status), "{status} is not a delivery claim");
         }
+    }
+}
+
+/// AMUX-5270: a needsyou ask a standing approval already answers is refused
+/// with the approval, on both doors; a control and an explicit decline pass.
+#[cfg(test)]
+mod standing_approval_door_tests {
+    use super::*;
+    use crate::api::standing_approvals::tests as sa;
+    use axum::body::to_bytes;
+    use axum::http::HeaderValue;
+
+    fn seed_card(store: &crate::db::SharedStore, session: &str, title: &str, desc: &str) -> String {
+        let slot = Arc::new(Mutex::new(None));
+        let slot_w = slot.clone();
+        let (session, title, desc) = (session.to_string(), title.to_string(), desc.to_string());
+        store
+            .write(move |conn| {
+                let row = bs::create_issue(
+                    conn,
+                    &bs::NewIssue {
+                        acceptance_criteria: None,
+                        next_action: None,
+                        title,
+                        desc,
+                        status: "todo".into(),
+                        session: Some(session),
+                        item_type: "chore".into(),
+                        creator: "test".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        ask_actor: None,
+                        source: Some("test".into()),
+                        requested_by: None,
+                        callback_session: None,
+                        callback_prompt: None,
+                    },
+                    1_700_000_000,
+                )?;
+                *slot_w.lock().unwrap() = Some(row.id);
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .expect("seed");
+        let id = slot.lock().unwrap().clone().unwrap();
+        id
+    }
+
+    fn lane(session: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-amux-session", HeaderValue::from_str(session).unwrap());
+        h
+    }
+
+    async fn body_of(r: Response) -> (StatusCode, Value) {
+        let st = r.status();
+        let b = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap_or(Value::Null))
+    }
+
+    fn park(extra: Value) -> Value {
+        let mut v = json!({
+            "status": "needsyou",
+            "ask_actor": "ethan",
+            "ask_type": "decision",
+            "ask_question": "Can I go ahead with this?",
+            "ask_unblocks": "the owner answers go or no-go",
+        });
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, x) in e {
+                o.insert(k.clone(), x.clone());
+            }
+        }
+        v
+    }
+
+    #[tokio::test]
+    async fn covered_needsyou_is_refused_on_both_doors() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        std::env::remove_var(crate::api::standing_approvals::KILL_SWITCH_KEY);
+        let state = sa::test_state();
+        let store = state.store.clone();
+        sa::seed(&crate::api::standing_approvals::routes().with_state(state.clone())).await;
+
+        // PATCH door: the mvs-infra escalation as a card.
+        let id = seed_card(&store, "mvs-infra", "WAL reconciliation go/no-go", sa::MVS_ESCALATION);
+        let (st, v) = body_of(
+            patch_item(State(state.clone()), Path(id.clone()), lane("mvs-infra"), Json(park(json!({})))).await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["code"], "covered_by_standing_approval", "{v}");
+        assert_eq!(v["standing_approval"]["id"], "SA-2", "{v}");
+        let row = bs::get_issue(&store.read().unwrap(), &id).unwrap().unwrap();
+        assert_eq!(row.status, "todo", "a refused park does not move the card");
+
+        // An explicit, logged decline passes the standing-approval gate.
+        let (st, v) = body_of(
+            patch_item(
+                State(state.clone()),
+                Path(id.clone()),
+                lane("mvs-infra"),
+                Json(park(json!({"standing_approval_decline": "the GCS lineage copy is unverified"}))),
+            )
+            .await,
+        )
+        .await;
+        assert_ne!(v["code"], "covered_by_standing_approval", "{st} {v}");
+
+        // Control on the PATCH door.
+        let ctl = seed_card(&store, "gtm-engine", "Advertising Week", "buy the $749 Advertising Week pass");
+        let (_, v) = body_of(
+            patch_item(State(state.clone()), Path(ctl), lane("gtm-engine"), Json(park(json!({})))).await,
+        )
+        .await;
+        assert_ne!(v["code"], "covered_by_standing_approval", "{v}");
+
+        // POST door: the canary escalation filed already parked.
+        let (st, v) = body_of(
+            create_item(
+                State(state.clone()),
+                lane("mixpeek-cicd"),
+                Json(park(json!({
+                    "title": "Canary paid probe needs a go",
+                    "desc": sa::CICD_ESCALATION,
+                    "session": "mixpeek-cicd",
+                    "ask_type": "budget",
+                }))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["standing_approval"]["id"], "SA-1", "{v}");
+
+        // Both covered asks were recorded as uses (the declined one was not).
+        let n: i64 = store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM standing_approval_uses WHERE verdict='applied'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
     }
 }

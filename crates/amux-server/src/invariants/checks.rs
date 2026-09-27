@@ -1168,6 +1168,11 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // Both team writers use Utc::now().timestamp(); 0060 uses strftime('%s').
     ("org_teams", "created_at", false),
     ("owner_alerts", "ts", false),
+    // AMUX-5270: every writer uses chrono Utc::now().timestamp().
+    ("standing_approvals", "granted_at", false),
+    ("standing_approvals", "expires_at", false),
+    ("standing_approvals", "revoked_at", false),
+    ("standing_approval_uses", "ts", false),
     ("proxies", "created_at", false),
     ("reclaim_quarantine", "created_at", false),
     // SECONDS, and MEASURED rather than assumed from the sibling convention:
