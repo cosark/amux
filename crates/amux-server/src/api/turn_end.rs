@@ -870,8 +870,24 @@ fn steer_text(sentence: &str) -> String {
 
 /// The turn-end consumer. Spawned from the report handler on the idle edge
 /// (legacy Stop hook) and on an applied native `Stop` event.
+/// Worker types the turn-end classifier leaves alone. A chat worker IS a
+/// conversation with the owner, so a reply ending on a question is the product
+/// working, not a lane parked on an ask. Measured 2026-09-27 on the live
+/// server: a haiku chat worker answered "What should I pick up next? Give me
+/// the task" and this classifier steered it to "proceed", which it could not
+/// do and which spent a turn. The promise nudge rides the same exit.
+pub(crate) fn skips_turn_end_classifier(worker_type: &str) -> bool {
+    worker_type == "chat"
+}
+
 pub(crate) async fn on_turn_end(state: AppState, name: String, session_id: String) {
     if sv::provider_of(&sv::parse_env(&name)) != "claude" {
+        return;
+    }
+    let wtype = crate::api::worker_exec::worker_type_of(&name);
+    if skips_turn_end_classifier(wtype.as_str()) {
+        tracing::debug!(session = %name, worker_type = wtype.as_str(), verdict = "turn_end_skipped_worker_type",
+            "turn-end: conversational worker type; owner-ask and promise classifiers do not apply");
         return;
     }
     let isolated = sv::session_is_isolated(&name);
@@ -1487,6 +1503,13 @@ mod tests {
         assert!(claim_once(&state, "lane", "turn_end.owner_ask", "k1".into(), json!({})).await);
         assert!(!claim_once(&state, "lane", "turn_end.owner_ask", "k1".into(), json!({})).await);
         assert!(claim_once(&state, "lane", "turn_end.owner_ask", "k2".into(), json!({})).await);
+    }
+
+    #[test]
+    fn chat_workers_are_left_alone_and_coding_workers_are_not() {
+        assert!(skips_turn_end_classifier("chat"));
+        assert!(!skips_turn_end_classifier("coding"));
+        assert!(!skips_turn_end_classifier(""));
     }
 
     #[test]
