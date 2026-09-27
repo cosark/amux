@@ -1771,7 +1771,10 @@
     align-items: center; gap: 6px; font-variant-numeric: tabular-nums;
     -webkit-tap-highlight-color: transparent;
   }
-  #rate-limit-pill-count { display:none; }
+  /* The header chips share one shape: text on desktop, count only on phones.
+     The status and host chips were added without these rules and showed a
+     stray count on desktop and overflowing text at 390px. */
+  #rate-limit-pill-count, #telemetry-pill-count, #host-pressure-pill-count { display:none; }
   .btn-rate-limit.show { display: flex; }
   .btn-rate-limit:active { background: rgba(248,81,73,0.22); }
   .active-dropdown {
@@ -1895,8 +1898,8 @@
     .header-row .active-wrap, .header-row .header-add-wrap, .header-row .settings-wrap { flex:0 0 auto; }
     .header-row .btn-active { gap:3px; font-size:0.85rem; }
     .header-row .btn-rate-limit { max-width:44px; overflow:visible; white-space:nowrap; }
-    .header-row #rate-limit-pill-text { display:none; }
-    .header-row #rate-limit-pill-count { display:inline-block; font-size:0.85rem; font-weight:600; }
+    .header-row #rate-limit-pill-text, .header-row #telemetry-pill-text, .header-row #host-pressure-pill-text { display:none; }
+    .header-row #rate-limit-pill-count, .header-row #telemetry-pill-count, .header-row #host-pressure-pill-count { display:inline-block; font-size:0.85rem; font-weight:600; }
     .header-row > #interaction-feedback { flex:0 0 44px; margin-left:auto; }
     .header-row > #interaction-feedback > summary { box-sizing:border-box; width:44px; height:44px; min-height:44px; padding:0; justify-content:center; }
     .header-row > #interaction-feedback > summary > span { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
