@@ -12190,7 +12190,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1136';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1137';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -19035,6 +19035,9 @@ function _msgDeliveryChip(e) {
     title = delivered
       ? (wait > 1500 ? 'Delivered at a later turn boundary after ' + _fmtDur(wait) : 'Delivered at the next turn boundary')
       : 'Waiting in the steering queue; delivery has not been confirmed';
+  } else if (rec === 'lost') {
+    label = 'not delivered'; color = '#f85149'; bg = 'rgba(248,81,73,0.16)';
+    title = 'A server restart interrupted delivery, and the message is not in the worker\'s transcript, so it never arrived. Send it again if it still matters.';
   } else if (rec === 'voided' || rec === 'uncertain') {
     label = rec === 'voided' ? 'not delivered' : 'delivery unknown';
     color = '#f85149'; bg = 'rgba(248,81,73,0.16)';

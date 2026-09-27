@@ -20819,7 +20819,11 @@ pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqli
                     "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
                      VALUES(?,?,?,?,?,?,?,?)",
                     rusqlite::params![id, session, redact_secrets(text), queued_at, now_f64(),
-                        "delivered: found in the worker's transcript after a restart interrupted the delivery record",
+                        // "sent" prefix: the 0086 receipt trigger settles the
+                        // Messages row as confirmed only for outcomes starting
+                        // with it, so any other wording would leave the chip
+                        // at "delivery unknown" for a message that landed.
+                        "sent: confirmed in the worker's transcript after a restart interrupted the delivery record",
                         guard, sender],
                 )?;
                 conn.execute("DELETE FROM steering_queue WHERE id=?1", [id])?;
@@ -20852,7 +20856,57 @@ pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqli
         )?;
         conn.execute("DELETE FROM steering_queue WHERE id=?1", [id])?;
     }
-    Ok(orphans.len())
+    let settled = settle_interrupted_receipts(conn)?;
+    Ok(orphans.len() + settled)
+}
+
+/// Messages a restart already marked "delivery unknown" before the transcript
+/// check existed (MSG-69352 is one). Same check, applied to recent
+/// `interrupted:` rows whose Messages row is still `uncertain`: found in the
+/// transcript settles it as confirmed; missing settles it as `lost`, shown as
+/// "not delivered". They are NOT re-sent: a message days old arriving unasked
+/// would surprise the worker more than the owner re-sending it would.
+fn settle_interrupted_receipts(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    let since = now_f64() - 7.0 * 86400.0;
+    let rows: Vec<(String, String, String, f64)> = conn
+        .prepare(
+            "SELECT h.id, h.session, h.text, h.queued_at FROM steering_history h \
+             JOIN cmd_history c ON c.queue_id = h.id \
+             WHERE h.outcome LIKE 'interrupted:%' AND c.delivery = 'uncertain' AND h.queued_at >= ?1",
+        )?
+        .query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .flatten()
+        .collect();
+    let mut settled = 0;
+    for (id, session, text, queued_at) in rows {
+        match orphan_landing(&session, &text, queued_at) {
+            OrphanLanding::Landed => {
+                conn.execute(
+                    "UPDATE steering_history SET outcome=?2 WHERE id=?1",
+                    rusqlite::params![id, "sent: confirmed in the worker's transcript after a restart interrupted the delivery record"],
+                )?;
+                conn.execute(
+                    "UPDATE cmd_history SET delivery='queued', submit_verdict='confirmed', \
+                     delivered_at=CAST((SELECT delivered_at FROM steering_history WHERE id=?1) * 1000 AS INTEGER) \
+                     WHERE queue_id=?1",
+                    [&id],
+                )?;
+                tracing::info!(steer_id = %id, session = %session, verdict = "interrupted_receipt_confirmed",
+                    measured = true, n_considered = 1, "an interrupted delivery was found in the transcript; receipt settled as delivered");
+            }
+            OrphanLanding::Absent => {
+                conn.execute(
+                    "UPDATE cmd_history SET delivery='lost', submit_verdict=NULL WHERE queue_id=?1 AND delivery='uncertain'",
+                    [&id],
+                )?;
+                tracing::warn!(steer_id = %id, session = %session, verdict = "interrupted_receipt_lost",
+                    measured = true, n_considered = 1, "an interrupted delivery is not in the transcript; receipt settled as not delivered");
+            }
+            OrphanLanding::Unknown => continue,
+        }
+        settled += 1;
+    }
+    Ok(settled)
 }
 
 // ---------------------------------------------------------------------------
