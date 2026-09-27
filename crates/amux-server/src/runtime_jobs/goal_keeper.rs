@@ -105,9 +105,16 @@ pub fn tool_uses_since(records: &[Value], since: f64) -> usize {
 }
 
 /// A typed user message after `since` that is not the keeper's own.
+///
+/// Claude Code also writes MACHINE records as `type: user`: background task
+/// completions (`<task-notification>`), system reminders, slash-command
+/// echoes, and `isMeta` records. Counting those as someone writing to the
+/// worker reset the keeper on every finished background task, and the reset
+/// also cleared the interval: tubescience-parity was continued at 04:39,
+/// 04:44 and 04:54 on 2026-09-27 against a 10-minute minimum.
 pub fn foreign_input_since(records: &[Value], since: f64) -> bool {
     records.iter().any(|r| {
-        if r["type"] != "user" || ts_of(r) <= since {
+        if r["type"] != "user" || ts_of(r) <= since || r["isMeta"] == true {
             return false;
         }
         let text = match &r["message"]["content"] {
@@ -121,7 +128,7 @@ pub fn foreign_input_since(records: &[Value], since: f64) -> bool {
             _ => String::new(),
         };
         let t = text.trim();
-        !t.is_empty() && !t.contains(MARK)
+        !t.is_empty() && !t.contains(MARK) && !t.starts_with('<')
     })
 }
 
@@ -157,15 +164,15 @@ fn decide(k: &mut Keep, goal: &Goal, records: &[Value], footer_active: bool, now
     if k.condition != goal.condition {
         *k = Keep { condition: goal.condition.clone(), ..Default::default() };
     }
+    // The interval ALWAYS holds, whatever else happened since the last send.
+    if k.last_sent > 0.0 && now - k.last_sent < env_f64("AMUX_GOAL_CONTINUE_INTERVAL_S", 600.0) {
+        return Decision::Skip("interval");
+    }
+    // Someone else writing to the worker resets the no-progress count only.
     if k.last_sent > 0.0 && foreign_input_since(records, k.last_sent) {
         k.no_progress = 0;
         k.exhausted_logged = false;
-        k.last_sent = 0.0;
-    }
-    if k.last_sent > 0.0 {
-        if now - k.last_sent < env_f64("AMUX_GOAL_CONTINUE_INTERVAL_S", 600.0) {
-            return Decision::Skip("interval");
-        }
+    } else if k.last_sent > 0.0 {
         if tool_uses_since(records, k.last_sent) == 0 {
             k.no_progress += 1;
         } else {
@@ -292,6 +299,13 @@ mod tests {
         let mut with_owner = recs.clone();
         with_owner.push(user("2026-09-26T19:10:00Z", "whats the status?"));
         assert!(foreign_input_since(&with_owner, t("2026-09-26T19:06:00Z")));
+        // Machine records written as `user` are not someone writing.
+        let machine = vec![
+            user("2026-09-26T19:10:00Z", "<task-notification>\n<task-id>b1</task-id>"),
+            user("2026-09-26T19:11:00Z", "<system-reminder>x</system-reminder>"),
+            json!({"type":"user","isMeta":true,"timestamp":"2026-09-26T19:12:00Z","message":{"content":"Caveat"}}),
+        ];
+        assert!(!foreign_input_since(&machine, t("2026-09-26T19:06:00Z")));
     }
 
     #[test]
@@ -313,9 +327,14 @@ mod tests {
         let recs = vec![tool("2026-09-26T20:05:00Z")];
         assert!(matches!(decide(&mut k2, &goal, &recs, true, base + 700.0), Decision::Send(_)));
         assert_eq!(k2.no_progress, 0);
-        // The owner writing resets the count.
+        // The owner writing resets the count...
         let owner = vec![user("2026-09-26T20:30:00Z", "keep going")];
         assert!(matches!(decide(&mut k, &goal, &owner, true, base + 2000.0), Decision::Send(_)));
+        // ...but never the interval: a task notification or an owner message
+        // one minute after a send does not allow another send.
+        let mut k4 = Keep { condition: "finish cicd".into(), last_sent: base, ..Default::default() };
+        let noise = vec![user("2026-09-26T20:01:00Z", "<task-notification>done"), user("2026-09-26T20:02:00Z", "hi")];
+        assert_eq!(decide(&mut k4, &goal, &noise, true, base + 300.0), Decision::Skip("interval"));
         // A new goal resets too.
         let mut k3 = Keep { condition: "old".into(), last_sent: base, no_progress: 5, ..Default::default() };
         assert!(matches!(decide(&mut k3, &goal, &[], true, base + 10.0), Decision::Send(_)));
