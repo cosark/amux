@@ -206,13 +206,21 @@ async fn get_history_item(
                 let waiting: bool = conn
                     .query_row("SELECT 1 FROM steering_queue WHERE id=?1", [&qid], |_| Ok(true))
                     .unwrap_or(false);
-                let hist: Option<Option<f64>> = conn
-                    .query_row("SELECT delivered_at FROM steering_history WHERE id=?1", [&qid], |r| r.get(0))
+                let hist_row: Option<(Option<f64>, Option<String>)> = conn
+                    .query_row("SELECT delivered_at, outcome FROM steering_history WHERE id=?1", [&qid], |r| Ok((r.get(0)?, r.get(1)?)))
                     .ok();
+                // A row the restart reconciler resolved as INTERRUPTED carries a
+                // stamp but no delivery (MSG-69352 read "delivered" this way).
+                let interrupted = hist_row.as_ref().and_then(|(_, o)| o.as_deref()).is_some_and(|o| o.starts_with("interrupted"));
+                let hist: Option<Option<f64>> = hist_row.map(|(t, _)| t);
                 if waiting {
                     d["delivered"] = json!("waiting in queue");
                     d["delivered_source"] = json!(format!("steering_queue row {qid} — held until the worker's next idle point"));
                     d["queued"] = json!(true);
+                } else if interrupted {
+                    d["delivered"] = json!("interrupted");
+                    d["delivered_source"] = json!(format!("steering_history row {qid} — the server restarted mid-delivery and could not confirm it landed"));
+                    d["queued"] = json!(false);
                 } else if let Some(Some(t)) = hist {
                     d["delivered"] = json!("delivered");
                     d["delivered_source"] = json!(format!("steering_history row {qid} — stamped by the deliverer"));

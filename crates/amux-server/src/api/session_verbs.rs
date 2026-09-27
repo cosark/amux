@@ -20705,6 +20705,78 @@ struct OrphanedSteeringClaim {
     sender: Option<String>,
 }
 
+#[derive(Debug, PartialEq)]
+enum OrphanLanding {
+    Landed,
+    Absent,
+    Unknown,
+}
+
+/// Whitespace-collapsed prefix used to recognise a message in a transcript or
+/// pane. Long enough to be specific, short enough to survive a composer that
+/// prepends a timestamp or a provider that re-wraps.
+fn landing_needle(text: &str, chars: usize) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(chars).collect()
+}
+
+/// Did this message reach the worker? Reads the worker's current Claude
+/// transcript for a user record at or after `queued_at` containing the
+/// message, and the pane for it sitting unsubmitted. Unknown when there is no
+/// readable transcript (other providers, missing file).
+fn orphan_landing(session: &str, text: &str, queued_at: f64) -> OrphanLanding {
+    let needle = landing_needle(text, 120);
+    if needle.len() < 8 {
+        return OrphanLanding::Unknown;
+    }
+    let Some(path) = session_jsonl_path(session) else { return OrphanLanding::Unknown };
+    let records = iter_jsonl_tail(&path, 8_000_000);
+    if records.is_empty() {
+        return OrphanLanding::Unknown;
+    }
+    if transcript_has_user_text(&records, &needle, queued_at - 60.0) {
+        return OrphanLanding::Landed;
+    }
+    // Pasted but not submitted: re-queueing would type it twice.
+    let pane = std::process::Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", &format!("amux-{session}"), "-S", "-80"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    match pane {
+        Some(p) if landing_needle(&p, usize::MAX).contains(&landing_needle(text, 40)) => OrphanLanding::Unknown,
+        Some(_) => OrphanLanding::Absent,
+        None => OrphanLanding::Unknown,
+    }
+}
+
+fn transcript_has_user_text(records: &[Value], needle: &str, since: f64) -> bool {
+    records.iter().any(|r| {
+        if r["type"] != "user" {
+            return false;
+        }
+        let ts = r["timestamp"]
+            .as_str()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.timestamp_millis() as f64 / 1000.0)
+            .unwrap_or(0.0);
+        if ts < since {
+            return false;
+        }
+        let content = &r["message"]["content"];
+        let text = match content {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        };
+        landing_needle(&text, usize::MAX).contains(needle)
+    })
+}
+
 pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
     let orphans: Vec<OrphanedSteeringClaim> = conn
         .prepare(
@@ -20732,6 +20804,38 @@ pub fn reconcile_orphaned_steering_claims(conn: &rusqlite::Connection) -> rusqli
         sender,
     } in &orphans
     {
+        // CHECK, DO NOT GUESS (2026-09-26, MSG-69352). A restart mid-delivery
+        // used to drop the message outright: an owner's long message to an
+        // isolated worker was claimed at 23:43:23, the builder restarted the
+        // server that same second, and the row became "interrupted" while the
+        // message view read it as delivered. The worker never saw it. The
+        // transcript can settle what the claim could not: present means it
+        // landed; absent (and not sitting in the composer) means it never did,
+        // so it goes back in the queue. Only when neither can be read does the
+        // old interrupted outcome stand.
+        match orphan_landing(session, text, *queued_at) {
+            OrphanLanding::Landed => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                     VALUES(?,?,?,?,?,?,?,?)",
+                    rusqlite::params![id, session, redact_secrets(text), queued_at, now_f64(),
+                        "delivered: found in the worker's transcript after a restart interrupted the delivery record",
+                        guard, sender],
+                )?;
+                conn.execute("DELETE FROM steering_queue WHERE id=?1", [id])?;
+                tracing::info!(steer_id = %id, session = %session, verdict = "steering_orphan_confirmed_delivered",
+                    measured = true, n_considered = 1, "restart-orphaned steering message was found in the transcript");
+                continue;
+            }
+            OrphanLanding::Absent => {
+                conn.execute("UPDATE steering_queue SET delivering_since=NULL WHERE id=?1", [id])?;
+                tracing::warn!(steer_id = %id, session = %session, verdict = "steering_orphan_requeued",
+                    measured = true, n_considered = 1,
+                    "restart-orphaned steering message is not in the worker's transcript or composer; re-queued for delivery");
+                continue;
+            }
+            OrphanLanding::Unknown => {}
+        }
         conn.execute(
             "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
              VALUES(?,?,?,?,?,?,?,?)",
@@ -36844,6 +36948,23 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn an_orphaned_message_is_recognised_in_the_transcript_only_after_it_was_queued() {
+        let msg = "is there anything here valid based on this frustration?\n\nI dug into the current AMUX code";
+        let needle = super::landing_needle(msg, 120);
+        let rec = |ts: &str, content: serde_json::Value| serde_json::json!({"type":"user","timestamp":ts,"message":{"content":content}});
+        let queued = chrono::DateTime::parse_from_rfc3339("2026-09-26T23:31:50Z").unwrap().timestamp() as f64;
+        // Landed as a text part, with a composer timestamp prefix and re-wrapped whitespace.
+        let landed = vec![rec("2026-09-26T23:44:00Z", serde_json::json!([{"type":"text","text":"[07:31 PM] is there anything here valid based on this   frustration?\nI dug into the current AMUX code"}]))];
+        assert!(super::transcript_has_user_text(&landed, &needle, queued - 60.0));
+        // The same words from BEFORE it was queued are a different message.
+        let older = vec![rec("2026-09-26T20:00:00Z", serde_json::json!(msg))];
+        assert!(!super::transcript_has_user_text(&older, &needle, queued - 60.0));
+        // An assistant quoting it is not delivery.
+        let quoted = vec![serde_json::json!({"type":"assistant","timestamp":"2026-09-26T23:44:00Z","message":{"content":msg}})];
+        assert!(!super::transcript_has_user_text(&quoted, &needle, queued - 60.0));
     }
 
     /// AF-678. A row left claimed (delivering_since set) means a previous
