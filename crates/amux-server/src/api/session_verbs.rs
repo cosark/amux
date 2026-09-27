@@ -8142,7 +8142,7 @@ async fn steer_enqueue_precond_with_id(
     // can still have schedulers they should"). A schedule is standing
     // configuration of that worker, not amux steering it, so it is exempt
     // here; board nudges, callbacks and peer relays still are not.
-    let isolated_schedule = is_schedule_guard(guard) && session_is_isolated(name);
+    let isolated_schedule = is_owner_configured_guard(guard) && session_is_isolated(name);
     if automation && !isolated_schedule && session_is_isolated(name) {
         return Err(
             "target is an isolated (raw-agent) worker: amux automation is not \
@@ -11093,6 +11093,15 @@ pub(crate) fn is_schedule_guard(guard: &str) -> bool {
     guard.starts_with("sched:")
 }
 
+/// Guards for deliveries that carry the OWNER's own standing configuration
+/// rather than amux steering: a schedule (`sched:`) and the goal keeper
+/// continuing an owner-set /goal (`goal:`, Ethan 2026-09-26: "this needs to
+/// have been continued automatically on the harness level. especially since
+/// its a /goal"). Both reach isolated workers, as owner input.
+pub(crate) fn is_owner_configured_guard(guard: &str) -> bool {
+    is_schedule_guard(guard) || guard.starts_with("goal:")
+}
+
 pub(crate) async fn deliver_automated(
     state: &AppState,
     name: &str,
@@ -11101,9 +11110,9 @@ pub(crate) async fn deliver_automated(
 ) -> AutoDelivery {
     // A schedule into an isolated worker is delivered as owner input; see
     // `is_schedule_guard` and the queue's isolation gate.
-    let origin = if is_schedule_guard(guard) && session_is_isolated(name) {
+    let origin = if is_owner_configured_guard(guard) && session_is_isolated(name) {
         tracing::info!(session = %name, guard, verdict = "isolated_schedule_delivered",
-            "schedule delivering into an isolated worker as owner configuration");
+            "owner configuration (schedule or /goal) delivering into an isolated worker");
         SendOrigin::Owner
     } else {
         SendOrigin::Automation
@@ -33399,7 +33408,11 @@ mod tests {
         assert!(src.contains("if automation && !isolated_schedule && session_is_isolated(name) {"));
         let body = src.split_once("pub(crate) async fn deliver_automated(").unwrap().1;
         let body = body.split_once("\n}\n").unwrap().0;
-        assert!(body.contains("if is_schedule_guard(guard) && session_is_isolated(name)"));
+        assert!(body.contains("if is_owner_configured_guard(guard) && session_is_isolated(name)"));
+        // Owner configuration is a schedule or the goal keeper, and nothing else.
+        assert!(is_owner_configured_guard("sched:SCHED-12") && is_owner_configured_guard("goal:gs-10"));
+        assert!(!is_owner_configured_guard("board-drive") && !is_owner_configured_guard("")
+            && !is_owner_configured_guard("project-steering"));
         assert!(!body.contains("send_text(state, name, text, false, SendOrigin::Automation)"),
             "the direct send must use the computed origin");
     }
@@ -33644,7 +33657,7 @@ mod tests {
             body.contains("            origin,\n") && body.contains("SendOrigin::Automation\n    };"),
             "the at-boundary fast path must use the computed origin, whose default is Automation"
         );
-        assert!(body.contains("if is_schedule_guard(guard) && session_is_isolated(name)"));
+        assert!(body.contains("if is_owner_configured_guard(guard) && session_is_isolated(name)"));
     }
 
     /// The test above spawned real sessions, so this pins the property that

@@ -63,6 +63,7 @@ pub mod email_approval_digest;
 pub(crate) mod executor;
 pub mod gemini_ledger;
 pub mod heartbeat;
+pub mod goal_keeper;
 pub mod host_guard;
 pub mod host_metrics;
 mod log_retention;

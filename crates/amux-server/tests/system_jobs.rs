@@ -57,6 +57,18 @@ const ALLOWED_BARE_SPAWNS: &[(&str, &str)] = &[
          A death mid-shot is visible as `reconciled: false` on /health, so registering the \
          shot would only add a job that exits immediately by design (same as AMUX-2888)",
     ),
+    (
+        "resume_interrupted_starts",
+        "one-shot startup pass: 15s after boot it restarts worker starts a deploy exec() cut \
+         off mid-flight, logs how many, and exits. Same class as reconcile_on_startup; a \
+         registered job would exit immediately by design",
+    ),
+    (
+        "chat_worker::recover_all",
+        "one-shot startup pass: 3s after boot it reports chat turns the exec() cut off and \
+         resumes their queued messages, logs `chat_recovery_pass`, and exits. Same class as \
+         reconcile_on_startup",
+    ),
 ];
 
 /// Every `tokio::spawn(` in `src` that is not on the allow-list, returned with
