@@ -12190,7 +12190,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1137';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1138';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -14044,7 +14044,47 @@ function _linkifyPaths(safeHtml) {
 // adding a stage meant finding all of them — which is how the path linkifier
 // would have been half-wired.
 function _peekHtml(raw) {
-  return _hangIndent(wrapBoxBlocks(_fitRules(highlightPrompts(_linkifyPaths(ansiToHtml(raw))))));
+  return _hangIndent(wrapBoxBlocks(_fitRules(_wrapToolCalls(highlightPrompts(_linkifyPaths(ansiToHtml(raw)))))));
+}
+
+const _peekToolCollapsed = {};
+function _peekToggleTool(id) {
+  _peekToolCollapsed[id] = !_peekToolCollapsed[id];
+  const el = document.getElementById('ptc-' + id);
+  if (!el) return;
+  el.classList.toggle('collapsed', !!_peekToolCollapsed[id]);
+}
+let _peekToolSeq = 0;
+function _wrapToolCalls(html) {
+  const lines = html.split('\n');
+  const strip = s => s.replace(/<[^>]*>/g, '');
+  const out = [];
+  _peekToolSeq = 0;
+  for (let i = 0; i < lines.length;) {
+    const t = strip(lines[i]);
+    if (!/^\s*⏺\s/.test(t)) { out.push(lines[i]); i++; continue; }
+    const id = _peekToolSeq++;
+    let end = i + 1;
+    while (end < lines.length) {
+      const next = strip(lines[end]);
+      if (/^\s*⏺\s/.test(next)) break;
+      if (/^\s*[❯›](?:\s|$)/.test(next)) break;
+      if (/^\s*⎿/.test(next) || /^\s{2,}\S/.test(next) || !next.trim()) { end++; continue; }
+      break;
+    }
+    const hasBody = end > i + 1;
+    const collapsed = _peekToolCollapsed[id];
+    if (hasBody) {
+      out.push('<div class="ptc' + (collapsed ? ' collapsed' : '') + '" id="ptc-' + id + '">'
+        + '<div class="ptc-head" onclick="_peekToggleTool(' + id + ')">'
+        + '<span class="ptc-caret"></span>' + lines[i] + '</div>'
+        + '<div class="ptc-body">' + lines.slice(i + 1, end).join('\n') + '</div></div>');
+    } else {
+      out.push(lines[i]);
+    }
+    i = end;
+  }
+  return out.join('\n');
 }
 // FORMAT FOR THE SCREEN LIKE A TERMINAL (Ethan, 2026-09-24: "make peek look
 // like the underlying terminal but format for the screen"). The browser wraps
