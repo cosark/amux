@@ -678,7 +678,11 @@
     .chat-tool.is-running .chat-tool-icon, .chat-thinking.is-live > summary,
     .is-streaming.has-text .md-tail *::after, .is-streaming.has-text .md-tail::after, .md-blk { animation: none; }
   }
-  .chat-empty, .chat-queued { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 16px 8px; }
+  .chat-empty, /* Chat offline parity: the saved-conversation note and offline sends. */
+.chat-offline-note { margin:8px auto; padding:6px 10px; max-width:560px; border-radius:var(--radius-control, 8px); background:rgba(210,153,34,0.12); color:var(--yellow, #d29922); font-size:0.82rem; text-align:center; }
+.chat-msg.chat-pending .chat-bubble { opacity:0.7; border-style:dashed; }
+.chat-msg.chat-pending .chat-meta { color:var(--yellow, #d29922); }
+.chat-queued { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 16px 8px; }
   .chat-queued { padding: 4px; font-size: 0.75rem; }
   .chat-typing { display: inline-flex; gap: 4px; padding: 4px 0; }
   .chat-typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); animation: chat-dot 1.2s infinite ease-in-out; }

@@ -12280,7 +12280,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1141';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1142';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.
@@ -12415,6 +12415,7 @@ async function _offlineTrimToCap() {
   const names = Object.keys(_peekIndex).sort((a, b) => (_peekIndex[b].time||0) - (_peekIndex[a].time||0));
   for (const n of names.slice(_offlineCap)) {
     try { _idb.del('peek_' + n); } catch(e) {}
+    try { _idb.del('chat_' + n); } catch(e) {}
     try { _idb.del('file_' + n); } catch(e) {}
     delete _peekIndex[n];
   }
@@ -12440,8 +12441,9 @@ function _linkIsCheap() {
 // Priority: what you'd actually want offline, in order — sessions doing work
 // now, then ones you recently looked at, then the rest.
 function _prefetchOrder() {
-  // Only terminal-rendered workers have a peek frame worth saving offline.
-  const running = (sessions || []).filter(s => s.running && _workerRenderer(s.name) === 'terminal');
+  // Terminal workers save their scrollback; chat workers save their
+  // conversation (chat_<name>). Other renderers have nothing to save.
+  const running = (sessions || []).filter(s => s.running && ['terminal', 'chat'].includes(_workerRenderer(s.name)));
   const recent = new Set([peekSession, _lastPeekedSession].filter(Boolean));
   const rank = s => (s.status === 'active' || s.status === 'waiting' ? 0 : recent.has(s.name) ? 1 : 2);
   return running.sort((a, b) => rank(a) - rank(b) || (b.last_activity || 0) - (a.last_activity || 0));
@@ -12463,6 +12465,20 @@ async function _offlinePrefetch(manual) {
   const worker = async () => {
     while (list.length && !_prefetchAbort) {
       const s = list.shift();
+      if (_workerRenderer(s.name) === 'chat') {
+        try {
+          const r = await fetch(API + '/api/sessions/' + encodeURIComponent(s.name) + '/chat?limit=' + _CHAT_CACHE_MSGS, { headers: _authHeaders() });
+          if (r.ok) {
+            const d = await r.json();
+            const before = _peekIndex[s.name] && _peekIndex[s.name].bytes;
+            await _chatCacheSave(s.name, d.messages || []);
+            const now = _peekIndex[s.name] && _peekIndex[s.name].bytes;
+            if (now === before) unchanged++; else { fetched++; bytes += now || 0; }
+          }
+        } catch (e) { /* skip; a dropped link should not kill the pass */ }
+        done++; report();
+        continue;
+      }
       try {
         const prev = _peekIndex[s.name];
         const h = _authHeaders();
@@ -12498,10 +12514,10 @@ async function _offlinePrefetch(manual) {
   // Evict stopped/vanished sessions and trim to the cap (oldest first).
   const live = new Set((sessions || []).filter(s => s.running).map(s => s.name));
   for (const name of Object.keys(_peekIndex)) {
-    if (!live.has(name)) { try { _idb.del('peek_' + name); } catch(e) {} delete _peekIndex[name]; }
+    if (!live.has(name)) { try { _idb.del('peek_' + name); _idb.del('chat_' + name); } catch(e) {} delete _peekIndex[name]; }
   }
   const names = Object.keys(_peekIndex).sort((a,b) => (_peekIndex[b].time||0) - (_peekIndex[a].time||0));
-  for (const n of names.slice(_offlineCap)) { try { _idb.del('peek_' + n); } catch(e) {} delete _peekIndex[n]; }
+  for (const n of names.slice(_offlineCap)) { try { _idb.del('peek_' + n); _idb.del('chat_' + n); } catch(e) {} delete _peekIndex[n]; }
   _peekIndexSave();
   _prefetchRunning = false;
   if (manual) {
@@ -12572,7 +12588,42 @@ function _workerRenderer(name) {
 // re-parsed (settled markdown blocks are frozen DOM). The finished message is
 // rendered from its full text, so it is what a full re-render produces.
 const _chat = { name: null, es: null, messages: [], streaming: null, loadedAt: 0, busy: false, queued: 0, gen: 0,
-  cursor: '', stick: true, unseen: false, raf: 0, onScroll: null, live: null };
+  cursor: '', stick: true, unseen: false, raf: 0, onScroll: null, live: null, offlineNote: '' };
+
+// OFFLINE PARITY WITH CODING WORKERS (Ethan 2026-09-26: "make sure amux chat
+// has all the same offline capabilities as coding too"). A coding worker's
+// scrollback is saved to IndexedDB (`peek_<name>`), prefetched for offline,
+// counted against the offline cap and painted instantly on open. A chat
+// worker had none of that: offline it showed "Could not load the chat". Its
+// conversation is now saved as `chat_<name>` under the same index, cap and
+// eviction, and painted from the cache when the server cannot be reached.
+const _CHAT_CACHE_MSGS = 200;
+async function _chatCacheSave(name, messages) {
+  if (!name || !Array.isArray(messages)) return;
+  const kept = messages.slice(-_CHAT_CACHE_MSGS);
+  const rec = { messages: kept, time: Date.now(), offline: true };
+  try {
+    await _idb.set('chat_' + name, rec);
+    await _peekIndexLoad();
+    _peekIndex[name] = { etag: '', time: rec.time, bytes: JSON.stringify(kept).length, kind: 'chat' };
+    _peekIndexSave();
+  } catch (e) {}
+}
+async function _chatCacheGet(name) {
+  try { return await _idb.get('chat_' + name); } catch (e) { return null; }
+}
+// Paint the saved conversation. `reason` becomes the note above it.
+async function _chatPaintCached(name, reason) {
+  const gen = _chat.gen;
+  const rec = await _chatCacheGet(name);
+  if (!rec || !Array.isArray(rec.messages) || gen !== _chat.gen || _chat.name !== name) return false;
+  if (_chat.loadedAt && !reason) return false;   // the live snapshot already won
+  _chat.messages = rec.messages;
+  _chat.offlineNote = reason ? reason + ' Showing the conversation saved ' + _chatTime(rec.time / 1000) + '.' : '';
+  hidePeekLoading();
+  _chatRender();
+  return true;
+}
 
 function _chatUnmount() {
   if (_chat.es) { try { _chat.es.close(); } catch (e) {} }
@@ -12581,6 +12632,7 @@ function _chatUnmount() {
   if (body && _chat.onScroll) body.removeEventListener('scroll', _chat.onScroll);
   _chat.es = null; _chat.name = null; _chat.messages = []; _chat.streaming = null; _chat.gen++;
   _chat.cursor = ''; _chat.stick = true; _chat.unseen = false; _chat.raf = 0; _chat.onScroll = null; _chat.live = null;
+  _chat.loadedAt = 0; _chat.offlineNote = ''; _chat.pendingShown = 0;
   if (body) body.classList.remove('peek-chat');
 }
 
@@ -12597,12 +12649,16 @@ async function _chatLoad(name) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     d = await r.json();
   } catch (e) {
-    if (gen === _chat.gen && _chat.name === name) _chatRender('Could not load the chat: ' + e.message);
+    if (gen !== _chat.gen || _chat.name !== name) return;
+    const why = (typeof online !== 'undefined' && !online) ? 'Offline.' : 'Could not reach the server (' + e.message + ').';
+    if (!(await _chatPaintCached(name, why))) _chatRender('Could not load the chat: ' + e.message);
     return;
   }
   if (gen !== _chat.gen || _chat.name !== name) return;
   hidePeekLoading();
+  _chat.offlineNote = '';
   _chat.messages = d.messages || [];
+  _chatCacheSave(name, _chat.messages);
   _chat.busy = !!d.busy; _chat.queued = d.queued || 0;
   _chat.streaming = d.streaming && d.streaming.turn_id ? _chatNewTurn(d.streaming) : null;
   _chat.loadedAt = Date.now();
@@ -12685,6 +12741,7 @@ function _chatOnEvent(name, m) {
     if (m.message && !_chat.messages.some(x => x.turn_id === m.turn_id && x.role === 'assistant'))
       _chat.messages.push(Object.assign({ ts: Date.now() / 1000 }, m.message));
     _chat.streaming = null; _chat.busy = false;
+    _chatCacheSave(name, _chat.messages);
     _chatRender();
     return;
   }
@@ -12713,6 +12770,9 @@ function _chatMount(name) {
     };
     body.addEventListener('scroll', _chat.onScroll, { passive: true });
   }
+  // Same as a coding worker's open-time cache paint: show the saved
+  // conversation at once; the live snapshot replaces it when it arrives.
+  _chatPaintCached(name, (typeof online !== 'undefined' && !online) ? 'Offline.' : '');
   _chatLoad(name);
 }
 
@@ -12839,13 +12899,19 @@ function _chatRender(errorText) {
   if (!body || peekSession !== _chat.name) return;
   const s = sessions.find(x => x.name === _chat.name) || {};
   let html = '';
+  if (_chat.offlineNote) html += '<div class="chat-offline-note" role="status">' + esc(_chat.offlineNote) + '</div>';
   if (errorText) html += '<div class="chat-empty">' + esc(errorText) + '</div>';
-  if (!_chat.messages.length && !_chat.streaming && !errorText) {
+  const pendingSends = _pendingSendsFor(_chat.name);
+  if (!_chat.messages.length && !_chat.streaming && !errorText && !pendingSends.length) {
     html += '<div class="chat-empty">' + (s.running
       ? 'No messages yet. Say something below.'
       : 'This chat worker is stopped. Sending a message starts it.') + '</div>';
   }
   for (const m of _chat.messages) html += _chatMessageHtml(m);
+  // Messages sent while offline, shown in the conversation where they will
+  // land (a coding worker shows them only in the pending pill).
+  for (const p of pendingSends) html += _chatBubble('user', esc(p.text).replace(/\n/g, '<br>'),
+    online ? 'waiting to send' : 'saved offline &middot; sends when connected', 'chat-pending');
   body.innerHTML = '<div class="chat-log">' + html + '<div class="chat-live-slot"></div>'
     + '<div class="chat-queued-slot">' + (_chat.queued > 0 ? '<div class="chat-queued">' + _chat.queued + ' message'
       + (_chat.queued > 1 ? 's' : '') + ' queued</div>' : '') + '</div></div>'
@@ -19992,6 +20058,11 @@ async function _pendingCancel(id) {
 // Normal delivery is visible in Messages. Only offline or delayed messages
 // need a notice above the composer; do not flash a queued pill on every Send.
 function _updatePendingPill() {
+  // A mounted chat shows pending sends as bubbles; repaint when the queue moves.
+  if (peekSession && _chat.name === peekSession && _workerRenderer(peekSession) === 'chat') {
+    const n = _pendingSendsFor(peekSession).length;
+    if (n !== _chat.pendingShown) { _chat.pendingShown = n; _chatRender(); }
+  }
   const pill = document.getElementById('peek-pending-pill');
   if (!pill) return;
   const n = peekSession ? _pendingSendsFor(peekSession)
