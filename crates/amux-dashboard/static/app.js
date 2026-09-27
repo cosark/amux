@@ -8255,13 +8255,18 @@ async function refreshHostPressure() {
 }
 function showHostPressure() {
   const p = _hostPressure || {};
-  const lines = [(p.level || 'unknown').toUpperCase() + ': ' + ((p.reasons || []).join('; ') || 'no pressure')];
+  const r = p.readings || {};
+  let html = '<ul class="chip-detail-list">' + ((p.reasons || []).map(x => '<li>' + esc(x) + '</li>').join('') || '<li>No pressure.</li>') + '</ul>';
+  html += '<p class="ui-help">Load ' + (r.load5 != null ? r.load5.toFixed(1) : '?') + ' on ' + (r.ncpu || '?') + ' cores · memory level '
+    + (r.mem_level ?? '?') + ' · ' + (r.disk_free_gb != null ? Math.round(r.disk_free_gb) + ' GiB free' : 'disk ?') + '</p>';
+  if (p.level === 'critical') html += '<p>Automated dispatch, schedules and worker starts are paused until this eases. Your own actions are not affected.</p>';
   const run = p.runaways || [];
-  if (run.length) lines.push(run.length + ' long-running worker process' + (run.length === 1 ? '' : 'es') + ': '
-    + run.slice(0, 3).map(x => x.worker + ' ' + (x.command || '').split('/').pop() + ' (' + x.avg_cores + ' cores, ' + x.action + ')').join(', '));
-  const held = Object.entries(p.deferred || {}).map(([k, v]) => k + ' ' + v).join(', ');
-  if (held) lines.push('Deferred ticks: ' + held);
-  showToast(lines.join(' · '));
+  if (run.length) html += '<h4>Long-running worker processes</h4><ul class="chip-detail-list">' + run.map(x =>
+    '<li><div class="chip-detail-row"><strong>' + esc(x.worker) + '</strong><span class="ui-help">' + esc((x.command || '').split('/').pop()) + '</span></div>'
+    + '<p class="ui-help">' + esc(x.avg_cores + ' cores for ' + _fmtDur(x.elapsed_s * 1000) + ' · nice ' + x.nice + ' · ' + x.action.replaceAll('_', ' ')) + '</p></li>').join('') + '</ul>';
+  const held = Object.entries(p.deferred || {});
+  if (held.length) html += '<h4>Deferred automated ticks</h4><p class="ui-help">' + held.map(([k, v]) => esc(k) + ' ' + v).join(' · ') + '</p>';
+  _chipDetailModal('host-pressure-detail', 'Host ' + (p.level || 'unknown'), p.measured === false ? (p.why_unmeasured || 'not measured') : '', html);
 }
 setInterval(refreshHostPressure, 60000);
 setTimeout(refreshHostPressure, 3000);
@@ -8282,10 +8287,50 @@ function updateTelemetryPill() {
   pill.setAttribute('aria-label', bad.length + ' workers without a healthy status channel');
   pill.classList.add('show');
 }
+// A header chip's detail, as the standard dialog (docs/ui-style-guide.md:
+// .modal-overlay > .modal > header / body / footer). A toast was the wrong
+// shape: on a phone it covered the list, vanished, and could not be acted on
+// (Ethan, 2026-09-26: "pressing 1 should open a modal").
+function _chipDetailModal(id, title, subtitle, bodyHtml) {
+  document.getElementById(id)?.remove();
+  const overlay = document.createElement('div');
+  overlay.id = id; overlay.className = 'modal-overlay active';
+  overlay.innerHTML = '<section class="modal chip-detail" role="dialog" aria-modal="true" aria-labelledby="' + id + '-title">'
+    + '<header class="modal-header"><div><h3 id="' + id + '-title">' + esc(title) + '</h3>'
+    + (subtitle ? '<p class="ui-help">' + esc(subtitle) + '</p>' : '') + '</div>'
+    + '<button class="modal-close" aria-label="Close">×</button></header>'
+    + '<div class="modal-body">' + bodyHtml + '</div>'
+    + '<footer class="modal-footer"><span class="ui-help"></span><button class="btn" data-close>Close</button></footer></section>';
+  const close = () => overlay.remove();
+  overlay.onclick = e => { if (e.target === overlay) close(); };
+  overlay.onkeydown = e => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); } };
+  document.body.appendChild(overlay);
+  overlay.querySelector('.modal-close').onclick = close;
+  overlay.querySelector('[data-close]').onclick = close;
+  overlay.querySelector('.modal-close').focus();
+  return overlay;
+}
 function showTelemetryDetail() {
-  const bad = sessions.filter(s => s.running && s.telemetry && (s.telemetry.health === 'degraded' || s.telemetry.health === 'missing'));
-  if (!bad.length) { showToast('Every running worker has a healthy status channel'); return; }
-  showToast(bad.length + ' without a healthy status channel: ' + bad.slice(0, 6).map(s => s.name + ' (' + s.telemetry.health + ')').join(', ') + (bad.length > 6 ? ', …' : ''));
+  const live = sessions.filter(s => s.running && !s.archived && s.telemetry && s.telemetry.health);
+  const hooked = live.filter(s => s.telemetry.health !== 'unsupported');
+  const bad = hooked.filter(s => s.telemetry.health === 'degraded' || s.telemetry.health === 'missing');
+  const counts = {};
+  live.forEach(s => { counts[s.telemetry.health] = (counts[s.telemetry.health] || 0) + 1; });
+  const ago = sec => sec == null ? 'no report from this run' : 'last report ' + _fmtDur(Math.round(sec) * 1000) + ' ago';
+  let html = '<p class="ui-help">' + Object.entries(counts).map(([k, v]) => v + ' ' + k).join(' · ') + '</p>';
+  if (!bad.length) html += '<p>Every running worker with status hooks is reporting. Nothing is being guessed from the screen.</p>';
+  else html += '<p>These workers\' status is being read from their terminal, so it may be wrong. Automation will not dispatch to one it cannot see is idle.</p>'
+    + '<ul class="chip-detail-list">' + bad.map(s => {
+      const t = s.telemetry;
+      return '<li><div class="chip-detail-row"><strong>' + esc(s.name) + '</strong>'
+        + '<span class="status-badge ' + (t.health === 'missing' ? 'unknown' : 'telemetry-warn') + '">' + esc(t.health) + '</span>'
+        + '<span class="ui-help">' + esc((s.agent_state || s.status || '') + ' · ' + (s.status_authority || 'inferred') + ' · ' + ago(t.last_report_age_s)) + '</span></div>'
+        + '<p class="ui-help">' + esc(t.reason || '') + '</p>'
+        + '<div class="ui-guide-row"><button class="btn" onclick="document.getElementById(\'telemetry-detail\')?.remove();openPeek(\'' + escJs(s.name) + '\')">Open worker</button>'
+        + '<button class="btn" onclick="document.getElementById(\'telemetry-detail\')?.remove();_openStatusDetail(\'' + escJs(s.name) + '\')">Status detail</button></div></li>';
+    }).join('') + '</ul>';
+  _chipDetailModal('telemetry-detail', 'Status coverage',
+    (hooked.length - bad.length) + ' of ' + hooked.length + ' running workers are reporting their status', html);
 }
 function _scrollToFirstRateLimited() {
   const target = sessions.find(s => s.rate_limited_until) || sessions.find(s => s.credit_limited);
@@ -12235,7 +12280,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.1140';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.1141';   // bump together with the sw.js CACHE version
 // Warm the shared catalog so model-type filters are exact on first use. A
 // failure is non-fatal (custom ids and the open-string fallback still work)
 // and is already reported by _loadModelCatalog.

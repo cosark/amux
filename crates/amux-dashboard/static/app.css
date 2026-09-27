@@ -7157,6 +7157,14 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .header-row svg { flex-shrink:0; }
 .header-row #notif-btn:hover, .header-row .btn-active:hover, .header-row .settings-btn:hover { background:var(--border); }
 .header-row .btn-rate-limit:hover { background:rgba(248,81,73,0.22); }
+/* The amber chips keep amber when tapped: iOS leaves :hover applied after a
+   tap, and the red hover above turned the status chip pink. */
+.header-row .btn-telemetry:hover, .header-row .btn-telemetry:active,
+.header-row .btn-host-pressure.strained:hover, .header-row .btn-host-pressure.strained:active { background:rgba(210,153,34,0.22); }
+.chip-detail-list { list-style:none; margin:8px 0; padding:0; display:flex; flex-direction:column; gap:10px; }
+.chip-detail-list > li { padding:10px 12px; border:1px solid var(--border); border-radius:var(--radius-control, 8px); background:var(--bg); }
+.chip-detail-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.chip-detail-list p { margin:4px 0 0; }
 @media (min-width:601px) { .header-row .header-actions { gap:10px !important; } .header-row .settings-btn,.header-row .btn-active,.header-row .btn-rate-limit,.header-row .header-add-btn { min-height:44px; } }
 @media (max-width:600px) {
  .header-row { gap:0; }
