@@ -1431,7 +1431,7 @@ impl FleetSignals {
     /// fallback can label a silent/missing probe idle for display, never grant
     /// permission to send into an unknown worker.
     pub(crate) fn turn_boundary_status(&self, name: &str) -> Option<String> {
-        if !self.agent_running(&format!("amux-{name}")) {
+        if !self.worker_running(name) {
             return None;
         }
         let (status, ex) = self.derive_status_explain(name, true);
@@ -1485,6 +1485,31 @@ impl FleetSignals {
             }
         }
         measured.then_some(status)
+    }
+
+    /// Is `name`'s worker alive, through its OWN type's execution adapter
+    /// (ACW-6) — the same dispatch `python_fleet_sessions` uses for the
+    /// `running` field the fleet list shows.
+    ///
+    /// `agent_running(&format!("amux-{name}"))` answers a narrower, TERMINAL
+    /// question: is there a live process inside this tmux pane. A chat
+    /// worker has no tmux session at all (`chat_worker.rs`: "No tmux pane, no
+    /// worktree"), so that call always reads `false` for one, regardless of
+    /// whether its provider turn is genuinely running. Every caller that
+    /// means "is this worker alive" — status derivation, the turn-boundary
+    /// gate, steering delivery, stop verification — needs THIS function, not
+    /// `agent_running` directly, or a chat worker reads `not_running` and
+    /// `idle` no matter what it is actually doing (measured live 2026-09-26:
+    /// `amux-chatbot` mid-turn, `/chat` reporting `busy: true`, while
+    /// `/status-explain` — which called `agent_running` directly — said
+    /// `decided_by: "not_running"`).
+    pub fn worker_running(&self, name: &str) -> bool {
+        match crate::api::worker_exec::adapter_for_session(name).running(name) {
+            crate::api::worker_exec::Dispatch::Handled(r) => r,
+            crate::api::worker_exec::Dispatch::Terminal => {
+                self.agent_running(&format!("amux-{name}"))
+            }
+        }
     }
 
     /// Is there a WORKER in this tmux session, not merely a tmux session?
@@ -5571,6 +5596,16 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
                 .filter_map(|v| {
                     let n = v["name"].as_str()?.to_string();
                     let running = v["running"].as_bool().unwrap_or(false);
+                    // A chat worker has no tmux pane at all (chat_worker.rs:
+                    // "No tmux pane, no worktree"), so it never belongs in the
+                    // tmux-capture pool below — every name that reaches it is
+                    // spent on `pane_target`/`stopped_session_raw` for a pane
+                    // that cannot exist, and always comes back empty. It gets
+                    // its own raw-text source, synchronously, further down.
+                    if v["worker_type"].as_str() == Some(amux_core::worker_type::WorkerTypeId::CHAT)
+                    {
+                        return None;
+                    }
                     Some((n, running))
                 })
                 .collect();
@@ -5581,6 +5616,20 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
                 .filter(|(_, raw)| !raw.trim().is_empty())
                 .map(|(n, raw)| (n.clone(), raw.clone()))
                 .collect();
+            // Chat workers: the tail of their own transcript stands in for a
+            // pane capture (ACW-9). Synchronous — one small indexed SELECT
+            // per worker on the connection this function already holds, not
+            // a subprocess, so it needs no thread of its own.
+            for v in out.iter() {
+                if v["worker_type"].as_str() != Some(amux_core::worker_type::WorkerTypeId::CHAT) {
+                    continue;
+                }
+                let Some(n) = v["name"].as_str() else { continue };
+                let raw = crate::api::chat_worker::preview_raw(conn, n);
+                if !raw.trim().is_empty() {
+                    raws.insert(n.to_string(), raw);
+                }
+            }
             let names: Vec<(String, bool)> = names
                 .into_iter()
                 .filter(|(n, _)| !raws.contains_key(n))
@@ -5636,7 +5685,20 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
                         v["preview"] = json!(sp);
                         v["preview_lines"] = json!(sl);
                     }
-                    apply_preview_waiting_status(v, raw);
+                    // Banner/picker text detection is a TERMINAL-UI reading of
+                    // `raw` (rate-limit banners, permission prompts, dingbat
+                    // pickers) — a chat worker's `raw` here is its own
+                    // transcript prose, which can *quote* or *discuss* that
+                    // same language without being in that state, and its real
+                    // status already comes from `native_status`/`derive_status`
+                    // (the same self-report harness a coding worker uses, per
+                    // `FleetSignals::worker_running`). Applying a terminal-only
+                    // overlay to prose would be a NEW status-inaccuracy source,
+                    // not a fix for one.
+                    if v["worker_type"].as_str() != Some(amux_core::worker_type::WorkerTypeId::CHAT)
+                    {
+                        apply_preview_waiting_status(v, raw);
+                    }
                 }
             }
         }
